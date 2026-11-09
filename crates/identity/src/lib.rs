@@ -13,7 +13,6 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
 
 /// Account number, as used by the ledger and the domain (`AccountId.0`).
 pub type AccountNo = u32;
@@ -72,14 +71,14 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// Credential of one service, minted by the [`IdentityAuthority`]. The tag binds the id and the
-/// role to the authority's secret, so a credential cannot be altered or made up, even by code that
-/// can see one.
+/// Credential of one service, minted by the [`IdentityAuthority`]. The tag is the authority's
+/// Ed25519 signature of the id and the role: a credential cannot be altered or made up, and the
+/// services that check it hold only the authority's public key, so they cannot mint one either.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServiceCredential {
     id: ServiceId,
     role: ServiceRole,
-    tag: [u8; 32],
+    tag: [u8; 64],
 }
 
 impl ServiceCredential {
@@ -99,41 +98,27 @@ impl fmt::Debug for ServiceCredential {
     }
 }
 
-fn credential_tag(secret: &[u8; 32], id: ServiceId, role: ServiceRole) -> [u8; 32] {
-    // HMAC-SHA256 (RFC 2104) over (id, role).
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (i, b) in secret.iter().enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
-    }
+fn credential_message(id: ServiceId, role: ServiceRole) -> Vec<u8> {
     let mut msg = Vec::with_capacity(16);
     msg.extend_from_slice(b"more/svc/v1");
     msg.extend_from_slice(&id.0.to_le_bytes());
     msg.push(role as u8);
-    let inner = Sha256::new()
-        .chain_update(ipad)
-        .chain_update(&msg)
-        .finalize();
-    Sha256::new()
-        .chain_update(opad)
-        .chain_update(inner)
-        .finalize()
-        .into()
+    msg
 }
 
-/// Mints and revokes service credentials. Held by the Identity domain only.
+/// Mints and revokes service credentials. Held by the Identity domain only: its signing key is
+/// the one secret that can create a service identity.
 pub struct IdentityAuthority {
-    secret: [u8; 32],
+    key: SigningKey,
     next_id: u32,
     revoked: Arc<RwLock<BTreeSet<ServiceId>>>,
 }
 
 impl IdentityAuthority {
-    /// `secret` must come from a secure random source in a real deployment.
-    pub fn new(secret: [u8; 32]) -> Self {
+    /// `seed` must come from a secure random source in a real deployment.
+    pub fn new(seed: [u8; 32]) -> Self {
         IdentityAuthority {
-            secret,
+            key: SigningKey::from_bytes(&seed),
             next_id: 1,
             revoked: Arc::default(),
         }
@@ -145,7 +130,7 @@ impl IdentityAuthority {
         ServiceCredential {
             id,
             role,
-            tag: credential_tag(&self.secret, id, role),
+            tag: self.key.sign(&credential_message(id, role)).to_bytes(),
         }
     }
 
@@ -155,26 +140,48 @@ impl IdentityAuthority {
         set.insert(id);
     }
 
-    /// Verifier handed to the services that must check credentials (the Ledger). It cannot mint.
+    /// Verifier handed to the services that must check credentials (Ledger, coordinator). It holds
+    /// the authority's public key only, so it cannot mint.
     pub fn verifier(&self) -> CredentialVerifier {
         CredentialVerifier {
-            secret: self.secret,
+            authority: self.key.verifying_key(),
             revoked: Arc::clone(&self.revoked),
+            seen: Arc::default(),
         }
     }
 }
 
+/// (service id, role, tag) of a credential whose signature was checked.
+type CredentialKey = (u32, u8, [u8; 64]);
+
 /// Checks that a credential was minted by the authority and is not revoked.
 #[derive(Clone)]
 pub struct CredentialVerifier {
-    secret: [u8; 32],
+    authority: VerifyingKey,
     revoked: Arc<RwLock<BTreeSet<ServiceId>>>,
+    /// Credentials whose signature already verified. Revocation is still checked every time.
+    seen: Arc<RwLock<BTreeSet<CredentialKey>>>,
 }
 
 impl CredentialVerifier {
     pub fn verify(&self, cred: &ServiceCredential) -> Result<ServiceRole, AuthError> {
-        if credential_tag(&self.secret, cred.id, cred.role) != cred.tag {
-            return Err(AuthError::InvalidCredential);
+        let key = (cred.id.0, cred.role as u8, cred.tag);
+        let known = self
+            .seen
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key);
+        if !known {
+            self.authority
+                .verify(
+                    &credential_message(cred.id, cred.role),
+                    &Signature::from_bytes(&cred.tag),
+                )
+                .map_err(|_| AuthError::InvalidCredential)?;
+            self.seen
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key);
         }
         let revoked = self.revoked.read().unwrap_or_else(|e| e.into_inner());
         if revoked.contains(&cred.id) {

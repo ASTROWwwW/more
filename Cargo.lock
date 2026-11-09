@@ -364,7 +364,6 @@ name = "more-identity"
 version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
- "sha2",
 ]
 
 [[package]]

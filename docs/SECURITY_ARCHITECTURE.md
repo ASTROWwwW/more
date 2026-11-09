@@ -49,7 +49,7 @@ Section 7 lists both, boundary by boundary.
 | Principal | How it is authenticated now | Target |
 | --- | --- | --- |
 | User account (borrower, lender, witness, pool admin) | Ed25519 signature on every protocol envelope, verified against the key registered in Identity (`gpu-protocol`, `more-identity`) | Same, over QUIC with mutual authentication of the transport |
-| Service (Orchestrator, Reconciler, Scheduler, Treasury, Clock, Platform admin, Auditor, Delivery) | `ServiceCredential`: a value only `more-identity` can mint, carrying a service id and a role, tagged by the authority. Each service has its own credential; there is no shared global secret. Tag and revocation are checked on every ledger call and every coordinator command | Separate processes, mTLS client certificates per service, short-lived tokens |
+| Service (Orchestrator, Reconciler, Scheduler, Treasury, Clock, Platform admin, Auditor, Delivery) | `ServiceCredential`: a value only `more-identity` can mint, carrying a service id and a role, signed by the identity authority (Ed25519). Verifiers hold the authority's public key only, so checking a credential never gives the power to mint one. Each service has its own credential; there is no shared global secret. Tag and revocation are checked on every ledger call and every coordinator command | Separate processes, mTLS client certificates per service, short-lived tokens |
 
 A user role is never a property of the account alone. It comes from the resource: a borrower is the borrower **of this job**, a lender is a lender **of this attempt**, a witness is the witness **assigned to this attempt**, and pool rights (borrow, lend, witness, admin) are granted per pool by its admin.
 
