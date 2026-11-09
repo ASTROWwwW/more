@@ -741,3 +741,26 @@ fn delivery_attested_by_a_lender_is_inadmissible() {
         "charged, provisionally"
     );
 }
+
+/// A revoked service credential stops working at the coordinator, not only at the ledger.
+#[test]
+fn revoked_service_credential_is_refused_by_the_coordinator() {
+    let mut e = Edge::running();
+    let scheduler = e.sim.ids.scheduler.clone();
+    let ctx = AuthContext::service(scheduler.clone());
+    assert!(e
+        .sim
+        .exec_as(
+            &ctx,
+            Command::NodeLost {
+                job: J1,
+                expected_version: None,
+            }
+        )
+        .is_ok());
+    e.sim.ids.revoke(&scheduler);
+    let before = e.sim.coord.clone();
+    let r = e.sim.exec_as(&ctx, Command::Reserve { job: J2 });
+    assert_eq!(r.map_err(|x| x.code()), Err("UNAUTHORIZED"));
+    assert_eq!(before, e.sim.coord);
+}

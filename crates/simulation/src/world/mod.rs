@@ -49,7 +49,7 @@ impl Default for Sim {
 impl Sim {
     pub fn new(cfg: Config) -> Self {
         let (ids, orchestrator) = SimIdentity::new();
-        let coord = Coordinator::new(cfg, ids.verifier_ledger(), orchestrator)
+        let coord = Coordinator::new(cfg, ids.verifier_ledger(), orchestrator, ids.verifier())
             .expect("valid simulation config");
         let mut sim = Sim {
             coord,

@@ -43,7 +43,17 @@ impl SimIdentity {
         (ids, orchestrator)
     }
 
-    /// Credential of a service that is not part of the standard set (compromise tests).
+    /// Credential checker of this world's authority.
+    pub fn verifier(&self) -> more_identity::CredentialVerifier {
+        self.authority.verifier()
+    }
+
+    /// Revokes a service credential (compromise tests).
+    pub fn revoke(&self, cred: &ServiceCredential) {
+        self.authority.revoke(cred.id());
+    }
+
+    /// Ledger service bound to this world's identities.
     pub fn verifier_ledger(&self) -> LedgerService {
         LedgerService::new(
             self.authority.verifier(),

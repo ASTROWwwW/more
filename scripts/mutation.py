@@ -147,6 +147,8 @@ MUTATIONS = [
      [(".filter(|t| *t <= MAX_TIME)", "")]),
     ("M60", "Signature checked but its result ignored", COORD,
      [("key.verify(message, &Signature::from_bytes(signature))\n            .map_err(|_| AuthError::BadSignature)?;", "let _ = key.verify(message, &Signature::from_bytes(signature));")]),
+    ("M61", "Coordinator accepts revoked or forged service credentials", COORD,
+     [(".map_err(|_| DomainError::Unauthorized(\"invalid or revoked service credential\"))?;", ".ok();")]),
 ]
 
 EXTRA = {

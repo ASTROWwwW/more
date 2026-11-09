@@ -20,5 +20,5 @@ pub use error::DomainError;
 pub use gpu_ledger::{Account, Amount, Ledger, LedgerApiError, LedgerService};
 pub use ids::*;
 pub use model::*;
-pub use more_identity::{AuthContext, ServiceCredential, ServiceRole};
+pub use more_identity::{AuthContext, CredentialVerifier, ServiceCredential, ServiceRole};
 pub use registry::{ModelSpec, Pool, PoolAccess, PoolMode, Registry, Rights};

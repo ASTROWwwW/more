@@ -12,7 +12,7 @@ use gpu_ledger::{
     Account, Amount, EscrowBucket, IssueTo, Ledger, LedgerApiError, LedgerError, LedgerOp,
     LedgerOutcome, LedgerService, LineRef, LineSource,
 };
-use more_identity::{AuthContext, ServiceCredential, ServiceRole};
+use more_identity::{AuthContext, CredentialVerifier, ServiceCredential, ServiceRole};
 
 use crate::authorization::authorize;
 use crate::command::{Command, IssueTarget, Outcome};
@@ -46,6 +46,8 @@ pub struct Coordinator {
     ledger: LedgerService,
     /// The orchestrator's credential towards the ledger (role `Orchestrator`).
     cred: ServiceCredential,
+    /// Checks the credentials of calling services (tag and revocation), like the ledger does.
+    verifier: CredentialVerifier,
     /// Model Registry: pools, members, catalog.
     registry: Registry,
     /// Delivery state: charges, contests, witness commitments.
@@ -95,9 +97,20 @@ fn sub(a: Amount, b: Amount, what: &'static str) -> R<Amount> {
 }
 
 impl Coordinator {
-    pub fn new(cfg: Config, ledger: LedgerService, cred: ServiceCredential) -> R<Self> {
+    /// `ledger` is the Ledger service; `cred` must be an Orchestrator credential it accepts;
+    /// `verifier` checks the credentials of the services that send commands.
+    ///
+    /// # Errors
+    /// `InvalidInput` for a config outside the arithmetic bounds or a credential that is not a
+    /// valid Orchestrator one.
+    pub fn new(
+        cfg: Config,
+        ledger: LedgerService,
+        cred: ServiceCredential,
+        verifier: CredentialVerifier,
+    ) -> R<Self> {
         cfg.validate().map_err(DomainError::InvalidInput)?;
-        if cred.role() != ServiceRole::Orchestrator {
+        if verifier.verify(&cred) != Ok(ServiceRole::Orchestrator) {
             return Err(DomainError::InvalidInput(
                 "orchestrator credential expected",
             ));
@@ -107,6 +120,7 @@ impl Coordinator {
             now: 0,
             ledger,
             cred,
+            verifier,
             registry: Registry::default(),
             delivery: DeliveryBook::default(),
             jobs: BTreeMap::new(),
@@ -123,6 +137,13 @@ impl Coordinator {
     /// Authorizes then applies a command atomically. An unauthorized command is refused before
     /// anything is touched (SEC-001).
     pub fn execute(&mut self, ctx: &AuthContext, cmd: &Command) -> R<Outcome> {
+        // A service credential is checked on every command: a revoked one stops working here as
+        // it does at the ledger.
+        if let Some(c) = ctx.credential() {
+            self.verifier
+                .verify(c)
+                .map_err(|_| DomainError::Unauthorized("invalid or revoked service credential"))?;
+        }
         authorize(self, ctx, cmd)?;
         let mut next = self.clone();
         let out = next.step(ctx, cmd)?;
