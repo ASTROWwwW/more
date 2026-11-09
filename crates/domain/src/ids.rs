@@ -12,6 +12,10 @@ pub struct AccountId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PoolId(pub u32);
 
+/// Model of a pool's catalog (Model Registry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelId(pub u32);
+
 /// Work type; each has its own flow budget (JOB-R13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkType {

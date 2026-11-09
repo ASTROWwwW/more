@@ -1,0 +1,178 @@
+# Validation
+
+How the changes of branch `hardening/security-architecture` were checked, with the real results. Environment: Linux, Rust 1.97.0, one machine, November 9, 2026. Baseline: `8e020bd`. Final code: `ae43129`.
+
+## Commands and results
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Clean, with the new workspace lints (no `unsafe`, `unwrap`, `expect`, `panic!` in production crates) |
+| `cargo test --workspace` (test profile: overflow checks on, 512 traces per generator) | 101 tests passed, 0 failed |
+| `cargo test --release --workspace` | 101 passed, 0 failed |
+| `cargo clean && PROPTEST_CASES=5000 cargo test --release --workspace` | 101 passed, 0 failed; 74 s including build, property tests 31.5 s |
+| `python3 scripts/mutation.py` | 60 of 62 on `ac03abf`; the 2 others fixed and caught on the final code, with the 2 mutants added after (64 of 64) |
+
+GitHub Actions (format and lints, minimum Rust version, debug tests, release tests) passed on `b8e790b` and runs on every later push. The first CI run had failed twice: newer clippy flagged redundant glob imports that 1.97 accepts, and `proptest` 1.12 needs Rust 1.88, not the 1.87 first declared. Both fixed; the minimum is now 1.88 and CI checks it.
+
+### Tests, before and after
+
+| Suite | Baseline | Now | Added |
+| --- | --- | --- | --- |
+| `more-identity` (unit) | — | 4 | credential forgery, other authority, revocation, signatures |
+| `gpu-ledger` (unit) | 5 | 5 | |
+| `gpu-ledger` (API, from outside the crate) | — | 9 | role matrix, forged and revoked credentials, issuance limits near `u64::MAX`, mandates, compromised scheduler and delivery service, atomic rollback, read scopes |
+| `gpu-ledger` (doc test) | — | 1 | the generic transfer does not compile from outside the crate |
+| `gpu-protocol` (unit) | 4 | 4 | signature coverage, replay policy, bounded retransmission window; three older tests now run on signed envelopes in `tests/security/`, under their original names |
+| `tests/properties` | 5 | 5 | TEST-P29 and impersonation in every generator |
+| `tests/scenarios` | 46 | 46 | JOB-F41 (M50) and JOB-F25 (M21) strengthened |
+| `tests/regressions` | 7 | 8 | CE-07 |
+| `tests/security` | — | 19 | the ten attacks of the audit, three simulated compromises, unsigned or altered messages, a revoked service credential, distinct lenders, and the three protocol tests kept by name |
+| **Total** | **67** | **101** | |
+
+No test was deleted. The two counterexample seeds found during this work are in `tests/properties/proptest-regressions.txt` (11 seeds in total).
+
+### The ten required security cases
+
+| # | Case | Test | Checked |
+| --- | --- | --- | --- |
+| 1 | Account A cancels account B's job | `borrower_cannot_cancel_another_borrowers_job` | `UNAUTHORIZED`, state unchanged |
+| 2 | Account A confirms B's tokens | `borrower_cannot_ack_or_confirm_another_borrowers_tokens` | same |
+| 3 | A lender passes itself off as the witness | `lender_cannot_act_as_witness` | `INADMISSIBLE_PROOF` as itself, `BAD_SIGNATURE` in the witness's name, `UNAUTHORIZED` for the witness's buffer |
+| 4 | A lender renews another's lease | `only_lenders_of_the_attempt_renew_its_lease` | `UNAUTHORIZED` |
+| 5 | Receipt commitment in another lender's name | `receipt_commitments_come_from_the_recipient_only` | producer and wrong recipient refused, wrong digest `INADMISSIBLE_PROOF`, right recipient accepted |
+| 6 | Expired attempt still sending work | `expired_or_revoked_attempt_cannot_send_work` | `LEASE_EXPIRED`, then `STALE_ATTEMPT` |
+| 7 | Price fraudulently set to zero | `the_client_never_sets_the_price` | no price field; tariff from the catalog; budget below cost refused; only admins set tariffs; no tariff in free pools |
+| 8 | Non-member in a private pool | `non_member_cannot_use_a_private_pool` | `UNAUTHORIZED`; self-join refused in a private pool, allowed in an open one without the witness right |
+| 9 | Amounts near `u64::MAX` | `extreme_values_are_refused_without_panic`, `issuance_limits_hold_near_u64_max` | `LIMIT_EXCEEDED`, `INVALID_INPUT`, `ARITHMETIC_OVERFLOW`; no panic in debug or release; balances unchanged |
+| 10 | Refused answer, then retransmission with the same business key | `retransmission_gets_the_first_answer_and_runs_nothing` | same answer, nothing run twice; new number: domain idempotency (`AlreadyApplied`); same number, other content: `REPLAY` |
+
+Every refusal test compares the whole coordinator state before and after.
+
+### Coverage of the reference run
+
+Written by the tests themselves in `target/coverage/` during the 5,000-trace run.
+
+| Measure | General | Failures | Partial reserve | Delivery | Total |
+| --- | --- | --- | --- | --- | --- |
+| Traces | 5,011 | 5,011 | 2,511 | 5,011 | 17,544 |
+| Commands run and checked | 543,495 | 715,509 | 338,786 | 711,322 | 2,309,112 |
+| accepted | 380,049 | 513,874 | 247,751 | 547,730 | 1,689,404 |
+| `UNAUTHORIZED` refusals (impersonation) | 9,364 | 11,445 | 5,271 | 10,722 | 36,802 |
+| `INADMISSIBLE_PROOF` refusals | 1,961 | 2,016 | 936 | 11,171 | 16,084 |
+| `LEASE_EXPIRED` refusals | 5,820 | 27,391 | 12,724 | 18,056 | 63,991 |
+| Outputs charged on ack | 409 | 1,632 | 732 | 711 | 3,484 |
+| Outputs charged provisionally | 383 | 2,069 | 789 | 2,487 | 5,728 |
+| Contribution payments | 616 | 3,247 | 1,309 | 2,747 | 7,919 |
+| Recovery payments | 60 | 724 | 306 | 643 | 1,733 |
+| Rewinds | 5 | 45 | 22 | 428 | 500 |
+| Payments by arbitration | 1 | 61 | 23 | 14 | 99 |
+| Rewards released | 290 | 1,891 | 770 | 1,652 | 4,603 |
+
+Impersonation operations send a realistic command from a random account or service. 36,802 of them were refused as unauthorized; the ones that happened to come from the right sender were accepted, and TEST-P29 checked every accepted command against the independent oracle.
+
+## Mutation campaign
+
+64 mutants: the 52 of v2.5, 16 of them with anchors moved to the new code with the same bug, and 12 new ones on the trust boundaries (M51 to M62). The suite run for each mutant is now the whole workspace (unit, ledger API, security, properties at 300 traces, scenarios, regressions), not only the conformance tests.
+
+Full campaign on `ac03abf`: 60 of 62 caught in 27 min. The two others were fixed (below) and rerun on the final code with M60, M61 and M62: all caught. **64 of 64 caught on the final code, 48 of them by a property in the full campaign.**
+
+| Mutation | Injected bug | Result | Caught by |
+| --- | --- | --- | --- |
+| M01 | v2.1 bug: JOB-T04 resets execution_intent to initial | caught | TEST-P07 |
+| M02 | v2.1 bug: contribution payable on another attempt | caught | TEST-P04 |
+| M03 | v2.2 bug: contribution id without layer range | caught | TEST-P23 |
+| M04 | v2.2 bug: no pending_evaluation at closure | caught | TEST-P06, TEST-P12, TEST-P16 |
+| M05 | Contest that creates credits | caught | TEST-P12 |
+| M06 | Cancel allowed while settling | caught | `f09_*` |
+| M06b | Cancel allowed while settling (transition table too) | caught | TEST-P11 |
+| M07 | Flow control disabled | caught | TEST-P09 |
+| M08 | Anti-collusion cap ignored | caught | TEST-P08 |
+| M09 | Late commitment accepted as prior | caught | TEST-P08 |
+| M09b | CE-03 back: bound = revocation, not slice closure | caught | TEST-P08 |
+| M10 | Settlement forgets OutputHold | caught | TEST-P13 |
+| M11 | CE-01 back: pool relay without active escrow | caught | TEST-P13, TEST-P17 |
+| M12 | CE-02 back: pool share returned to the borrower | caught | TEST-P17 |
+| M13 | Resume without state restore | caught | TEST-P07, TEST-P25 |
+| M14 | Work accepted on a revoked attempt | caught | TEST-P04 |
+| M15 | Reconciliation without default dispute arbitration | caught | TEST-P06, TEST-P23 |
+| M16 | Unvalidated window coverage disabled (JOB-R25) | caught | TEST-P18 |
+| M17 | Pool relay used before the borrower budget | caught | TEST-P17 |
+| M18 | Recovery not capped by the earmark | caught | TEST-P06, TEST-P14, TEST-P16 |
+| M19 | Flow budget measured from delivered positions (colluding witness unbounded) | caught | TEST-P09 |
+| M20 | Attestation from someone other than the assigned witness accepted | caught | TEST-P20 |
+| M21 | Non-independent witness accepted at placement | missed, then caught after the fix below | TEST-P20, `f25_*` |
+| M22 | Contribution evaluated while its output is provisional | caught | TEST-P22 |
+| M23 | Rewind without cascade: only the lost position is voided | caught | TEST-P05, TEST-P06, TEST-P27 |
+| M24 | Rewind without revoking the live attempt | caught | TEST-P25 |
+| M25 | Work accepted under an expired lease | caught | TEST-P24 |
+| M26 | Reconciliation does not revoke expired leases | caught | TEST-P24 |
+| M27 | Heartbeat renews an expired lease | caught | TEST-P24 |
+| M28 | Delivery window closed without waiting for revocation | caught | TEST-P20 |
+| M29 | Client may confirm beyond delivered | caught | TEST-P16 |
+| M30 | Resume from validated positions: delivered ones are regenerated | caught | TEST-P09 |
+| M31 | CE-04 back: already decided item evaluated twice | caught | TEST-P06, TEST-P16, TEST-P23 |
+| M32 | CE-05 back: zero reward never closed | caught | TEST-P23 |
+| M33 | Closure loses claims (fairness) | caught | TEST-P23 |
+| M34 | Proven contribution refunded when its output becomes definitive (fairness) | caught | TEST-P23 |
+| M35 | Automatic reward release disabled | caught | TEST-P06, TEST-P23 |
+| M36 | Attestation beyond produced accepted | caught | TEST-P09, TEST-P21 |
+| M37 | Contest closed by the replay alone | caught | TEST-P20, TEST-P22 |
+| M38 | Client liveness signal resolves contests | did not compile, then caught after the fix below | `f33_*` |
+| M39 | Frame digest not checked on attestation | caught | TEST-P20 |
+| M40 | Client declaration not bound to the stream | caught | `f35_*` |
+| M41 | Late attestation without prior commitment | caught | TEST-P20 |
+| M42 | Commitment accepted after revocation and counted as prior | caught | TEST-P20 |
+| M43 | Buffer purged despite an open contest | caught | TEST-P26 |
+| M44 | Per-calendar-day cap instead of a sliding window | caught | TEST-P08 |
+| M45 | Refund restores the quota (net amounts) | caught | `f40_*` |
+| M46 | Refund for missing proof before the deadline | caught | TEST-P28 |
+| M47 | Expired window ignores contests | caught | TEST-P20, TEST-P27 |
+| M48 | Contest deadline never enforced | caught | TEST-P06, TEST-P27 |
+| M49 | CE-06 back: slice finished before the deadline with an awaiting contribution | caught | TEST-P12 |
+| M50 | Supplementary proof accepted after the deadline | caught | TEST-P28 |
+| M51 | Authorization skipped before execution | caught | TEST-P29 |
+| M52 | Ledger accepts any service role for any operation | caught | `compromise_*`, `compromise_*`, `only_*` |
+| M53 | Ledger opens an escrow without checking the borrower's mandate | caught | `escrow_*` |
+| M54 | Ledger lets reservations exceed the signed mandate | caught | `compromise_*` |
+| M55 | Receipts committed by anyone, the producer included | caught | `receipt_*` |
+| M56 | Exact retransmission runs the command again | caught | `retransmission_*` |
+| M57 | One lender may hold several ranges of an attempt | caught | `one_*` |
+| M58 | Tariff above MAX_PRICE accepted | caught | `extreme_*` |
+| M59 | Clock allowed beyond MAX_TIME | caught | `extreme_*` |
+| M60 | Signature checked but its result ignored | caught | `escrow_*`, `lender_*`, `replayed_*` |
+| M61 | Coordinator accepts revoked or forged service credentials | caught (added after the campaign, run on the final code) | `revoked_service_credential_*` |
+| M62 | Service credential accepted without checking the authority's signature | caught (same) | identity unit tests, ledger API tests |
+
+The two that did not pass the full campaign:
+
+- **M21** (non-independent witness accepted): JOB-F25 placed a lender as witness, but that lender had no witness right, so the new rights check refused it before the independence check was reached. Removing the independence check went unnoticed. JOB-F25 now uses the lender that does hold the witness right, so only the independence rule can refuse it. TEST-P20 also catches it, on some runs.
+- **M38** (liveness signal resolves contests): the mutant still referred to a field that moved into `DeliveryBook`, so it did not compile. Rewritten against the book; caught by JOB-F33.
+
+Mutants caught only by a scenario or a security test: M06 changes an error code only; M40 and M45 were caught by properties in earlier runs, not in this one; M52 to M62 test the ledger API, the identity crate and the protocol edge, which the property generators do not drive (they authenticate through `test-support`) and which their own tests cover.
+
+### Defects found in the campaign script
+
+- A mutant that does not compile used to be reported as "missed" (its test list was empty). Compile errors are now reported as such. Earlier campaigns were not inflated by this: a compile error could only lower their score.
+- M57 did not compile as first written (type inference on an unused set); rewritten.
+- Failing tests inside modules (`lifecycle::f09_...`, after the scenarios were split into files) were not recognized, so a mutant caught only by such a test was reported missed (M06 in a first, interrupted run). The script now reads module paths and runs every test binary (`--no-fail-fast`). The campaign was restarted from scratch after this fix.
+- M58 survived its first run: the security test checked all catalog bounds with one input that broke all of them, so removing one bound was invisible. The test now checks each bound separately; M58 is caught.
+
+## Benchmark
+
+Same machine, same command (`PROPTEST_CASES=5000 cargo test --release --workspace`), property tests only:
+
+| | Commands checked | Time | Commands per second |
+| --- | --- | --- | --- |
+| Baseline `8e020bd` | 1,998,359 | 18.8 s | 106,000 |
+| `ae43129` | 2,309,112 | 31.5 s | 73,000 |
+
+About 31 % slower per command: authorization before every command, a credential check on every ledger operation and every service command (signature verified once per credential, revocation each time), checked arithmetic and the extra checker work (TEST-P29). Each command also clones a slightly larger state. These figures describe the in-memory model and its checker, not a PostgreSQL coordinator.
+
+## Limits of this validation
+
+- Boundaries between trust domains are in-process (compiler, private types, checks on every call). Process, OS and database isolation are specified in `docs/SECURITY_ARCHITECTURE.md` but not built.
+- Envelope signatures are real Ed25519; frame, receipt and ledger-chain digests are still FNV-1a. Delivery on a real network is not shown.
+- The simulation authenticates accounts through the `test-support` feature; signatures themselves are tested at the protocol edge and in `tests/security/`.
+- Properties are checked on finite random traces; they are not proven for all traces.
+- A green test count is not the claim. The claims are the specific checks listed above, the mutants they catch, and the open issues of `docs/AUDIT_CODE.md`.

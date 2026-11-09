@@ -1,381 +1,36 @@
-//! Message contract (spec section 5), first draft. Each message becomes a domain command. The wire
-//! format is not fixed yet; this crate pins what does not depend on it: the envelope (PROTO-001),
-//! size checks before decoding (PROTO-002), stable error codes (PROTO-004) and replay protection
-//! (JOB-R05).
+//! Protocol edge (spec section 5). Authenticates each message (Ed25519, `more-identity`), guards
+//! against replays, turns it into a domain command whose actor is the authenticated sender, and
+//! hands it to the coordinator with an [`more_identity::AuthContext`]. The wire transport (QUIC)
+//! is not here yet; the fixed binary encoding of what is signed is.
 
-use std::collections::BTreeMap;
+mod dispatch;
+mod envelope;
+mod errors;
+mod limits;
+mod messages;
+mod replay_guard;
 
-use gpu_domain::*;
-
-pub const PROTOCOL_VERSION: u16 = 1;
-
-/// Envelope shared by every message (PROTO-001).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Envelope {
-    pub version: u16,
-    pub sender: AccountId,
-    pub seq: u64,
-    /// Sender signature. The model does no cryptography; a zero signature is rejected.
-    pub signature: u64,
-    pub body: Message,
-}
-
-/// Messages per transition (spec section 5).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Message {
-    SubmitJob {
-        job: JobId,
-        pool: PoolId,
-        layout: Vec<u32>,
-        price: PerType<Amount>,
-        max_outputs: PerType<u32>,
-    },
-    CancelJob {
-        job: JobId,
-    },
-    ResumeJob {
-        job: JobId,
-        topup: Amount,
-    },
-    AssignAck {
-        job: JobId,
-        attempt: u32,
-        restored: PerType<u32>,
-    },
-    AssignReject {
-        job: JobId,
-        attempt: u32,
-    },
-    Produced {
-        job: JobId,
-        attempt: u32,
-        wt: WorkType,
-        upto: u32,
-    },
-    TokenAck {
-        job: JobId,
-        attempt: u32,
-        wt: WorkType,
-        upto: u32,
-    },
-    ReceiptCommit {
-        job: JobId,
-        attempt: u32,
-        producer: AccountId,
-        wt: WorkType,
-        upto: u32,
-    },
-    UsageReport {
-        slice: SliceId,
-        items: Vec<ClaimItem>,
-    },
-    /// Lease renewal (JOB-R31).
-    Heartbeat {
-        job: JobId,
-        attempt: u32,
-    },
-    /// Witness to coordinator: positions `< upto` reached the client's transport (JOB-R26). The
-    /// envelope signer is the attester.
-    DeliveryAttestation {
-        job: JobId,
-        attempt: u32,
-        wt: WorkType,
-        upto: u32,
-        /// Chained digest of the frames signed by the output node (JOB-R34).
-        digest: u64,
-    },
-    /// Witness to coordinator: short stamped commitment (JOB-R32).
-    WitnessCommitment {
-        job: JobId,
-        attempt: u32,
-        wt: WorkType,
-        upto: u32,
-    },
-    /// Client to coordinator: keepalive, covers no position (JOB-R33).
-    ClientHeartbeat {
-        job: JobId,
-    },
-    /// Client to coordinator: "I hold exactly `0..confirmed`" (JOB-R28).
-    DeliveryConfirm {
-        job: JobId,
-        wt: WorkType,
-        confirmed: u32,
-        /// Digest of the held prefix, bound to the stream (JOB-R34).
-        digest: u64,
-    },
-}
-
-impl Message {
-    pub fn kind(&self) -> MessageKind {
-        match self {
-            Message::SubmitJob { .. } => MessageKind::SubmitJob,
-            Message::CancelJob { .. } => MessageKind::CancelJob,
-            Message::ResumeJob { .. } => MessageKind::ResumeJob,
-            Message::AssignAck { .. } => MessageKind::AssignAck,
-            Message::AssignReject { .. } => MessageKind::AssignReject,
-            Message::Produced { .. } => MessageKind::Produced,
-            Message::TokenAck { .. } => MessageKind::TokenAck,
-            Message::ReceiptCommit { .. } => MessageKind::ReceiptCommit,
-            Message::UsageReport { .. } => MessageKind::UsageReport,
-            Message::Heartbeat { .. } => MessageKind::Heartbeat,
-            Message::DeliveryAttestation { .. } => MessageKind::DeliveryAttestation,
-            Message::DeliveryConfirm { .. } => MessageKind::DeliveryConfirm,
-            Message::WitnessCommitment { .. } => MessageKind::WitnessCommitment,
-            Message::ClientHeartbeat { .. } => MessageKind::ClientHeartbeat,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MessageKind {
-    SubmitJob,
-    CancelJob,
-    ResumeJob,
-    AssignAck,
-    AssignReject,
-    Produced,
-    TokenAck,
-    ReceiptCommit,
-    UsageReport,
-    Heartbeat,
-    DeliveryAttestation,
-    DeliveryConfirm,
-    WitnessCommitment,
-    ClientHeartbeat,
-}
-
-impl MessageKind {
-    /// Maximum frame size, checked before decoding (PROTO-002). Provisional values.
-    pub fn max_frame_bytes(self) -> usize {
-        match self {
-            MessageKind::SubmitJob => 4 * 1024,
-            MessageKind::UsageReport => 64 * 1024,
-            _ => 512,
-        }
-    }
-}
-
-/// Stable error codes (PROTO-004).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProtoError {
-    UnsupportedVersion,
-    FrameTooLarge,
-    MissingSignature,
-    Replay,
-    /// Domain error with its stable code.
-    Rejected(&'static str),
-}
-
-impl ProtoError {
-    pub fn code(&self) -> &'static str {
-        match self {
-            ProtoError::UnsupportedVersion => "UNSUPPORTED_VERSION",
-            ProtoError::FrameTooLarge => "FRAME_TOO_LARGE",
-            ProtoError::MissingSignature => "MISSING_SIGNATURE",
-            ProtoError::Replay => "REPLAY",
-            ProtoError::Rejected(c) => c,
-        }
-    }
-}
-
-/// Stable code for each domain rejection (PROTO-004).
-pub fn domain_code(e: &DomainError) -> &'static str {
-    match e {
-        DomainError::UnknownJob(_) => "UNKNOWN_JOB",
-        DomainError::UnknownSlice(_) => "UNKNOWN_SLICE",
-        DomainError::UnknownPool => "UNKNOWN_POOL",
-        DomainError::InvalidTransition { .. } => "INVALID_TRANSITION",
-        DomainError::InvalidSliceTransition { .. } => "INVALID_SLICE_TRANSITION",
-        DomainError::VersionConflict { .. } => "VERSION_CONFLICT",
-        DomainError::StaleAttempt => "STALE_ATTEMPT",
-        DomainError::JobSettling => "JOB_SETTLING",
-        DomainError::FlowBudgetExceeded => "FLOW_BUDGET_EXCEEDED",
-        DomainError::WindowNotCovered => "WINDOW_NOT_COVERED",
-        DomainError::RecoveryBudget => "RECOVERY_BUDGET",
-        DomainError::InadmissibleProof => "INADMISSIBLE_PROOF",
-        DomainError::LeaseExpired => "LEASE_EXPIRED",
-        DomainError::Precondition(_) => "PRECONDITION_FAILED",
-        DomainError::Ledger(_) => "LEDGER_REJECTED",
-        DomainError::Internal(_) => "INTERNAL",
-    }
-}
-
-/// Checks a frame's declared size BEFORE decoding it (PROTO-002).
-pub fn check_frame(kind: MessageKind, declared_len: usize) -> Result<(), ProtoError> {
-    if declared_len > kind.max_frame_bytes() {
-        return Err(ProtoError::FrameTooLarge);
-    }
-    Ok(())
-}
-
-/// Replay guard: strictly increasing sequence number per sender.
-#[derive(Clone, Debug, Default)]
-pub struct ReplayGuard {
-    last_seq: BTreeMap<AccountId, u64>,
-}
-
-impl ReplayGuard {
-    pub fn admit(&mut self, env: &Envelope) -> Result<(), ProtoError> {
-        if env.version != PROTOCOL_VERSION {
-            return Err(ProtoError::UnsupportedVersion);
-        }
-        if env.signature == 0 {
-            return Err(ProtoError::MissingSignature);
-        }
-        let last = self.last_seq.get(&env.sender).copied();
-        if last.is_some_and(|l| env.seq <= l) {
-            return Err(ProtoError::Replay);
-        }
-        self.last_seq.insert(env.sender, env.seq);
-        Ok(())
-    }
-}
-
-/// Turns an admitted message into a domain command.
-pub fn to_command(env: &Envelope) -> Command {
-    let sender = env.sender;
-    match &env.body {
-        Message::SubmitJob {
-            job,
-            pool,
-            layout,
-            price,
-            max_outputs,
-        } => Command::Submit {
-            job: *job,
-            borrower: sender,
-            pool: *pool,
-            layout: layout.clone(),
-            price: *price,
-            max_outputs: *max_outputs,
-        },
-        Message::CancelJob { job } => Command::Cancel {
-            job: *job,
-            expected_version: None,
-        },
-        Message::ResumeJob { job, topup } => Command::Resume {
-            job: *job,
-            topup: *topup,
-        },
-        Message::AssignAck {
-            job,
-            attempt,
-            restored,
-        } => Command::AttemptReady {
-            job: *job,
-            attempt: *attempt,
-            restored: *restored,
-        },
-        Message::AssignReject { job, .. } => Command::PlacementFailed { job: *job },
-        Message::Produced {
-            job,
-            attempt,
-            wt,
-            upto,
-        } => Command::Produce {
-            job: *job,
-            attempt: *attempt,
-            wt: *wt,
-            upto: *upto,
-        },
-        Message::TokenAck {
-            job,
-            attempt,
-            wt,
-            upto,
-        } => Command::Ack {
-            job: *job,
-            attempt: *attempt,
-            wt: *wt,
-            upto: *upto,
-        },
-        Message::ReceiptCommit {
-            job,
-            attempt,
-            producer,
-            wt,
-            upto,
-        } => Command::CommitReceipts {
-            job: *job,
-            attempt: *attempt,
-            lender: *producer,
-            wt: *wt,
-            upto: *upto,
-        },
-        Message::Heartbeat { job, attempt } => Command::Heartbeat {
-            job: *job,
-            attempt: *attempt,
-        },
-        Message::DeliveryAttestation {
-            job,
-            attempt,
-            wt,
-            upto,
-            digest,
-        } => Command::Deliver {
-            job: *job,
-            attempt: *attempt,
-            witness: sender,
-            wt: *wt,
-            upto: *upto,
-            digest: *digest,
-        },
-        Message::WitnessCommitment {
-            job,
-            attempt,
-            wt,
-            upto,
-        } => Command::WitnessCommit {
-            job: *job,
-            attempt: *attempt,
-            witness: sender,
-            wt: *wt,
-            upto: *upto,
-        },
-        Message::ClientHeartbeat { job } => Command::ClientHeartbeat { job: *job },
-        Message::DeliveryConfirm {
-            job,
-            wt,
-            confirmed,
-            digest,
-        } => Command::ConfirmDelivery {
-            job: *job,
-            wt: *wt,
-            confirmed: *confirmed,
-            digest: *digest,
-        },
-        Message::UsageReport { slice, items } => Command::Claim {
-            slice: *slice,
-            lender: sender,
-            items: items.clone(),
-        },
-    }
-}
-
-/// Full chain: admission, translation, atomic application.
-pub fn handle(
-    guard: &mut ReplayGuard,
-    coord: &mut Coordinator,
-    env: &Envelope,
-) -> Result<Outcome, ProtoError> {
-    guard.admit(env)?;
-    coord
-        .apply(&to_command(env))
-        .map_err(|e| ProtoError::Rejected(domain_code(&e)))
-}
+pub use dispatch::{handle, to_command};
+pub use envelope::{Envelope, PROTOCOL_VERSION};
+pub use errors::{domain_code, ProtoError};
+pub use limits::check_frame;
+pub use messages::{Message, MessageKind};
+pub use replay_guard::{Admission, Answer, ReplayGuard, RECENT};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpu_domain::{AccountId, JobId, Outcome};
+    use more_identity::UserKey;
 
-    fn env(seq: u64, body: Message) -> Envelope {
-        Envelope {
-            version: PROTOCOL_VERSION,
-            sender: AccountId(9),
+    fn env(session: u64, seq: u64, body: Message) -> Envelope {
+        Envelope::signed(
+            AccountId(9),
+            session,
             seq,
-            signature: 1,
             body,
-        }
+            &UserKey::from_seed([9; 32]),
+        )
     }
 
     #[test]
@@ -388,103 +43,53 @@ mod tests {
     }
 
     #[test]
-    fn replayed_or_unsigned_messages_rejected() {
+    fn signature_covers_every_field() {
+        let a = env(1, 5, Message::CancelJob { job: JobId(1) });
+        let mut b = a.clone();
+        b.body = Message::CancelJob { job: JobId(2) };
+        assert_ne!(a.signing_bytes(), b.signing_bytes());
+        let mut c = a.clone();
+        c.session = 2;
+        assert_ne!(a.signing_bytes(), c.signing_bytes());
+    }
+
+    #[test]
+    fn replay_policy() {
         let mut g = ReplayGuard::default();
         let m = Message::CancelJob { job: JobId(1) };
-        assert!(g.admit(&env(5, m.clone())).is_ok());
-        assert_eq!(g.admit(&env(5, m.clone())), Err(ProtoError::Replay));
-        assert_eq!(g.admit(&env(4, m.clone())), Err(ProtoError::Replay));
-        let mut unsigned = env(6, m.clone());
-        unsigned.signature = 0;
-        assert_eq!(g.admit(&unsigned), Err(ProtoError::MissingSignature));
-        let mut old = env(7, m);
-        old.version = 0;
-        assert_eq!(g.admit(&old), Err(ProtoError::UnsupportedVersion));
-    }
-
-    #[test]
-    fn domain_refusal_has_stable_code() {
-        let mut c = Coordinator::new(Config::default());
-        let mut g = ReplayGuard::default();
-        let r = handle(
-            &mut g,
-            &mut c,
-            &env(1, Message::CancelJob { job: JobId(42) }),
-        );
-        assert_eq!(r.unwrap_err().code(), "UNKNOWN_JOB");
-    }
-
-    /// JOB-R26: an attestation signed by a lender instead of the assigned witness is rejected with
-    /// a stable code and no state change.
-    #[test]
-    fn delivery_attested_by_a_lender_is_inadmissible() {
-        let mut c = Coordinator::new(Config::default());
-        for cmd in [
-            Command::CreatePool {
-                pool: PoolId(1),
-                mode: PoolMode::Credits,
-            },
-            Command::Issue {
-                id: 1,
-                to: IssueTarget::User(AccountId(1)),
-                amount: 1_000,
-            },
-            Command::Submit {
-                job: JobId(1),
-                borrower: AccountId(1),
-                pool: PoolId(1),
-                layout: vec![1],
-                price: [0, 10, 0],
-                max_outputs: [0, 4, 0],
-            },
-            Command::Reserve { job: JobId(1) },
-            Command::Place {
-                job: JobId(1),
-                lenders: vec![AccountId(10)],
-                recovery_estimate: 0,
-                witness: AccountId(90),
-                expected_version: None,
-            },
-            Command::AttemptReady {
-                job: JobId(1),
-                attempt: 1,
-                restored: [0; 3],
-            },
-            Command::Produce {
-                job: JobId(1),
-                attempt: 1,
-                wt: WorkType::Generate,
-                upto: 2,
-            },
-        ] {
-            c.apply(&cmd).unwrap();
-        }
-        let mut g = ReplayGuard::default();
-        let body = Message::DeliveryAttestation {
-            job: JobId(1),
-            attempt: 1,
-            wt: WorkType::Generate,
-            upto: 2,
-            digest: c.frame_digest(JobId(1), WorkType::Generate, 2),
-        };
-        let before = c.clone();
-        let mut forged = env(1, body.clone());
-        forged.sender = AccountId(10);
+        let first = env(1, 5, m.clone());
+        assert_eq!(g.admit(&first), Ok(Admission::Fresh));
+        let answer = Err(ProtoError::Rejected("STALE_ATTEMPT"));
+        g.record(&first, &answer);
+        // Exact retransmission: same answer, nothing run again.
+        assert_eq!(g.admit(&first), Ok(Admission::Retransmission(answer)));
+        // Same number, other content: replay.
         assert_eq!(
-            handle(&mut g, &mut c, &forged).unwrap_err().code(),
-            "INADMISSIBLE_PROOF"
+            g.admit(&env(1, 5, Message::CancelJob { job: JobId(2) })),
+            Err(ProtoError::Replay)
         );
-        assert_eq!(before, c);
-        let mut genuine = env(2, body);
-        genuine.sender = AccountId(90);
-        assert_eq!(handle(&mut g, &mut c, &genuine), Ok(Outcome::Applied));
-        assert!(
-            !c.charges[&OutputId {
-                job: JobId(1),
-                wt: WorkType::Generate,
-                pos: 1
-            }]
-                .definitive
+        // Older number never seen: replay.
+        assert_eq!(g.admit(&env(1, 4, m.clone())), Err(ProtoError::Replay));
+        // Restarted sender opens session 2 and starts again at 1.
+        assert_eq!(g.admit(&env(2, 1, m.clone())), Ok(Admission::Fresh));
+        // Session 1 is closed for good.
+        assert_eq!(g.admit(&env(1, 6, m)), Err(ProtoError::StaleSession));
+    }
+
+    #[test]
+    fn retransmission_window_is_bounded() {
+        let mut g = ReplayGuard::default();
+        let m = |j| Message::CancelJob { job: JobId(j) };
+        for seq in 1..=(RECENT as u64 + 1) {
+            let e = env(1, seq, m(seq as u32));
+            assert_eq!(g.admit(&e), Ok(Admission::Fresh));
+            g.record(&e, &Ok(Outcome::Applied));
+        }
+        // The oldest answer was dropped: its retransmission is now refused, not run again.
+        assert_eq!(g.admit(&env(1, 1, m(1))), Err(ProtoError::Replay));
+        assert_eq!(
+            g.admit(&env(1, 2, m(2))),
+            Ok(Admission::Retransmission(Ok(Outcome::Applied)))
         );
     }
 }

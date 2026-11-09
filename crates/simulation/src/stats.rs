@@ -28,7 +28,7 @@ impl Stats {
         for (k, n) in &sim.refusal_counts {
             *self.refusals.entry(k.clone()).or_default() += n;
         }
-        for e in &sim.coord.audit {
+        for e in sim.coord.audit_log() {
             match e {
                 AuditEvent::Exec {
                     from: Some(ExecStatus::Running),

@@ -79,21 +79,6 @@ pub enum Intent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PoolMode {
-    Credits,
-    /// Free sharing: no credits, a quota of active jobs per borrower.
-    FreeShare {
-        quota_per_borrower: u32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pool {
-    pub id: PoolId,
-    pub mode: PoolMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PauseReason {
     LowEscrow,
     Requested,
@@ -105,8 +90,10 @@ pub enum PauseReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
     pub no: u32,
-    /// Lender assigned to each layer range (index = stage).
+    /// Lender assigned to each layer range (index = stage). All distinct (JOB-T04).
     pub lenders: Vec<AccountId>,
+    /// Layers per stage, chosen by the scheduler; covers the model exactly.
+    pub layout: Vec<u32>,
     pub issued_at: Time,
     /// Assigned delivery witness (JOB-R26), independent of lenders and borrower; the only one
     /// allowed to attest delivery.
@@ -144,8 +131,12 @@ pub struct Job {
     pub pool: PoolId,
     /// Client stream (session) id; binds frames and acks (JOB-R34).
     pub stream: u64,
-    /// Catalogue model id, covered by the frame digest.
-    pub model: u32,
+    /// Catalog model, covered by the frame digest.
+    pub model: ModelId,
+    /// Layers of the model; every attempt's layout covers exactly this many.
+    pub model_layers: u32,
+    /// Budget the borrower signed for (escrow total never exceeds it, checked by the ledger).
+    pub max_budget: Amount,
     pub version: u64,
     pub exec: ExecStatus,
     pub settle: SettleStatus,
@@ -154,9 +145,7 @@ pub struct Job {
     /// State the current placement came from (JOB-T06).
     pub placing_from: Option<ExecStatus>,
     pub placement_failures: u32,
-    /// Layers per stage (consecutive ranges).
-    pub layout: Vec<u32>,
-    /// Authorized price of one output, per type.
+    /// Price of one output, per type, from the pool's tariff at submission.
     pub price: PerType<Amount>,
     pub max_outputs: PerType<u32>,
     pub est_cost: Amount,
@@ -189,27 +178,51 @@ impl Job {
         self.attempts.get(&self.attempt)
     }
 
+    /// A contribution's share of an output's price: proportional to its layers, rounded down, so
+    /// shares never exceed the price (JOB-R21). `None` if the stage does not exist.
+    pub fn share(&self, attempt: &Attempt, wt: WorkType, stage: usize) -> Option<Amount> {
+        let total = u128::from(attempt.total_layers());
+        let layers = u128::from(*attempt.layout.get(stage)?);
+        if total == 0 {
+            return Some(0);
+        }
+        // price <= MAX_PRICE and layers <= MAX_LAYERS: the product fits in u128 with room to spare.
+        Amount::try_from(u128::from(self.price[wt.idx()]) * layers / total).ok()
+    }
+}
+
+impl Attempt {
     pub fn total_layers(&self) -> u32 {
         self.layout.iter().sum()
     }
 
     /// Layer range `[start, end)` of `stage`.
     pub fn layer_range(&self, stage: usize) -> Option<(u32, u32)> {
-        if stage >= self.layout.len() {
-            return None;
-        }
+        let width = *self.layout.get(stage)?;
         let start: u32 = self.layout[..stage].iter().sum();
-        Some((start, start + self.layout[stage]))
+        Some((start, start + width))
     }
 
-    /// A contribution's share of an output's price: proportional to its layers, rounded down, so
-    /// shares never exceed the price (JOB-R21).
-    pub fn share(&self, wt: WorkType, stage: usize) -> Amount {
-        let total = Amount::from(self.total_layers());
-        if total == 0 {
-            return 0;
+    /// Stage of `lender` in this attempt.
+    pub fn stage_of(&self, lender: AccountId) -> Option<usize> {
+        self.lenders.iter().position(|l| *l == lender)
+    }
+
+    /// Who receives the output of `stage` and commits its receipts (JOB-R15): the next stage, or
+    /// the witness for the output node.
+    pub fn recipient_of(&self, stage: usize) -> Option<AccountId> {
+        if stage + 1 < self.lenders.len() {
+            self.lenders.get(stage + 1).copied()
+        } else if stage + 1 == self.lenders.len() {
+            Some(self.witness)
+        } else {
+            None
         }
-        self.price[wt.idx()] * Amount::from(self.layout[stage]) / total
+    }
+
+    /// The output node: last stage.
+    pub fn output_node(&self) -> Option<AccountId> {
+        self.lenders.last().copied()
     }
 }
 

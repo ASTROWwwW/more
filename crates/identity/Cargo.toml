@@ -1,0 +1,19 @@
+[package]
+name = "more-identity"
+description = "Identity and authentication for More: signatures, service credentials, auth contexts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Lets tests build an authenticated account context without a signature. Never enable it in a
+# production build.
+test-support = []
+
+[dependencies]
+ed25519-dalek = "2.1"
+
+[lints]
+workspace = true

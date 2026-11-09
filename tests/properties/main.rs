@@ -149,6 +149,7 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
         2 => (b(), b()).prop_map(|(job, sel)| Op::ContestReplay { job, sel }),
         1 => (b(), b()).prop_map(|(job, sel)| Op::BoundaryBurst { job, sel }),
         1 => (b(), any::<bool>()).prop_map(|(job, prev)| Op::PurgeBuffer { job, prev }),
+        3 => (b(), b(), b()).prop_map(|(job, sel, sender)| Op::Impersonate { job, sel, sender }),
     ]
 }
 
@@ -185,6 +186,7 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
         1 => (b(), b()).prop_map(|(job, sel)| Op::BoundaryBurst { job, sel }),
         3 => (b(), any::<bool>()).prop_map(|(job, prev)| Op::PurgeBuffer { job, prev }),
         3 => (b(), b(), any::<bool>()).prop_map(|(job, sel, honest)| Op::Supplement { job, sel, honest }),
+        3 => (b(), b(), b()).prop_map(|(job, sel, sender)| Op::Impersonate { job, sel, sender }),
     ]
 }
 
@@ -249,7 +251,12 @@ fn generator_reaches_interesting_paths() {
         .filter(|(k, min)| total.counts.get(k).copied().unwrap_or(0) < *min)
         .map(|(k, min)| format!("{k}: {} < {min}", total.counts.get(k).copied().unwrap_or(0)))
         .collect();
-    for refusal in ["InadmissibleProof", "LeaseExpired", "Precondition"] {
+    for refusal in [
+        "InadmissibleProof",
+        "LeaseExpired",
+        "Precondition",
+        "Unauthorized",
+    ] {
         assert!(
             total.refusals.get(refusal).copied().unwrap_or(0) > 0,
             "generator never triggered a {refusal} refusal"

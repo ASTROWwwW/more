@@ -7,8 +7,6 @@ use gpu_ledger::Amount;
 pub struct Config {
     /// Flow budgets `K_prefill`, `K_generate`, `K_batch` (JOB-R16).
     pub flow_budget: PerType<u32>,
-    /// Commission in basis points, taken when a reward is released.
-    pub commission_bps: u64,
     /// Recovery budget, as a percentage of the estimated cost (JOB-R18).
     pub recovery_budget_pct: u64,
     pub max_attempts: u32,
@@ -44,7 +42,6 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             flow_budget: [1, 4, 1],
-            commission_bps: 1_000,
             recovery_budget_pct: 10,
             max_attempts: 8,
             max_placement_failures: 5,
@@ -65,5 +62,49 @@ impl Default for Config {
             contest_resolution: 3600,
             uncommitted_window: 24 * 3600,
         }
+    }
+}
+
+/// Latest coordinator time accepted. With every duration bounded by [`MAX_DURATION`], any
+/// `time + duration` computed by the domain stays below `u64::MAX` (SAFE-001).
+pub const MAX_TIME: Time = 1 << 62;
+/// Longest configurable duration (about 35,000 years).
+pub const MAX_DURATION: Time = 1 << 40;
+/// Largest tariff for one output.
+pub const MAX_PRICE: Amount = 1_000_000_000;
+/// Most outputs per type a model may allow.
+pub const MAX_OUTPUTS: u32 = 1_000_000;
+/// Most layers in a model.
+pub const MAX_LAYERS: u32 = 100_000;
+
+impl Config {
+    /// Rejects values that would break the arithmetic bounds above.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let durations = [
+            self.placing_timeout,
+            self.recovery_timeout,
+            self.queued_wait,
+            self.reserved_wait,
+            self.client_silence,
+            self.drain_window,
+            self.evaluation_deadline,
+            self.dispute_deadline,
+            self.pause_max,
+            self.reward_window,
+            self.lease_ttl,
+            self.delivery_window,
+            self.contest_resolution,
+            self.uncommitted_window,
+        ];
+        if durations.iter().any(|d| *d > MAX_DURATION) {
+            return Err("duration above MAX_DURATION");
+        }
+        if self.recovery_budget_pct > 100 {
+            return Err("recovery budget above 100 %");
+        }
+        if self.flow_budget.iter().any(|k| *k == 0 || *k > MAX_OUTPUTS) {
+            return Err("flow budget out of range");
+        }
+        Ok(())
     }
 }

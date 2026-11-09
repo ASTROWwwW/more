@@ -3,6 +3,13 @@ name = "gpu-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
+sha2 = "0.10"
+more-identity.workspace = true
 gpu-domain.workspace = true
+
+[lints]
+workspace = true

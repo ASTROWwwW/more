@@ -4,6 +4,12 @@ description = "Job state machine, slices and settlement for More (pure transitio
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
+more-identity.workspace = true
 gpu-ledger.workspace = true
+
+[lints]
+workspace = true

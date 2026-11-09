@@ -3,8 +3,11 @@ name = "gpu-simulation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
+more-identity = { workspace = true, features = ["test-support"] }
 gpu-domain.workspace = true
 gpu-ledger.workspace = true
 proptest.workspace = true
