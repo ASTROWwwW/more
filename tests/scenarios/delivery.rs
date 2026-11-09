@@ -57,14 +57,15 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
 fn f25_lender_cannot_attest_its_own_delivery() {
     let mut t = T::new();
     t.ok(Command::Reserve { job: J1 });
-    // A lender cannot be the witness of its own cluster (JOB-R26).
+    // A lender cannot be the witness of its own cluster (JOB-R26), even one that holds the witness
+    // right in the pool (L[0] does): only the independence check refuses it.
     assert!(matches!(
         t.err(Command::Place {
             job: J1,
             lenders: L.to_vec(),
             layout: layout_of(J1),
             recovery_estimate: 0,
-            witness: L[2],
+            witness: L[0],
             expected_version: None,
         }),
         DomainError::Precondition(_)
