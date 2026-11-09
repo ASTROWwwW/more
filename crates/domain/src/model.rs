@@ -1,4 +1,4 @@
-//! États et structures (spécification v2.5, sections 2.1 à 2.4).
+//! States and structures (spec sections 2.1 to 2.4).
 
 use std::collections::BTreeMap;
 
@@ -28,8 +28,8 @@ impl ExecStatus {
         )
     }
 
-    /// Transitions autorisées : toute autre est interdite (section 2).
-    /// Sert à l'implémentation et au vérificateur d'invariants (TEST-P01).
+    /// Allowed transitions; anything else is forbidden. Used by the code and by the checker
+    /// (TEST-P01).
     pub fn allowed(from: ExecStatus, to: ExecStatus) -> bool {
         use ExecStatus::*;
         matches!(
@@ -39,7 +39,7 @@ impl ExecStatus {
                 | (Reserved, Placing)     // JOB-T04
                 | (Placing, Running)      // JOB-T05
                 | (Placing, Reserved)     // JOB-T06 (premier placement)
-                | (Placing, Recovering)   // JOB-T06 (reprise)
+                | (Placing, Recovering)   // JOB-T06 (resume)
                 | (Running, Recovering)   // JOB-T08
                 | (Recovering, Placing)   // JOB-T09
                 | (Recovering, Paused)    // JOB-T10
@@ -71,7 +71,7 @@ pub enum SettleStatus {
     Closed,
 }
 
-/// `execution_intent` : monotone, ne revient jamais à `Initial`.
+/// `execution_intent`: monotonic, never goes back to `Initial`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Intent {
     Initial,
@@ -81,7 +81,7 @@ pub enum Intent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolMode {
     Credits,
-    /// Partage libre : aucun crédit, un quota de jobs actifs par emprunteur.
+    /// Free sharing: no credits, a quota of active jobs per borrower.
     FreeShare {
         quota_per_borrower: u32,
     },
@@ -101,38 +101,38 @@ pub enum PauseReason {
     ClientSilent,
 }
 
-/// Une tentative : grappe figée, autorisations, compteurs de production.
+/// An attempt: fixed cluster, leases, production counters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
     pub no: u32,
-    /// Prêteur assigné à chaque plage de couches (index = étage).
+    /// Lender assigned to each layer range (index = stage).
     pub lenders: Vec<AccountId>,
     pub issued_at: Time,
-    /// Témoin de livraison assigné (JOB-R26) : relais indépendant des prêteurs
-    /// et de l'emprunteur, seul habilité à attester une livraison.
+    /// Assigned delivery witness (JOB-R26), independent of lenders and borrower; the only one
+    /// allowed to attest delivery.
     pub witness: AccountId,
-    /// Expiration de l'autorisation (JOB-R31), heure du coordinateur.
+    /// Lease expiry (JOB-R31), coordinator time.
     pub lease_expires_at: Time,
-    /// Le témoin a perdu son tampon : plus d'attestation ni de rejeu (JOB-R28).
+    /// The witness lost its buffer: no more attestation or replay (JOB-R28).
     pub witness_lost: bool,
-    /// Le témoin a purgé son tampon après la fin de la rétention (JOB-R28).
+    /// The witness purged its buffer after retention (JOB-R28).
     pub buffer_purged: bool,
-    /// `execution_revoked` : plus aucune nouvelle unité acceptée (JOB-R11).
+    /// `execution_revoked`: no new unit accepted (JOB-R11).
     pub revoked_at: Option<Time>,
-    /// Position de la révocation dans le journal du coordinateur (CE-03).
+    /// Position of the revocation in the coordinator log (CE-03).
     pub revoked_seq: Option<u64>,
-    /// La grappe a accepté et l'état est restauré (JOB-T05).
+    /// The cluster accepted and state is restored (JOB-T05).
     pub ready: bool,
-    /// Prochaine position produite, par type.
+    /// Next position to produce, per type.
     pub produced: PerType<u32>,
-    /// Engagements de reçus enregistrés par le coordinateur :
-    /// (prêteur, type) → (couvert jusqu'à, horodatage coordinateur).
+    /// Receipt commitments recorded by the coordinator: (lender, type) to (covered up to,
+    /// coordinator time).
     pub commitments: BTreeMap<(AccountId, WorkType), (u32, Time)>,
-    /// Enveloppe du budget de récupération réservée à cette tentative.
+    /// Share of the recovery budget set aside for this attempt.
     pub recovery_earmark: Amount,
-    /// Montant de récupération déjà réservé dans des lignes (payé ou non).
+    /// Recovery amount already reserved in lines (paid or not).
     pub recovery_reserved: Amount,
-    /// L'enveloppe inutilisée a été rendue au budget.
+    /// The unused share went back to the budget.
     pub earmark_returned: bool,
     pub next_slice: u32,
 }
@@ -142,46 +142,45 @@ pub struct Job {
     pub id: JobId,
     pub borrower: AccountId,
     pub pool: PoolId,
-    /// Identifiant du flux client (session) : lie trames et accusés (JOB-R34).
+    /// Client stream (session) id; binds frames and acks (JOB-R34).
     pub stream: u64,
-    /// Identifiant du modèle du catalogue, couvert par l'empreinte des trames.
+    /// Catalogue model id, covered by the frame digest.
     pub model: u32,
     pub version: u64,
     pub exec: ExecStatus,
     pub settle: SettleStatus,
     pub intent: Intent,
     pub exec_since: Time,
-    /// État d'où vient le placement en cours (JOB-T06).
+    /// State the current placement came from (JOB-T06).
     pub placing_from: Option<ExecStatus>,
     pub placement_failures: u32,
-    /// Nombre de couches par étage (plages de couches consécutives).
+    /// Layers per stage (consecutive ranges).
     pub layout: Vec<u32>,
-    /// Prix autorisé d'une sortie, par type.
+    /// Authorized price of one output, per type.
     pub price: PerType<Amount>,
     pub max_outputs: PerType<u32>,
     pub est_cost: Amount,
     pub recovery_budget: Amount,
-    /// Budget de récupération non encore attribué à une tentative.
+    /// Recovery budget not yet given to an attempt.
     pub recovery_unearmarked: Amount,
     pub attempt: u32,
     pub attempts: BTreeMap<u32, Attempt>,
-    /// Positions validées (JOB-R23) : `0..validated[t]`, signées par le client.
-    /// Ne reculent jamais. Le budget de flux se mesure depuis elles.
+    /// Validated positions `0..validated[t]` (JOB-R23), signed by the client. Never go back. The
+    /// flow budget is measured from them.
     pub validated: PerType<u32>,
-    /// Positions livrées (JOB-R27) : `0..delivered[t]`, toutes facturées
-    /// (définitivement ou provisoirement). `validated ≤ delivered`. Peut
-    /// reculer uniquement par retour arrière (JOB-R29), jamais sous `validated`.
+    /// Delivered positions `0..delivered[t]` (JOB-R27), all charged, definitively or provisionally.
+    /// `validated <= delivered`. Only a rewind lowers it, never below `validated` (JOB-R29).
     pub delivered: PerType<u32>,
     pub last_ack_at: Time,
     pub checkpoint: bool,
     pub pause_reason: Option<PauseReason>,
-    /// Crédits versés par le pool en relais du budget de récupération (JOB-R18).
+    /// Credits paid in by the pool to relay the recovery budget (JOB-R18).
     pub pool_recovery_funded: Amount,
-    /// Récupération payée, imputée au budget de l'emprunteur (brut, jamais diminué).
+    /// Recovery paid from the borrower's budget (gross).
     pub recovery_paid_borrower: Amount,
-    /// Récupération payée, imputée au relais du pool (brut, jamais diminué).
+    /// Recovery paid from the pool relay (gross).
     pub recovery_paid_pool: Amount,
-    /// Part pool rendue au pool par contestation.
+    /// Pool share returned to the pool by a contest.
     pub recovery_contested_pool: Amount,
 }
 
@@ -194,7 +193,7 @@ impl Job {
         self.layout.iter().sum()
     }
 
-    /// Plage `[start, end)` de l'étage `stage`.
+    /// Layer range `[start, end)` of `stage`.
     pub fn layer_range(&self, stage: usize) -> Option<(u32, u32)> {
         if stage >= self.layout.len() {
             return None;
@@ -203,8 +202,8 @@ impl Job {
         Some((start, start + self.layout[stage]))
     }
 
-    /// Part d'une contribution dans le prix d'une sortie : proportionnelle au
-    /// nombre de couches, arrondie vers le bas. Somme des parts ≤ prix (JOB-R21).
+    /// A contribution's share of an output's price: proportional to its layers, rounded down, so
+    /// shares never exceed the price (JOB-R21).
     pub fn share(&self, wt: WorkType, stage: usize) -> Amount {
         let total = Amount::from(self.total_layers());
         if total == 0 {
@@ -214,7 +213,7 @@ impl Job {
     }
 }
 
-/// Cycle de vie d'une tranche (section 2.2).
+/// Slice lifecycle (section 2.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SliceStatus {
     Open,
@@ -239,14 +238,14 @@ impl SliceStatus {
     }
 }
 
-/// Preuve attachée à un élément réclamé (JOB-R12).
+/// Proof attached to a claimed item (JOB-R12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Evidence {
-    /// Couvert par un engagement de reçus enregistré par le coordinateur.
+    /// Covered by a receipt commitment recorded by the coordinator.
     Committed,
-    /// Reçu cosigné par le destinataire, non couvert par un engagement.
+    /// Receipt co-signed by the recipient, not covered by a commitment.
     Uncommitted,
-    /// Aucune preuve.
+    /// No proof.
     None,
 }
 
@@ -284,17 +283,16 @@ pub struct LineItem {
     pub amount: Amount,
     pub evidence: Evidence,
     pub status: ItemStatus,
-    /// Part financée par le relais du pool (récupération uniquement).
+    /// Share funded by the pool relay (recovery only).
     pub pool_part: Amount,
-    /// La récompense de cet élément a été libérée ou contestée.
+    /// This item's reward was released or contested.
     pub reward_done: bool,
-    /// Contribution d'une sortie encore provisoire à l'évaluation : contestée
-    /// en attente du sort de la sortie, jamais arbitrée à part (JOB-R30).
+    /// Contribution to an output still provisional at evaluation: waits for the output's fate,
+    /// never arbitrated on its own (JOB-R30).
     pub awaiting_delivery: bool,
 }
 
-/// Ligne `(tranche, prêteur)`. Invariant (JOB-R24) :
-/// `claimed = pending + paid + refunded + disputed`.
+/// Line `(slice, lender)`. Invariant (JOB-R24): `claimed = pending + paid + refunded + disputed`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line {
     pub claimed: Amount,
@@ -303,13 +301,13 @@ pub struct Line {
     pub refunded: Amount,
     pub disputed: Amount,
     pub items: Vec<LineItem>,
-    /// Récompenses retenues (part payée, pas encore libérée ni contestée).
+    /// Held rewards (paid, not yet released or contested).
     pub held: Amount,
     pub released: Amount,
     pub contested: Amount,
 }
 
-/// Réclamation reçue pendant `open` / `draining`, évaluée à la clôture.
+/// Claim received while `open` or `draining`, evaluated at closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedClaim {
     pub lender: AccountId,
@@ -323,7 +321,7 @@ pub struct Slice {
     pub opened_at: Time,
     pub receipt_deadline: Option<Time>,
     pub closed_at: Option<Time>,
-    /// Position de la clôture dans le journal du coordinateur (CE-03).
+    /// Position of the closure in the coordinator log (CE-03).
     pub closed_seq: Option<u64>,
     pub final_at: Option<Time>,
     pub staged: Vec<StagedClaim>,
@@ -331,60 +329,59 @@ pub struct Slice {
     pub rejected_items: u32,
 }
 
-/// Fondement d'une facturation de sortie (JOB-R26, JOB-R27).
+/// Why an output is charged (JOB-R26, JOB-R27).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChargeBasis {
-    /// Signature du client : accusé, ou position confirmée à la reprise.
+    /// Client signature: ack, or position confirmed on resume.
     ClientSigned,
-    /// Attestation du témoin de livraison : facturation provisoire.
+    /// Witness attestation: provisional charge.
     Witnessed,
-    /// Fenêtre de livraison expirée sans contestation.
+    /// Delivery window expired without contest.
     WindowExpired,
 }
 
-/// Facturation en vigueur d'une sortie.
+/// Charge currently in force for an output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputCharge {
-    /// Tentative qui a produit la sortie (JOB-R17).
+    /// Attempt that produced the output (JOB-R17).
     pub attempt: u32,
-    /// Génération de facturation (clé d'idempotence, `ContributionId::charge`).
+    /// Billing generation (idempotency key, `ContributionId::charge`).
     pub gen: u32,
     pub definitive: bool,
     pub basis: ChargeBasis,
-    /// Le tampon de rejeu du témoin contient la sortie (JOB-R28).
+    /// The witness's replay buffer holds the output (JOB-R28).
     pub replayable: bool,
-    /// Contestation ouverte (une seule par sortie, JOB-R33).
+    /// Open contest, at most one per output (JOB-R33).
     pub contest: Option<Contest>,
 }
 
-/// Contestation d'une sortie provisoire déclarée non reçue (JOB-R33).
+/// Contest of a provisional output reported as not received (JOB-R33).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Contest {
     pub opened_at: Time,
-    /// Sans accusé cumulatif signé couvrant la sortie avant cette échéance :
-    /// remboursement (retour arrière).
+    /// Without a signed cumulative ack covering the output by then: refund (rewind).
     pub deadline: Time,
 }
 
-/// Motif d'un remboursement d'élément (journal, propriété d'équité TEST-P23).
+/// Why an item was refunded (log, fairness property TEST-P23).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefundReason {
-    /// Aucune preuve fournie.
+    /// No proof given.
     NoEvidence,
-    /// Preuve « engagée » annoncée mais introuvable ou postérieure.
+    /// Commitment claimed but missing or too late.
     EvidenceNotFound,
-    /// Récupération d'une tentative jamais démarrée.
+    /// Recovery for an attempt that never started.
     AttemptNotStarted,
-    /// Décision d'arbitrage explicite.
+    /// Explicit arbitration decision.
     Arbitration,
-    /// Règle par défaut à l'échéance du litige.
+    /// Default rule at the dispute deadline.
     DefaultRuling,
-    /// La sortie a été annulée par retour arrière (JOB-R29, JOB-R33).
+    /// The output was voided by a rewind (JOB-R29, JOB-R33).
     OutputVoided,
 }
 
 impl Evidence {
-    /// Force d'une preuve : une preuve complémentaire doit être plus forte (JOB-R35).
+    /// Proof strength; a supplementary proof must be stronger (JOB-R35).
     pub fn rank(self) -> u8 {
         match self {
             Evidence::None => 0,

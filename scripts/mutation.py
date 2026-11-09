@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Test des tests par mutation.
+"""Mutation testing for the test suite.
 
-Chaque mutation réintroduit un bug connu (ou plausible) dans le modèle. La
-suite de conformité doit échouer : sinon, le vérificateur a un angle mort.
-Usage : python3 scripts/mutation.py   (depuis la racine du workspace)
+Each mutation puts a known (or plausible) bug back into the model. The suite must fail;
+if it passes, the checker has a blind spot.
+Usage: python3 scripts/mutation.py   (from the workspace root)
 """
 import os
 import re
@@ -16,116 +16,116 @@ COORD = "crates/domain/src/coordinator.rs"
 MODEL = "crates/domain/src/model.rs"
 REGRESSIONS = "tests/properties/proptest-regressions.txt"
 
-# (id, description, fichier, [(ancien, nouveau), ...])
+# (id, description, file, [(old, new), ...])
 MUTATIONS = [
-    ("M01", "Bug v2.1 : JOB-T04 remet execution_intent à initial", COORD,
+    ("M01", "v2.1 bug: JOB-T04 resets execution_intent to initial", COORD,
      [("        j.placing_from = Some(from);", "        j.placing_from = Some(from);\n        if from == ExecStatus::Reserved { j.intent = Intent::Initial; }")]),
-    ("M02", "Bug v2.1 : contribution payable sur une autre tentative", COORD,
+    ("M02", "v2.1 bug: contribution payable on another attempt", COORD,
      [("self.outputs.get(&output) == Some(&slice.attempt)", "self.outputs.contains_key(&output)")]),
-    ("M03", "Bug v2.2 : identifiant de contribution sans plage de couches", COORD,
+    ("M03", "v2.2 bug: contribution id without layer range", COORD,
      [("let cid = ContributionId { output, charge: self.charges[&output].gen, layer_start: ls, layer_end: le, role: ContributionRole::Executor",
        "let cid = ContributionId { output, charge: self.charges[&output].gen, layer_start: 0 * ls, layer_end: 0 * le, role: ContributionRole::Executor")]),
-    ("M04", "Bug v2.2 : pas de pending_evaluation à la clôture", COORD,
+    ("M04", "v2.2 bug: no pending_evaluation at closure", COORD,
      [("                    line.pending += amount;\n", "")]),
-    ("M05", "Contestation qui crée des crédits", COORD,
+    ("M05", "Contest that creates credits", COORD,
      [("pending_acct(slice, lender), Account::User(borrower.0), held - to_pool", "Account::Issuance, Account::User(borrower.0), held - to_pool")]),
-    ("M06", "Annulation autorisée en settling", COORD,
+    ("M06", "Cancel allowed while settling", COORD,
      [("        if j.exec == ExecStatus::Settling {\n            return Err(DomainError::JobSettling);\n        }", "")]),
-    ("M06b", "Annulation autorisée en settling (table de transitions aussi)", COORD,
+    ("M06b", "Cancel allowed while settling (transition table too)", COORD,
      [("        if j.exec == ExecStatus::Settling {\n            return Err(DomainError::JobSettling);\n        }", "")]),
-    ("M07", "Contrôle de flux désactivé", COORD,
+    ("M07", "Flow control disabled", COORD,
      [("        if upto - j.validated[t] > self.cfg.flow_budget[t] {\n            return Err(DomainError::FlowBudgetExceeded);\n        }", "")]),
-    ("M08", "Plafond anti-collusion ignoré", COORD,
+    ("M08", "Anti-collusion cap ignored", COORD,
      [("if recent + item.amount <= self.cfg.uncommitted_cap {", "if recent + item.amount <= u64::MAX {")]),
-    ("M09", "Engagement tardif accepté comme antérieur", COORD,
+    ("M09", "Late commitment accepted as prior", COORD,
      [("let cutoff = a.revoked_seq.map_or(closed, |r| r.min(closed));", "let cutoff = u64::MAX + 0 * closed;")]),
-    ("M09b", "CE-03 réintroduit : borne = révocation, pas la clôture de la tranche", COORD,
+    ("M09b", "CE-03 back: bound = revocation, not slice closure", COORD,
      [("let cutoff = a.revoked_seq.map_or(closed, |r| r.min(closed));", "let cutoff = a.revoked_seq.unwrap_or(self.seq) + 0 * closed;")]),
-    ("M10", "Règlement qui oublie OutputHold", COORD,
+    ("M10", "Settlement forgets OutputHold", COORD,
      [("            (Account::OutputHold(job_acct(job)), \"hold\"),\n        ] {", "        ] {")]),
-    ("M11", "CE-01 réintroduit : relais du pool sans escrow actif", COORD,
+    ("M11", "CE-01 back: pool relay without active escrow", COORD,
      [("if j.settle != SettleStatus::Active {", "if j.exec.is_terminal() {")]),
-    ("M12", "CE-02 réintroduit : part pool rendue à l'emprunteur", COORD,
+    ("M12", "CE-02 back: pool share returned to the borrower", COORD,
      [("let pool_unspent = j.pool_recovery_funded - j.recovery_paid_pool;", "let pool_unspent = 0 * (j.pool_recovery_funded - j.recovery_paid_pool);")]),
-    ("M13", "Reprise sans restauration de l'état", COORD,
+    ("M13", "Resume without state restore", COORD,
      [("if restored != j.delivered {", "if false && restored != j.delivered {")]),
-    ("M14", "Production acceptée sur une tentative révoquée", COORD,
+    ("M14", "Work accepted on a revoked attempt", COORD,
      [("if attempt != j.attempt || a.revoked_at.is_some() || !a.ready || j.exec != ExecStatus::Running {",
        "if attempt != j.attempt || !a.ready {")]),
-    ("M15", "Réconciliation sans arbitrage par défaut des litiges", COORD,
+    ("M15", "Reconciliation without default dispute arbitration", COORD,
      [("                    SliceStatus::Disputed if now >= s.closed_at.unwrap_or(0) + c.dispute_deadline => {", "                    SliceStatus::Disputed if false => {")]),
-    ("M16", "Couverture de la fenêtre non validée désactivée (JOB-R25)", COORD,
+    ("M16", "Unvalidated window coverage disabled (JOB-R25)", COORD,
      [("        if window > self.ledger.available(Account::EscrowWork(job_acct(job))) {\n            return Err(DomainError::WindowNotCovered);\n        }", "")]),
-    ("M17", "Relais du pool consommé avant le budget de l'emprunteur", COORD,
+    ("M17", "Pool relay used before the borrower budget", COORD,
      [("let from_borrower = amount.min(j.recovery_budget - j.recovery_paid_borrower);", "let from_borrower = amount.saturating_sub(j.pool_recovery_funded - j.recovery_paid_pool).min(j.recovery_budget - j.recovery_paid_borrower);")]),
-    ("M18", "Récupération non plafonnée par l'enveloppe", COORD,
+    ("M18", "Recovery not capped by the earmark", COORD,
      [("let fits = recovery_reserved.checked_add(amount).is_some_and(|t| t <= a.recovery_earmark);", "let fits = true;")]),
-    # ---- v2.4 : livraison et rejeu (I-03), équité, autorisations datées
-    ("M19", "Budget de flux mesuré depuis les positions livrées (témoin complice sans limite)", COORD,
+    # ---- delivery, replay, fairness, leases
+    ("M19", "Flow budget measured from delivered positions (colluding witness unbounded)", COORD,
      [("if upto - j.validated[t] > self.cfg.flow_budget[t] {", "if upto - j.delivered[t] > self.cfg.flow_budget[t] {")]),
-    ("M20", "Attestation d'un autre que le témoin assigné acceptée", COORD,
+    ("M20", "Attestation from someone other than the assigned witness accepted", COORD,
      [("if witness != a.witness || a.witness_lost || a.buffer_purged {", "if (a.witness_lost || a.buffer_purged) && witness != a.witness {")]),
-    ("M21", "Témoin non indépendant accepté au placement", COORD,
+    ("M21", "Non-independent witness accepted at placement", COORD,
      [("if witness == j.borrower || lenders.contains(&witness) {", "if false && (witness == j.borrower || lenders.contains(&witness)) {")]),
-    ("M22", "Contribution évaluée alors que sa sortie est provisoire", COORD,
+    ("M22", "Contribution evaluated while its output is provisional", COORD,
      [("(ItemKind::Contribution(cid), _) if !self.charges[&cid.output].definitive => {", "(ItemKind::Contribution(cid), _) if false && !self.charges[&cid.output].definitive => {")]),
-    ("M23", "Retour arrière sans cascade : seule la position perdue est annulée", COORD,
+    ("M23", "Rewind without cascade: only the lost position is voided", COORD,
      [("for pos in (to..from).rev() {", "for pos in (to..(to + 1).min(from)).rev() {")]),
-    ("M24", "Retour arrière sans révocation de la tentative vivante", COORD,
+    ("M24", "Rewind without revoking the live attempt", COORD,
      [("        if live {\n            match j.exec {", "        if false && live {\n            match j.exec {")]),
-    ("M25", "Travail accepté sous une autorisation expirée", COORD,
+    ("M25", "Work accepted under an expired lease", COORD,
      [("        if self.now >= a.lease_expires_at {\n            return Err(DomainError::LeaseExpired);\n        }\n        Ok(a)", "        Ok(a)")]),
-    ("M26", "Réconciliation qui ne révoque pas les autorisations expirées", COORD,
+    ("M26", "Reconciliation does not revoke expired leases", COORD,
      [("                        if j.current().is_some_and(|a| now >= a.lease_expires_at) {\n                            todo.push(Command::NodeLost {", "                        if false {\n                            todo.push(Command::NodeLost {")]),
-    ("M27", "Heartbeat qui renouvelle une autorisation expirée", COORD,
-     [("        // JOB-R31 : une autorisation expirée ne se renouvelle pas.\n        if now >= a.lease_expires_at {\n            return Err(DomainError::LeaseExpired);\n        }", "")]),
-    ("M28", "Fenêtre de livraison close sans attendre la révocation", COORD,
+    ("M27", "Heartbeat renews an expired lease", COORD,
+     [("        // JOB-R31: an expired lease is never renewed.\n        if now >= a.lease_expires_at {\n            return Err(DomainError::LeaseExpired);\n        }", "")]),
+    ("M28", "Delivery window closed without waiting for revocation", COORD,
      [(".revoked_at\n                    .is_some_and(|r| now >= r + w);", ".revoked_at\n                    .is_none_or(|r| now >= r + w);")]),
-    ("M29", "Client autorisé à confirmer au-delà du livré", COORD,
+    ("M29", "Client may confirm beyond delivered", COORD,
      [("        if confirmed > delivered {\n            return Err(DomainError::Precondition(\n                \"JOB-R28: confirmed beyond delivered\",\n            ));\n        }", "")]),
-    ("M30", "Reprise depuis les positions validées : les livrées sont régénérées", COORD,
+    ("M30", "Resume from validated positions: delivered ones are regenerated", COORD,
      [("let produced = j.delivered;", "let produced = j.validated;"), ("if restored != j.delivered {", "if restored != j.validated {")]),
-    ("M31", "CE-04 réintroduit : élément déjà tranché évalué une seconde fois", COORD,
+    ("M31", "CE-04 back: already decided item evaluated twice", COORD,
      [("                if item.status != ItemStatus::PendingEvaluation {\n                    continue;\n                }", "")]),
-    ("M32", "CE-05 réintroduit : récompense nulle jamais close", COORD,
+    ("M32", "CE-05 back: zero reward never closed", COORD,
      [("l.items[idx].reward_done = amount == 0;", "")]),
-    ("M33", "Clôture qui perd des réclamations (équité)", COORD,
+    ("M33", "Closure loses claims (fairness)", COORD,
      [("for StagedClaim { lender, item } in &s.staged {", "for StagedClaim { lender, item } in s.staged.iter().take(1) {")]),
-    ("M34", "Contribution prouvée remboursée quand sa sortie devient définitive (équité)", COORD,
+    ("M34", "Proven contribution refunded when its output becomes definitive (fairness)", COORD,
      [("                Decision::Pay => self.pay_item(slice, lender, idx, false)?,", "                Decision::Pay => self.refund_item(slice, lender, idx, RefundReason::EvidenceNotFound)?,")]),
-    ("M35", "Libération automatique des récompenses désactivée", COORD,
+    ("M35", "Automatic reward release disabled", COORD,
      [("                    SliceStatus::Final\n                        if s.final_at.is_some_and(|f| now >= f + c.reward_window) =>", "                    SliceStatus::Final if false =>")]),
-    ("M36", "Attestation au-delà du produit acceptée", COORD,
+    ("M36", "Attestation beyond produced accepted", COORD,
      [("        if upto > a.produced[t] {\n            return Err(DomainError::Precondition(\n                \"JOB-R27: attestation beyond produced\",\n            ));\n        }", "")]),
-    # ---- v2.5 : contestation, empreintes, attestations tardives, tampon, preuves, plafond glissant
-    ("M37", "Contestation close par le simple rejeu", COORD,
+    # ---- contests, frame digests, late attestations, buffer, supplementary proof, sliding cap
+    ("M37", "Contest closed by the replay alone", COORD,
      [("self.audit.push(AuditEvent::ContestOpened { output, deadline });", "self.audit.push(AuditEvent::ContestOpened { output, deadline });\n            self.make_definitive(output, ChargeBasis::ClientSigned)?;")]),
-    ("M38", "Signe de vie du client qui résout les contestations", COORD,
+    ("M38", "Client liveness signal resolves contests", COORD,
      [("                self.job(*job)?;\n                Ok(Outcome::AlreadyApplied)", "                self.job(*job)?;\n                let os: Vec<OutputId> = self.charges.iter().filter(|(o, c)| o.job == *job && c.contest.is_some()).map(|(o, _)| *o).collect();\n                for o in &os { self.make_definitive(*o, ChargeBasis::ClientSigned)?; }\n                Ok(if os.is_empty() { Outcome::AlreadyApplied } else { Outcome::Applied })")]),
-    ("M39", "Empreinte des trames non vérifiée à l'attestation", COORD,
+    ("M39", "Frame digest not checked on attestation", COORD,
      [("if digest != self.frame_digest(job, wt, upto) {", "if false && digest != self.frame_digest(job, wt, upto) {")]),
-    ("M40", "Déclaration du client non liée au flux", COORD,
+    ("M40", "Client declaration not bound to the stream", COORD,
      [("if digest != self.frame_digest(job, wt, confirmed) {", "if false && digest != self.frame_digest(job, wt, confirmed) {")]),
-    ("M41", "Attestation tardive sans engagement antérieur", COORD,
+    ("M41", "Late attestation without prior commitment", COORD,
      [("            if !committed {\n                return Err(DomainError::InadmissibleProof);\n            }", "")]),
-    ("M42", "Engagement accepté après révocation et compté comme antérieur", COORD,
+    ("M42", "Commitment accepted after revocation and counted as prior", COORD,
      [("let a = self.current_live_attempt(job, attempt)?;\n        if witness != a.witness || a.witness_lost {", "let a = self.job(job)?.attempts.get(&attempt).ok_or(DomainError::StaleAttempt)?;\n        if witness != a.witness || a.witness_lost {"),
       ("*u >= upto && *seq < cutoff", "*u >= upto && *seq <= u64::MAX + 0 * cutoff")]),
-    ("M43", "Tampon purgé malgré une contestation ouverte", COORD,
+    ("M43", "Buffer purged despite an open contest", COORD,
      [("        if self\n            .charges\n            .iter()\n            .any(|(o, ch)| o.job == job && ch.attempt == attempt && !ch.definitive)\n        {", "        if false {")]),
-    ("M44", "Plafond par jour calendaire au lieu d'une fenêtre glissante", COORD,
+    ("M44", "Per-calendar-day cap instead of a sliding window", COORD,
      [(".filter(|(t, _)| t + w > now)", ".filter(|(t, _)| t / w == now / w)")]),
-    ("M45", "Remboursement qui restaure le quota (montants nets)", COORD,
+    ("M45", "Refund restores the quota (net amounts)", COORD,
      [("        self.job_mut(slice.job)?.recovery_contested_pool += to_pool;", "        self.job_mut(slice.job)?.recovery_contested_pool += to_pool;\n        self.uncommitted_paid.remove(&lender);")]),
-    ("M46", "Remboursement faute de preuve avant l'échéance", COORD,
+    ("M46", "Refund for missing proof before the deadline", COORD,
      [("            if before_deadline {\n                Decision::Defer", "            if false && before_deadline {\n                Decision::Defer")]),
-    ("M47", "Fenêtre expirée qui ignore les contestations", COORD,
+    ("M47", "Expired window ignores contests", COORD,
      [("if ch.contest.is_some() || !expired {", "if !expired {")]),
-    ("M48", "Échéance des contestations jamais appliquée", COORD,
+    ("M48", "Contest deadline never enforced", COORD,
      [("                if contest_due {", "                if false && contest_due {")]),
-    ("M49", "CE-06 réintroduit : tranche terminée avant l'échéance avec une contribution en attente", COORD,
+    ("M49", "CE-06 back: slice finished before the deadline with an awaiting contribution", COORD,
      [("if deferred || (before_deadline && awaiting) {", "if deferred || (false && before_deadline && awaiting) {")]),
-    ("M50", "Preuve complémentaire acceptée après l'échéance", COORD,
+    ("M50", "Supplementary proof accepted after the deadline", COORD,
      [("            && now < s.closed_at.unwrap_or(0) + deadline;", "            && now < u64::MAX + 0 * (s.closed_at.unwrap_or(0) + deadline);")]),
 ]
 
@@ -139,8 +139,8 @@ def run_suite():
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
     out = p.stdout + p.stderr
     failed = sorted(set(re.findall(r"^    (\w+)$", out, re.M)))
-    # Le contrôle de couverture ne compte pas comme une détection : une
-    # mutation peut le faire échouer simplement en changeant les chemins atteints.
+    # The coverage check does not count as a detection: a mutation can fail it just by changing
+    # which paths are reached.
     real = [f for f in failed if f != "generator_reaches_interesting_paths"]
     props = sorted(set(re.findall(r"\[(TEST-P\d+)\]", out)))
     compile_error = "error[E" in out or "could not compile" in out
@@ -148,7 +148,7 @@ def run_suite():
 
 
 def anchor_regex(old):
-    """Ancre insensible aux blancs : survit à `cargo fmt`."""
+    """Whitespace-insensitive anchor, so it survives `cargo fmt`."""
     chars = [c for c in old if not c.isspace()]
     return re.compile(r"\s*".join(re.escape(c) for c in chars))
 
@@ -171,8 +171,8 @@ def main():
         targets = [(path, reps)] + ([EXTRA[mid]] if mid in EXTRA else [])
         for f, _ in targets:
             backups[f] = open(os.path.join(ROOT, f)).read()
-        # Les graines trouvées contre un mutant ne doivent pas aider à détecter
-        # le suivant : le fichier de non-régression est restauré après chaque essai.
+        # Seeds found against one mutant must not help detect the next: the regression file is
+        # restored after each run.
         backups[REGRESSIONS] = open(os.path.join(ROOT, REGRESSIONS)).read()
         try:
             for f, r in targets:
@@ -181,11 +181,11 @@ def main():
         finally:
             for f, content in backups.items():
                 open(os.path.join(ROOT, f), "w").write(content)
-        status = "NON DÉTECTÉE" if ok else ("ERREUR DE COMPILATION" if cerr else "détectée")
+        status = "MISSED" if ok else ("COMPILE ERROR" if cerr else "caught")
         results.append((mid, desc, status, failed, props))
-        print(f"{mid} {status:22} {desc}\n      tests: {', '.join(failed) or '-'}\n      propriétés: {', '.join(props) or '-'}", flush=True)
-    caught = sum(1 for r in results if r[2] == "détectée")
-    print(f"\n{caught}/{len(results)} mutations détectées")
+        print(f"{mid} {status:22} {desc}\n      tests: {', '.join(failed) or '-'}\n      properties: {', '.join(props) or '-'}", flush=True)
+    caught = sum(1 for r in results if r[2] == "caught")
+    print(f"\n{caught}/{len(results)} mutations caught")
     return 0
 
 

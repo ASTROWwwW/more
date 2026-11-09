@@ -1,16 +1,12 @@
-//! Scénarios déterministes JOB-F01 à JOB-F32 (section 4) et tests ciblés des
-//! corrections v2.3 (JOB-R21, JOB-R22, JOB-R24). JOB-F24 à F32 (v2.4) couvrent
-//! le protocole de livraison et de rejeu (I-03) et les autorisations datées ;
-//! JOB-F33 à F41 (v2.5) les huit cas adverses demandés à l'audit de la v2.4.
-//!
-//! Chaque commande passe par le vérificateur d'invariants complet ; chaque
-//! scénario se termine par la phase de vidage (vivacité, escrow soldé).
+//! Deterministic failure scenarios JOB-F01 to JOB-F41 (spec section 4) and targeted tests for
+//! JOB-R21, JOB-R22 and JOB-R24. Every command goes through the full checker, and every scenario
+//! ends with the drain (liveness, settled escrow, fairness).
 
 use gpu_domain::*;
 use gpu_simulation::*;
 
-const J1: JobId = JobId(1); // 3 étages (3, 2, 1 couches), génération à 12 crédits
-const J3: JobId = JobId(3); // pool en partage libre
+const J1: JobId = JobId(1); // 3 stages (3, 2, 1 layers), generation at 12 credits
+const J3: JobId = JobId(3); // open-sharing pool
 const L: [AccountId; 3] = [AccountId(10), AccountId(11), AccountId(12)];
 const GEN: WorkType = WorkType::Generate;
 
@@ -70,7 +66,7 @@ impl T {
         self.job(j).attempt
     }
 
-    /// Réservation, placement, démarrage.
+    /// Reserve, place, start.
     fn start(&mut self, j: JobId, est: Amount) {
         if self.job(j).exec == ExecStatus::Queued {
             self.ok(Command::Reserve { job: j });
@@ -91,7 +87,7 @@ impl T {
         });
     }
 
-    /// Produit et fait valider `n` tokens de génération, un par un.
+    /// Produces and acks `n` generation tokens, one by one.
     fn gen(&mut self, j: JobId, n: u32) {
         for _ in 0..n {
             let a = self.attempt(j);
@@ -134,7 +130,7 @@ impl T {
             .expect("open slice")
     }
 
-    /// Chaque prêteur réclame sa plage pour toutes les sorties de la tentative de la tranche.
+    /// Each lender claims its range for every output of the slice's attempt.
     fn claim_all(&mut self, s: SliceId, ev: Evidence) {
         let outs: Vec<OutputId> = self
             .c()
@@ -161,8 +157,8 @@ impl T {
         }
     }
 
-    /// Le temps passe, la grappe reste saine : elle renouvelle ses
-    /// autorisations (JOB-R31). Pour une grappe muette, utiliser `Tick`.
+    /// Time passes on a healthy cluster that keeps renewing its leases (JOB-R31). Use `Tick` for a
+    /// silent cluster.
     fn wait(&mut self, dt: Time) {
         let mut left = dt;
         while left > 0 {
@@ -183,7 +179,7 @@ impl T {
         }
     }
 
-    /// Le témoin atteste la livraison jusqu'à `upto` (JOB-R26).
+    /// The witness attests delivery up to `upto` (JOB-R26).
     fn deliver(&mut self, j: JobId, upto: u32) {
         let a = self.attempt(j);
         self.ok(Command::Deliver {
@@ -196,7 +192,7 @@ impl T {
         });
     }
 
-    /// Déclaration signée du client, liée au flux (JOB-R28, JOB-R34).
+    /// Signed client statement bound to the stream (JOB-R28, JOB-R34).
     fn confirm(&mut self, j: JobId, confirmed: u32) -> Outcome {
         let digest = self.c().frame_digest(j, GEN, confirmed);
         self.ok(Command::ConfirmDelivery {
@@ -228,7 +224,7 @@ impl T {
             .copied()
     }
 
-    /// Nombre de facturations nettes d'une sortie, d'après le journal.
+    /// Net number of charges of an output, from the log.
     fn net_charges(&self, j: JobId, pos: u32) -> i64 {
         let o = OutputId {
             job: j,
@@ -268,11 +264,11 @@ impl T {
     }
 }
 
-// ---------------------------------------------------------------- JOB-F01 à F23
+// ---------------------------------------------------------------- JOB-F01 to F23
 
 #[test]
 fn f01_partial_transition_leaves_no_trace() {
-    // Une transition en deux écritures dont la seconde échoue : rien n'est écrit (JOB-R01).
+    // A two-entry transition whose second entry fails writes nothing (JOB-R01).
     let mut t = T::new();
     t.ok(Command::Issue {
         id: 50,
@@ -287,7 +283,7 @@ fn f01_partial_transition_leaves_no_trace() {
         price: [6, 12, 3],
         max_outputs: [4, 12, 3],
     });
-    // Assez pour la part travail (177), pas pour le budget de récupération (17).
+    // Enough for the work part (177), not for the recovery budget (17).
     let e = t.err(Command::Reserve { job: JobId(4) });
     assert!(matches!(e, DomainError::Ledger(_)));
     assert_eq!(t.bal(Account::User(3)), 177);
@@ -307,9 +303,9 @@ fn f02_redelivered_assignments_are_harmless() {
         expected_version: None,
     };
     t.ok(place.clone());
-    t.err(place); // rejouée depuis l'outbox : refusée, aucune nouvelle tentative
+    t.err(place); // replayed from the outbox: rejected, no new attempt
     assert_eq!(t.attempt(J1), 1);
-    // Timeout de placement entre-temps : JOB-T06 renvoie en `reserved`.
+    // Placement timeout meanwhile: JOB-T06 goes back to `reserved`.
     t.ok(Command::Tick { dt: 61 });
     t.ok(Command::Reconcile);
     assert_eq!(t.job(J1).exec, ExecStatus::Reserved);
@@ -377,7 +373,7 @@ fn f04_duplicate_report_after_settlement_pays_once() {
             evidence: Evidence::Committed,
         }],
     });
-    // Le prêteur renvoie son rapport sur la tranche suivante : la contribution est déjà prise.
+    // The lender resends its report on the next slice: the contribution is already taken.
     let s2 = t.open_slice(J1);
     t.ok(Command::Claim {
         slice: s2,
@@ -417,7 +413,7 @@ fn f05_returning_node_is_ignored_but_keeps_prior_pay() {
         job: J1,
         expected_version: None,
     });
-    t.start(J1, 2); // tentative 2
+    t.start(J1, 2); // attempt 2
     assert_eq!(
         t.err(Command::Produce {
             job: J1,
@@ -510,7 +506,7 @@ fn f07_client_disconnect_stops_after_k_then_pauses() {
         2,
         "unacknowledged window never charged"
     );
-    // Reprise : la génération repart à la dernière position validée.
+    // Resume: generation restarts at the last validated position.
     t.ok(Command::Resume { job: J1, topup: 0 });
     t.start(J1, 3);
     assert_eq!(t.job(J1).current().unwrap().produced[GEN.idx()], 2);
@@ -519,8 +515,8 @@ fn f07_client_disconnect_stops_after_k_then_pauses() {
 
 #[test]
 fn f08_lost_contact_revocation_stops_payment() {
-    // Le modèle n'a pas de minuterie d'autorisation : l'expiration est représentée
-    // par la révocation (JOB-T08). Ce qui suit la révocation n'est jamais payé.
+    // Contact lost: modeled by revocation (JOB-T08); see JOB-F29 for real lease expiry. Nothing
+    // after revocation is paid.
     let mut t = T::new();
     t.start(J1, 0);
     t.gen(J1, 1);
@@ -566,7 +562,7 @@ fn f09_cancel_and_finish_race() {
         }),
         DomainError::VersionConflict { .. }
     ));
-    // En relisant la version, l'annulation est refusée en `settling`.
+    // Re-reading the version: cancel is refused while `settling`.
     let v2 = Some(t.job(J1).version);
     assert_eq!(
         t.err(Command::Cancel {
@@ -586,7 +582,7 @@ fn f10_low_escrow_blocks_window_then_pause_and_topup() {
         ..sim_config()
     });
     t.start(J1, 0);
-    t.gen(J1, 2); // 24 facturés, 2 restants
+    t.gen(J1, 2); // 24 charged, 2 left
     assert_eq!(
         t.err(Command::Produce {
             job: J1,
@@ -601,7 +597,7 @@ fn f10_low_escrow_blocks_window_then_pause_and_topup() {
         reason: PauseReason::LowEscrow,
         expected_version: None,
     });
-    // 2 crédits ne couvrent aucune sortie restante (la moins chère coûte 3).
+    // 2 credits cover no remaining output (the cheapest costs 3).
     t.err(Command::Resume { job: J1, topup: 0 });
     t.ok(Command::Resume { job: J1, topup: 60 });
     t.start(J1, 2);
@@ -653,7 +649,7 @@ fn f12_oversized_frame_rejected_before_decoding() {
 
 #[test]
 fn f13_scheduler_restart_replays_nothing() {
-    // Le scheduler n'a pas d'état propre : rejouer ses décisions est sans effet.
+    // The scheduler has no state of its own: replaying its decisions does nothing.
     let mut t = T::new();
     t.ok(Command::Reserve { job: J1 });
     let place = Command::Place {
@@ -703,10 +699,10 @@ fn f15_withheld_acks_bound_loss_to_k() {
         attempt: 1,
         wt: GEN,
         upto: 5,
-    }); // 4 livrés, jamais acquittés
+    }); // 4 delivered, never acked
     t.commit_all(J1);
     let s = t.open_slice(J1);
-    // Les prêteurs réclament aussi la fenêtre non acquittée : refusée (sortie non validée).
+    // Lenders also claim the unacked window: rejected (output not validated).
     let items = (0..5)
         .map(|p| ClaimItem::Contribution {
             output: OutputId {
@@ -724,12 +720,12 @@ fn f15_withheld_acks_bound_loss_to_k() {
         items,
     });
     t.wait(60);
-    t.ok(Command::Reconcile); // pause, client silencieux
+    t.ok(Command::Reconcile); // pause, client silent
     assert_eq!(t.job(J1).pause_reason, Some(PauseReason::ClientSilent));
     t.ok(Command::Tick { dt: 121 });
-    t.ok(Command::Reconcile); // fin du drainage : clôture
+    t.ok(Command::Reconcile); // end of draining: closure
     t.ok(Command::Tick { dt: 601 });
-    t.ok(Command::Reconcile); // échéance d'évaluation
+    t.ok(Command::Reconcile); // evaluation deadline
     assert_eq!(t.line(s, L[0]).paid, 6, "only the validated output is paid");
     assert_eq!(
         t.c().slices[&s].rejected_items,
@@ -750,7 +746,7 @@ fn f16_survivor_paid_after_other_gpu_fails() {
         job: J1,
         expected_version: None,
     });
-    // Seul le prêteur de l'étage 0 réclame, en drainage.
+    // Only the stage 0 lender claims, while draining.
     let items = (0..3)
         .map(|p| ClaimItem::Contribution {
             output: OutputId {
@@ -775,7 +771,7 @@ fn f16_survivor_paid_after_other_gpu_fails() {
 
 #[test]
 fn f17_receipts_fabricated_after_revocation() {
-    // Scénario écrit pour un plafond de 8 crédits (la simulation en utilise 4).
+    // Written for an 8-credit cap (the simulation uses 4).
     let mut t = T::with(Config {
         uncommitted_cap: 8,
         ..sim_config()
@@ -787,7 +783,7 @@ fn f17_receipts_fabricated_after_revocation() {
         job: J1,
         expected_version: None,
     });
-    // Engagement envoyé APRÈS la révocation : horodaté trop tard.
+    // Commitment sent AFTER revocation: stamped too late.
     t.ok(Command::Tick { dt: 5 });
     t.ok(Command::CommitReceipts {
         job: J1,
@@ -810,7 +806,7 @@ fn f17_receipts_fabricated_after_revocation() {
         lender: L[0],
         items: vec![ev(0), ev(1)],
     });
-    // Reçus non engagés : au plus K = 4 par type en drainage.
+    // Uncommitted receipts: at most K = 4 per type while draining.
     let un = |p| ClaimItem::Contribution {
         output: OutputId {
             job: J1,
@@ -836,12 +832,12 @@ fn f17_receipts_fabricated_after_revocation() {
     t.ok(Command::Tick { dt: 121 });
     t.close_eval(s);
     assert_eq!(t.line(s, L[0]).paid, 0, "late commitment proves nothing");
-    // JOB-R35 : remboursement faute de preuve seulement à l'échéance d'évaluation.
+    // JOB-R35: refund for missing proof only at the evaluation deadline.
     assert_eq!(t.line(s, L[0]).pending, 12);
     t.ok(Command::Tick { dt: 600 });
     t.ok(Command::Reconcile);
     assert_eq!(t.line(s, L[0]).refunded, 12);
-    // 4 × 4 = 16 > plafond 8 : 2 payés, 2 contestés.
+    // 4 x 4 = 16 > cap 8: 2 paid, 2 disputed.
     assert_eq!(t.line(s, L[1]).paid, 8);
     assert_eq!(t.line(s, L[1]).disputed, 8);
     assert_eq!(t.c().slices[&s].status, SliceStatus::Disputed);
@@ -932,13 +928,13 @@ fn f19_resume_after_pause_keeps_intent() {
 fn f20_unvalidated_positions_are_wasted_not_billed() {
     let mut t = T::new();
     t.start(J1, 0);
-    t.gen(J1, 2); // positions 0-1 validées
+    t.gen(J1, 2); // positions 0-1 validated
     t.ok(Command::Produce {
         job: J1,
         attempt: 1,
         wt: GEN,
         upto: 5,
-    }); // 2-4 produites
+    }); // 2-4 produced
     t.commit_all(J1);
     let s1 = t.open_slice(J1);
     t.ok(Command::NodeLost {
@@ -951,10 +947,10 @@ fn f20_unvalidated_positions_are_wasted_not_billed() {
         2,
         "attempt 2 resumes at 2"
     );
-    t.gen(J1, 3); // positions 2-4 validées sur la tentative 2
+    t.gen(J1, 3); // positions 2-4 validated on attempt 2
     t.commit_all(J1);
     let s2 = t.open_slice(J1);
-    // Tentative 1 : réclame 0..5 ; seules 0-1 lui appartiennent.
+    // Attempt 1 claims 0..5; only 0-1 belong to it.
     let all = |stage| {
         (0..5).map(move |p| ClaimItem::Contribution {
             output: OutputId {
@@ -1007,7 +1003,7 @@ fn f20_unvalidated_positions_are_wasted_not_billed() {
 
 #[test]
 fn f21_dispute_isolated_to_one_lender_line() {
-    // Scénario écrit pour un plafond de 8 crédits (la simulation en utilise 4).
+    // Written for an 8-credit cap (the simulation uses 4).
     let mut t = T::with(Config {
         uncommitted_cap: 8,
         ..sim_config()
@@ -1035,7 +1031,7 @@ fn f21_dispute_isolated_to_one_lender_line() {
         lender: L[1],
         items: (0..3).map(|p| item(p, 1, Evidence::Committed)).collect(),
     });
-    // Étage 2 (2 crédits / sortie) sur reçus non engagés : 6 ≤ 8, payé. On abaisse le plafond par une 2e tranche plus bas.
+    // Stage 2 (2 credits per output) on uncommitted receipts: 6 <= 8, paid.
     t.ok(Command::Claim {
         slice: s,
         lender: L[2],
@@ -1043,7 +1039,7 @@ fn f21_dispute_isolated_to_one_lender_line() {
     });
     t.close_eval(s);
     assert_eq!(t.c().slices[&s].status, SliceStatus::Final);
-    // Deuxième tranche : le prêteur 12 dépasse le plafond, seule sa ligne est contestée.
+    // Second slice: lender 12 goes over the cap, only its line is disputed.
     t.gen(J1, 3);
     t.commit_all(J1);
     let s2 = t.open_slice(J1);
@@ -1086,7 +1082,7 @@ fn f22_cancel_while_draining_settles_everything() {
     });
     assert_eq!(t.job(J1).exec, ExecStatus::Cancelled);
     assert_eq!(t.job(J1).settle, SettleStatus::Finalizing);
-    t.err(Command::Settle { job: J1 }); // tranche encore en drainage
+    t.err(Command::Settle { job: J1 }); // slice still draining
     t.ok(Command::Tick { dt: 121 });
     t.ok(Command::Reconcile);
     t.ok(Command::Tick { dt: 601 });
@@ -1094,7 +1090,7 @@ fn f22_cancel_while_draining_settles_everything() {
     assert_eq!(t.job(J1).settle, SettleStatus::Closed);
     assert_eq!(t.bal(Account::EscrowWork(1)), 0);
     assert_eq!(t.bal(Account::OutputHold(1)), 0);
-    // Emprunteur : 2 000 − 24 (2 sorties). Les 24 sont retenus pour les prêteurs.
+    // Borrower: 2,000 - 24 (2 outputs). The 24 are held for lenders.
     assert_eq!(t.bal(Account::User(1)), 2_000 - 24);
     t.finish();
 }
@@ -1109,7 +1105,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
         job: J1,
         expected_version: None,
     });
-    t.start(J1, 17); // tout le budget
+    t.start(J1, 17); // whole budget
     t.gen(J1, 1);
     t.ok(Command::NodeLost {
         job: J1,
@@ -1125,7 +1121,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
         }),
         DomainError::RecoveryBudget
     );
-    // Le pool bloque 10 crédits avant la reprise.
+    // The pool locks 10 credits before the resume.
     t.ok(Command::FundRecovery {
         job: J1,
         amount: 10,
@@ -1136,7 +1132,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
         job: J1,
         expected_version: None,
     });
-    // Plus rien : aucune reprise non financée, pause à l'échéance.
+    // Nothing left: no unfunded resume, pause at the deadline.
     t.err(Command::Place {
         job: J1,
         lenders: L.to_vec(),
@@ -1150,7 +1146,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
     t.finish();
 }
 
-// ------------------------------------------------- Corrections v2.3 (ciblées)
+// ------------------------------------------------- targeted tests
 
 #[test]
 fn r21_every_stage_paid_once_and_sum_le_price() {
@@ -1171,7 +1167,7 @@ fn r21_every_stage_paid_once_and_sum_le_price() {
         [6, 4, 2]
     );
     assert_eq!(paid, 12, "three contributions, one output, sum = price");
-    // Un prêteur ne peut pas réclamer la plage d'un autre.
+    // A lender cannot claim another lender's range.
     let s2 = t.open_slice(J1);
     t.ok(Command::Claim {
         slice: s2,
@@ -1193,7 +1189,7 @@ fn r21_every_stage_paid_once_and_sum_le_price() {
 
 #[test]
 fn r21_rounding_never_exceeds_price() {
-    // Job 2 : 2 étages égaux, prix 7 → parts 3 + 3 = 6 ≤ 7 ; le reste revient à l'emprunteur.
+    // Job 2: 2 equal stages, price 7, so shares 3 + 3 = 6 <= 7; the rest goes back to the borrower.
     let mut t = T::new();
     let j2 = JobId(2);
     t.ok(Command::Reserve { job: j2 });
@@ -1232,7 +1228,7 @@ fn r24_pending_evaluation_balances_line_between_close_and_evaluate() {
         (l.claimed, l.pending, l.paid, l.refunded, l.disputed),
         (12, 12, 0, 0, 0)
     );
-    // Réservation atomique : l'argent est déjà sorti de OutputHold vers la ligne.
+    // Atomic reservation: the money already moved from OutputHold to the line.
     assert_eq!(
         t.bal(Account::SliceLine {
             job: 1,
@@ -1272,7 +1268,7 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
     );
     let circulating = t.c().ledger.circulating();
     let borrower = t.bal(Account::User(1));
-    // Fraude découverte : contestation de la ligne du prêteur 11, pendant la fenêtre.
+    // Fraud found: lender 11's line is contested within the window.
     t.ok(Command::ContestReward {
         slice: s,
         lender: L[1],
@@ -1283,7 +1279,7 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
         "refund comes from held rewards"
     );
     assert_eq!(t.c().ledger.circulating(), circulating, "no credit created");
-    // Après la fenêtre : libération définitive, plus de contestation possible.
+    // After the window: release is final, no more contest.
     t.ok(Command::Tick { dt: 48 * 3600 });
     t.ok(Command::ReleaseReward {
         slice: s,
@@ -1296,7 +1292,7 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
     t.err(Command::ContestReward {
         slice: s,
         lender: L[2],
-    }); // fenêtre close
+    }); // window closed
     t.ok(Command::ReleaseReward {
         slice: s,
         lender: L[2],
@@ -1309,7 +1305,7 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
     t.finish();
 }
 
-// ------------------------------------------------- JOB-F24 à F32 (v2.4, I-03)
+// ------------------------------------------------- JOB-F24 to F32 (delivery)
 
 #[test]
 fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
@@ -1318,7 +1314,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
     t.gen(J1, 1);
     let escrow0 = t.bal(Account::EscrowWork(1));
     t.produce(J1, 5);
-    t.deliver(J1, 5); // le témoin voit passer 4 tokens ; le client n'acquitte jamais
+    t.deliver(J1, 5); // the witness sees 4 tokens go by; the client never acks
     assert_eq!(t.job(J1).validated[GEN.idx()], 1);
     assert_eq!(t.job(J1).delivered[GEN.idx()], 5);
     assert!(!t.charge(J1, 4).unwrap().definitive);
@@ -1333,7 +1329,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
     t.wait(60);
     t.ok(Command::Reconcile);
     assert_eq!(t.job(J1).pause_reason, Some(PauseReason::ClientSilent));
-    // Fin du drainage puis de la fenêtre de livraison (24 h) et de l'évaluation.
+    // End of draining, then of the 24 h delivery window and of evaluation.
     t.ok(Command::Tick { dt: 121 });
     t.ok(Command::Reconcile);
     t.ok(Command::Tick { dt: 24 * 3600 });
@@ -1346,7 +1342,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
         "the witnessed window is paid to lenders"
     );
     assert_eq!(t.line(s, L[2]).paid, 5 * 2);
-    // Le client conteste trop tard : rejeu gratuit, aucun remboursement.
+    // The client contests too late: free retransmission, no refund.
     let before = t.c().ledger.entries().len();
     t.ok(Command::ConfirmDelivery {
         job: J1,
@@ -1366,7 +1362,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
 fn f25_lender_cannot_attest_its_own_delivery() {
     let mut t = T::new();
     t.ok(Command::Reserve { job: J1 });
-    // Un prêteur ne peut pas être le témoin de sa propre grappe (JOB-R26).
+    // A lender cannot be the witness of its own cluster (JOB-R26).
     assert!(matches!(
         t.err(Command::Place {
             job: J1,
@@ -1379,7 +1375,7 @@ fn f25_lender_cannot_attest_its_own_delivery() {
     ));
     t.start(J1, 0);
     t.produce(J1, 3);
-    // Le nœud de sortie « atteste » lui-même : aucune preuve.
+    // The output node "attests" itself: no proof.
     assert_eq!(
         t.err(Command::Deliver {
             job: J1,
@@ -1408,12 +1404,12 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
     t.start(J1, 0);
     t.gen(J1, 2);
     t.produce(J1, 6);
-    t.deliver(J1, 6); // positions 2..6 livrées ; l'accusé du client est perdu
+    t.deliver(J1, 6); // positions 2..6 delivered; the client's ack is lost
     t.ok(Command::NodeLost {
         job: J1,
         expected_version: None,
     });
-    // Le client annonce sa dernière position reçue : 2 et 3 reçues, 4 et 5 non.
+    // The client reports its last received position: 2 and 3 received, 4 and 5 not.
     t.ok(Command::ConfirmDelivery {
         job: J1,
         wt: GEN,
@@ -1422,7 +1418,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
     });
     assert_eq!(t.job(J1).validated[GEN.idx()], 4);
     assert_eq!(t.charge(J1, 3).unwrap().basis, ChargeBasis::ClientSigned);
-    // 4 et 5 : contestées, rejouées, toujours provisoires (JOB-R33).
+    // 4 and 5: contested, replayed, still provisional (JOB-R33).
     let c5 = t.charge(J1, 5).unwrap();
     assert!(!c5.definitive && c5.contest.is_some());
     t.ok(Command::Place {
@@ -1432,7 +1428,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
         witness: WITNESS,
         expected_version: None,
     });
-    // La reprise repart des positions livrées, pas des validées.
+    // The resume starts from delivered positions, not validated ones.
     assert!(matches!(
         t.err(Command::AttemptReady {
             job: J1,
@@ -1446,7 +1442,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
         attempt: 2,
         restored: [0, 6, 0],
     });
-    t.gen(J1, 1); // accusé cumulatif jusqu'à 7 : couvre aussi le rejeu de 4 et 5
+    t.gen(J1, 1); // cumulative ack up to 7, also covers the replay of 4 and 5
     assert_eq!(t.charge(J1, 5).unwrap().basis, ChargeBasis::ClientSigned);
     assert!(t.charge(J1, 5).unwrap().contest.is_none());
     for pos in 0..7 {
@@ -1483,8 +1479,8 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
     let s = t.open_slice(J1);
     t.claim_all(s, Evidence::Committed);
     t.close_eval(s);
-    // Contributions des sorties provisoires : réservées, en attente (JOB-R30) ;
-    // la tranche reste close jusqu'à l'échéance (CE-06).
+    // Contributions to provisional outputs: reserved and waiting (JOB-R30); the slice stays closed
+    // until the deadline (CE-06).
     assert_eq!(t.c().slices[&s].status, SliceStatus::Closed);
     assert_eq!(t.line(s, L[0]).paid, 6);
     assert_eq!(t.line(s, L[0]).disputed, 4 * 6);
@@ -1509,7 +1505,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
         expected_version: None,
     });
     let escrow = t.bal(Account::EscrowWork(1));
-    // Le client a reçu 1 et 2, pas 3 ni 4 ; le tampon est perdu.
+    // The client got 1 and 2, not 3 or 4; the buffer is lost.
     t.ok(Command::ConfirmDelivery {
         job: J1,
         wt: GEN,
@@ -1527,7 +1523,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
         "voided outputs refunded"
     );
     assert!(t.charge(J1, 3).is_none());
-    // 1 et 2 signées par le client → payées ; 3 et 4 annulées → remboursées.
+    // 1 and 2 signed by the client are paid; 3 and 4 voided are refunded.
     assert_eq!(t.line(s, L[0]).paid, 3 * 6);
     assert_eq!(t.line(s, L[0]).refunded, 2 * 6);
     assert_eq!(t.line(s, L[0]).disputed + t.line(s, L[0]).pending, 0);
@@ -1543,7 +1539,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
         attempt: 2,
         restored: [0, 3, 0],
     });
-    t.gen(J1, 2); // positions 3 et 4 régénérées et facturées une nouvelle fois
+    t.gen(J1, 2); // positions 3 and 4 produced again and charged again
     assert_eq!(t.net_charges(J1, 3), 1);
     assert_eq!(t.charge(J1, 3).unwrap().gen, 1);
     assert_eq!(
@@ -1563,7 +1559,7 @@ fn f28_simultaneous_client_silence_and_lease_expiry() {
     t.start(J1, 0);
     t.gen(J1, 1);
     t.produce(J1, 3);
-    // Ni accusé ni heartbeat : les deux échéances tombent ensemble.
+    // No ack and no heartbeat: both deadlines hit together.
     t.ok(Command::Tick { dt: 60 });
     t.ok(Command::Reconcile);
     assert_eq!(
@@ -1586,7 +1582,7 @@ fn f28_simultaneous_client_silence_and_lease_expiry() {
         })
         .count();
     assert_eq!(revocations, 1);
-    // Perte du nœud et du témoin dans la même seconde, sur la reprise.
+    // Node and witness lost in the same second, on the resume.
     t.start(J1, 2);
     t.produce(J1, 3);
     t.deliver(J1, 3);
@@ -1607,9 +1603,9 @@ fn f29_expired_lease_rejects_work_until_reconciliation_revokes() {
     let mut t = T::new();
     t.start(J1, 0);
     t.gen(J1, 1);
-    t.wait(300); // grappe saine : l'autorisation est renouvelée
+    t.wait(300); // healthy cluster: the lease is renewed
     t.gen(J1, 1);
-    t.ok(Command::Tick { dt: 45 }); // grappe muette
+    t.ok(Command::Tick { dt: 45 }); // silent cluster
     let a = t.attempt(J1);
     assert_eq!(
         t.err(Command::Produce {
@@ -1641,7 +1637,7 @@ fn f30_client_cannot_overstate_or_unconfirm_or_contest_live_output() {
     t.gen(J1, 1);
     t.produce(J1, 5);
     t.deliver(J1, 3);
-    // Sortie de la tentative vivante : on la retransmet, on ne la conteste pas.
+    // Output of the live attempt: retransmit, don't contest.
     assert!(matches!(
         t.err(Command::ConfirmDelivery {
             job: J1,
@@ -1691,14 +1687,14 @@ fn f31_contest_after_window_replays_but_never_refunds() {
         confirmed: 1,
         digest: t.c().frame_digest(J1, GEN, 1),
     });
-    // Fenêtre passée : simple retransmission, aucune contestation ni écriture.
+    // Window over: plain retransmission, no contest, no ledger entry.
     assert!(t.charge(J1, 3).unwrap().contest.is_none());
     assert_eq!(t.c().ledger.entries().len(), entries);
     t.ok(Command::WitnessLost {
         job: J1,
         attempt: 1,
     });
-    // Tampon perdu après la fenêtre : la sortie reste due, plus de rejeu possible.
+    // Buffer lost after the window: the output stays due, no replay possible.
     assert!(matches!(
         t.err(Command::ConfirmDelivery {
             job: J1,
@@ -1726,8 +1722,8 @@ fn f32_rewind_revokes_live_attempt_built_on_voided_outputs() {
         job: J1,
         expected_version: None,
     });
-    t.start(J1, 2); // la reprise démarre en position 4 sans attendre le client
-                    // Budget de flux mesuré depuis la signature du client : 1 seule unité de plus.
+    t.start(J1, 2); // the resume starts at position 4 without waiting for the client
+                    // Flow budget measured from the client's signature: only 1 more unit.
     t.produce(J1, 5);
     assert_eq!(
         t.err(Command::Produce {
@@ -1739,7 +1735,7 @@ fn f32_rewind_revokes_live_attempt_built_on_voided_outputs() {
         DomainError::FlowBudgetExceeded
     );
     assert_eq!(t.job(J1).exec, ExecStatus::Running);
-    // Le client revient : il n'a rien reçu après la position 1.
+    // The client comes back: it got nothing after position 1.
     t.ok(Command::ConfirmDelivery {
         job: J1,
         wt: GEN,
@@ -1760,9 +1756,9 @@ fn f32_rewind_revokes_live_attempt_built_on_voided_outputs() {
     t.finish();
 }
 
-// ------------------------------------------------ JOB-F33 à F41 (v2.5)
+// ------------------------------------------------ JOB-F33 to F41 (contests, proofs, cap)
 
-/// Fin de flux attestée (positions 1 à 3), nœud perdu.
+/// Attested tail (positions 1 to 3), node lost.
 fn provisional_tail(t: &mut T) {
     t.start(J1, 0);
     t.gen(J1, 1);
@@ -1779,9 +1775,9 @@ fn f33_signed_heartbeat_without_replay_receipt_is_refunded() {
     let mut t = T::new();
     provisional_tail(&mut t);
     let escrow = t.bal(Account::EscrowWork(1));
-    t.confirm(J1, 1); // « rien reçu après la position 1 » : contestation et rejeu
+    t.confirm(J1, 1); // "nothing after position 1": contest and replay
     assert!(t.charge(J1, 3).unwrap().contest.is_some());
-    // Le client signe un signe de vie, mais aucun accusé couvrant le rejeu.
+    // The client sends a signed keepalive, but no ack covering the replay.
     assert_eq!(
         t.ok(Command::ClientHeartbeat { job: J1 }),
         Outcome::AlreadyApplied
@@ -1799,7 +1795,7 @@ fn f34_cumulative_ack_covering_the_replay_bills_definitively() {
     let mut t = T::new();
     provisional_tail(&mut t);
     t.confirm(J1, 1);
-    // Le rejeu arrive : accusé cumulatif signé, lié au flux, couvrant 1 à 3.
+    // The replay arrives: signed cumulative ack, bound to the stream, covering 1 to 3.
     t.confirm(J1, 4);
     for pos in 1..4 {
         let ch = t.charge(J1, pos).unwrap();
@@ -1821,7 +1817,7 @@ fn f35_declaration_or_attestation_from_another_session_is_rejected() {
     let j2 = JobId(2);
     t.start(j2, 0);
     let a = t.attempt(J1);
-    // Trames d'un autre flux présentées pour ce job.
+    // Frames from another stream presented for this job.
     let foreign = t.c().frame_digest(j2, GEN, 3);
     assert_eq!(
         t.err(Command::Deliver {
@@ -1839,7 +1835,7 @@ fn f35_declaration_or_attestation_from_another_session_is_rejected() {
         job: J1,
         expected_version: None,
     });
-    // Déclaration signée dans une autre session : refusée, rien ne change.
+    // Statement signed in another session: rejected, nothing changes.
     let foreign = t.c().frame_digest(j2, GEN, 3);
     assert_eq!(
         t.err(Command::ConfirmDelivery {
@@ -1897,7 +1893,7 @@ fn f37_commitment_before_revocation_makes_late_attestation_admissible() {
         job: J1,
         expected_version: None,
     });
-    t.ok(Command::Tick { dt: 30 }); // l'attestation complète arrive pendant le drainage
+    t.ok(Command::Tick { dt: 30 }); // the full attestation arrives while draining
     t.deliver(J1, 4);
     assert!(t
         .c()
@@ -1918,7 +1914,7 @@ fn f38_commitment_after_revocation_or_attestation_after_drain_proves_nothing() {
         job: J1,
         expected_version: None,
     });
-    // Engagement fabriqué après la révocation : refusé.
+    // Commitment forged after revocation: rejected.
     assert_eq!(
         t.err(Command::WitnessCommit {
             job: J1,
@@ -1941,7 +1937,7 @@ fn f38_commitment_after_revocation_or_attestation_after_drain_proves_nothing() {
         }),
         DomainError::InadmissibleProof
     );
-    // Même avec un engagement antérieur, une attestation après le drainage est refusée.
+    // Even with an earlier commitment, an attestation after draining is rejected.
     let mut t = T::new();
     t.start(J1, 0);
     t.gen(J1, 1);
@@ -1977,9 +1973,9 @@ fn f38_commitment_after_revocation_or_attestation_after_drain_proves_nothing() {
 fn f39_contest_just_before_window_end_keeps_the_buffer() {
     let mut t = T::new();
     provisional_tail(&mut t);
-    t.ok(Command::Tick { dt: 24 * 3600 - 60 }); // 23 h 59
+    t.ok(Command::Tick { dt: 24 * 3600 - 60 }); // 23:59
     t.confirm(J1, 1);
-    t.ok(Command::Tick { dt: 120 }); // la fenêtre de 24 h est passée
+    t.ok(Command::Tick { dt: 120 }); // the 24 h window is over
     t.ok(Command::Reconcile);
     assert!(
         !t.charge(J1, 3).unwrap().definitive,
@@ -1992,7 +1988,7 @@ fn f39_contest_just_before_window_end_keeps_the_buffer() {
         }),
         DomainError::Precondition(_)
     ));
-    t.confirm(J1, 4); // le rejeu est bien reçu et acquitté
+    t.confirm(J1, 4); // the replay is received and acked
     t.ok(Command::PurgeBuffer {
         job: J1,
         attempt: 1,
@@ -2005,7 +2001,7 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
     let mut t = T::new();
     t.ok(Command::Tick {
         dt: 24 * 3600 - 300,
-    }); // 23 h 55
+    }); // 23:55
     t.start(J1, 0);
     t.gen(J1, 3);
     let un = |p| ClaimItem::Contribution {
@@ -2017,7 +2013,7 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
         stage: 2,
         evidence: Evidence::Uncommitted,
     };
-    // Deux reçus non engagés de 2 crédits avant minuit : 4 = plafond.
+    // Two uncommitted receipts of 2 credits before midnight: 4 = cap.
     let mut slices = Vec::new();
     for p in 0..2 {
         let s = t.open_slice(J1);
@@ -2030,12 +2026,12 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
         assert_eq!(t.line(s, L[2]).paid, 2);
         slices.push(s);
     }
-    // Une contestation rend 2 crédits à l'emprunteur : le quota n'est pas restauré.
+    // A contest returns 2 credits to the borrower; the quota is not restored.
     t.ok(Command::ContestReward {
         slice: slices[0],
         lender: L[2],
     });
-    t.wait(360); // 00 h 01 : nouveau jour calendaire, même fenêtre glissante
+    t.wait(360); // 00:01: new calendar day, same sliding window
     let s = t.open_slice(J1);
     t.ok(Command::Claim {
         slice: s,
@@ -2048,7 +2044,7 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
         2,
         "6 > 4 within 24 h: disputed despite midnight and the refund"
     );
-    // 24 h après les premiers paiements, le quota est de nouveau disponible.
+    // 24 h after the first payments, the quota is available again.
     t.ok(Command::Pause {
         job: J1,
         reason: PauseReason::Requested,
@@ -2096,7 +2092,7 @@ fn f41_supplementary_proof_before_deadline_is_paid_after_is_refused() {
     t.gen(J1, 2);
     t.commit_all(J1);
     let s = t.open_slice(J1);
-    t.claim_all(s, Evidence::None); // réclamations envoyées avant le retour de la preuve
+    t.claim_all(s, Evidence::None); // claims sent before the proof came back
     t.close_eval(s);
     assert_eq!(t.c().slices[&s].status, SliceStatus::Closed);
     assert_eq!(
@@ -2115,6 +2111,18 @@ fn f41_supplementary_proof_before_deadline_is_paid_after_is_refused() {
         evidence: Evidence::Committed,
     });
     t.ok(Command::Tick { dt: 600 });
+    // Deadline reached, slice not evaluated yet: a proof sent now is too late.
+    let late = Command::SupplementEvidence {
+        slice: s,
+        lender: L[0],
+        output: OutputId {
+            job: J1,
+            wt: GEN,
+            pos: 1,
+        },
+        evidence: Evidence::Committed,
+    };
+    assert!(matches!(t.err(late), DomainError::Precondition(_)));
     t.ok(Command::Reconcile);
     assert_eq!(t.line(s, L[0]).paid, 6, "supplemented proof is paid");
     assert_eq!(

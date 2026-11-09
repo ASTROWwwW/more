@@ -1,6 +1,6 @@
 [package]
 name = "gpu-domain"
-description = "Machine à états des jobs, tranches et règlement du réseau GPU P2P (fonctions de transition pures)"
+description = "Job state machine, slices and settlement for More (pure transition functions)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

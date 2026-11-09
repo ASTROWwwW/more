@@ -1,36 +1,36 @@
 # More
 
-More permet de partager la puissance de son GPU. Quand ta carte ne sert pas, tu la prêtes au réseau et tu gagnes des crédits. Quand tu veux faire tourner un modèle trop gros pour ta machine, tu dépenses ces crédits : le modèle est découpé en tranches de couches, et chaque tranche tourne sur le GPU d'un prêteur.
+More lets people share GPU power. When your card sits idle, you lend it to the network and earn credits. When you want to run a model too large for your machine, you spend those credits: the model is cut into layer slices, and each slice runs on a lender's GPU.
 
-Un coordinateur tient les comptes et organise l'exécution, mais le calcul circule directement entre les machines. Les crédits ne s'achètent pas et ne se transfèrent pas : on les gagne en prêtant et on les dépense en empruntant, à l'intérieur d'un pool. Un pool peut rester privé, se fédérer avec d'autres pools ou s'ouvrir au public, et chacun peut héberger son propre coordinateur.
+A coordinator keeps the accounts and organizes the run, but the computation flows directly between machines. Credits cannot be bought or transferred: you earn them by lending and spend them by borrowing, inside a pool. A pool can stay private, federate with other pools or open to the public, and anyone can host their own coordinator.
 
-## Contenu du dépôt
+## What is in the repository
 
-Pour l'instant, le dépôt contient la spécification du système et un modèle exécutable en Rust de ses règles. Il n'y a pas encore de réseau ni de moteur GPU. Le modèle sert à vérifier, avant d'écrire le vrai coordinateur, que les règles résistent aux pannes et à la triche. Un job interrompu doit reprendre sans perdre ni refacturer un résultat déjà livré. Chaque sortie est facturée une seule fois, chaque contribution d'un prêteur est payée au plus une fois, et aucun crédit n'est créé ni perdu en route.
+For now the repository holds the system specification and an executable Rust model of its rules. There is no network layer or GPU engine yet. The model checks, before the real coordinator is written, that the rules hold up against failures and cheating. An interrupted job has to resume without losing or re-billing a result that was already delivered. Each output is billed once, each lender contribution is paid at most once, and no credit is created or lost along the way.
 
-Les tests génèrent des séquences aléatoires de commandes : nœuds qui tombent, messages en double, clients qui n'acquittent pas, prêteurs qui mentent sur la livraison, horloges qui expirent. Les invariants sont vérifiés après chaque commande, et une campagne de mutation réintroduit des bugs connus pour s'assurer que les tests les attrapent.
+The tests generate random command sequences: nodes going down, duplicated messages, clients that never acknowledge, lenders lying about delivery, expiring clocks. Invariants are checked after every command, and a mutation campaign puts known bugs back in to make sure the tests catch them.
 
-| Chemin | Rôle |
+| Path | Purpose |
 | --- | --- |
-| `crates/ledger` | Registre comptable en partie double, en insertion seule |
-| `crates/domain` | Coordinateur : jobs, tentatives, tranches de facturation, livraison des sorties, règlement |
-| `crates/protocol` | Contrat des messages : enveloppe, contrôle de taille, codes d'erreur, anti-rejeu |
-| `crates/simulation` | Vérificateur d'invariants et générateurs de scénarios aléatoires |
-| `tests/` | Tests de propriétés, scénarios d'échec et contre-exemples trouvés |
-| `scripts/mutation.py` | Campagne de mutation |
-| `docs/specification.md` | Spécification complète |
-| `RAPPORT_TESTS.md` | Tests exécutés et résultats |
+| `crates/ledger` | Append-only double-entry ledger |
+| `crates/domain` | Coordinator: jobs, attempts, billing slices, output delivery, settlement |
+| `crates/protocol` | Message contract: envelope, size check, error codes, anti-replay |
+| `crates/simulation` | Invariant checker and random scenario generators |
+| `tests/` | Property tests, failure scenarios and counterexamples found so far |
+| `scripts/mutation.py` | Mutation campaign |
+| `docs/specification.md` | Full specification |
+| `TEST_REPORT.md` | Tests run and results |
 
-## Lancer les tests
+## Running the tests
 
 ```sh
 cargo test --release --workspace
-PROPTEST_CASES=5000 cargo test --release --workspace   # plus de traces aléatoires
-python3 scripts/mutation.py                            # environ 30 min
+PROPTEST_CASES=5000 cargo test --release --workspace   # more random traces
+python3 scripts/mutation.py                            # about 30 min
 ```
 
-Il faut Rust 1.75 ou plus récent.
+Requires Rust 1.75 or newer.
 
-## Licence
+## License
 
 AGPL-3.0.

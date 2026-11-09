@@ -1,18 +1,8 @@
-//! Tests de propriétés (section 9, TEST-P01 à TEST-P28).
-//!
-//! `proptest` génère des séquences de commandes, pannes, doublons, versions
-//! concurrentes, sauts d'horloge et comportements adverses (client qui
-//! n'acquitte pas, prêteur qui atteste sa propre livraison, témoin qui perd son
-//! tampon, client qui ment sur ce qu'il a reçu). Après chaque commande, toutes
-//! les propriétés d'état et de transition sont vérifiées ; en fin de séquence,
-//! la phase de vidage vérifie la vivacité et l'équité.
-//!
-//! Tout contre-exemple trouvé est enregistré dans
-//! `tests/properties/proptest-regressions.txt` (rejoué en premier à chaque
-//! exécution) ET recopié à la main, réduit, dans `tests/regressions/`.
-//!
-//! Chaque test écrit ses mesures de couverture dans `target/coverage/` : le
-//! rapport cite ces fichiers, produits par l'exécution de référence elle-même.
+//! Property tests (spec section 9, TEST-P01 to TEST-P28). `proptest` generates sequences of
+//! commands, faults, duplicates, concurrent versions, clock jumps and adversarial behaviour; every
+//! property is checked after each command, and liveness and fairness after a final drain.
+//! Counterexamples are saved in `tests/properties/proptest-regressions.txt` and copied, reduced,
+//! into `tests/regressions/`. Each test writes its coverage figures to `target/coverage/`.
 
 use std::sync::Mutex;
 
@@ -39,8 +29,8 @@ fn report(sim: &Sim, ops: &[Op]) -> String {
     )
 }
 
-/// Exécute une propriété : chaque trace est rejouée commande par commande
-/// sous le vérificateur complet, puis vidée.
+/// Runs one property: each trace is replayed command by command under the full checker, then
+/// drained.
 fn run_property(
     name: &str,
     cases: u32,
@@ -51,7 +41,7 @@ fn run_property(
     let config = ProptestConfig {
         cases,
         max_shrink_iters: 20_000,
-        // Contre-exemples rejoués en premier à chaque exécution (non-régression).
+        // Saved counterexamples are replayed first on every run.
         failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
             "tests/properties/proptest-regressions.txt",
         ))),
@@ -81,21 +71,20 @@ fn run_property(
     }
 }
 
-/// Toutes les propriétés de sûreté après chaque commande, puis la vivacité.
+/// All safety properties after each command, then liveness.
 #[test]
 fn invariants_hold_on_random_traces() {
     run_property("random", cases(), 160, op_strategy(), sim_config());
 }
 
-/// Traces longues orientées « pannes » : plus de pertes de nœud, de reprises
-/// et de réclamations tardives.
+/// Long fault-heavy traces: more lost nodes, resumes and late claims.
 #[test]
 fn invariants_hold_under_heavy_faults() {
     run_property("faults", cases(), 220, fault_heavy_op(), sim_config());
 }
 
-/// Réserve initiale partielle : l'escrow peut s'épuiser (JOB-R25, JOB-F10),
-/// les reprises passent par des compléments (JOB-T12).
+/// Partial initial reserve: escrow can run out (JOB-R25, JOB-F10) and resumes need top-ups
+/// (JOB-T12).
 #[test]
 fn invariants_hold_with_partial_reserve() {
     run_property(
@@ -110,9 +99,8 @@ fn invariants_hold_with_partial_reserve() {
     );
 }
 
-/// I-03 (v2.4) : livraison attestée, client qui n'acquitte pas, prêteur qui
-/// atteste lui-même, témoin qui perd son tampon, client qui ment à la reprise,
-/// pannes simultanées.
+/// Delivery: attested outputs, clients that never ack, lenders attesting themselves, lost buffers,
+/// clients lying on resume, simultaneous faults.
 #[test]
 fn invariants_hold_under_delivery_adversaries() {
     run_property(
@@ -124,8 +112,7 @@ fn invariants_hold_under_delivery_adversaries() {
     );
 }
 
-/// Mélange qui force le chemin nominal + pannes : réserver, placer, démarrer,
-/// produire, acquitter, réclamer, perdre un nœud, reprendre.
+/// Mix that pushes the normal path plus faults.
 fn fault_heavy_op() -> impl Strategy<Value = Op> {
     let b = any::<u8>;
     prop_oneof![
@@ -165,8 +152,8 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Mélange centré sur I-03 : peu d'accusés, beaucoup d'attestations, de
-/// déclarations du client, de pertes de témoin et de pannes simultanées.
+/// Delivery-focused mix: few acks, many attestations, client statements, lost witnesses and
+/// simultaneous faults.
 fn delivery_adversary_op() -> impl Strategy<Value = Op> {
     let b = any::<u8>;
     prop_oneof![
@@ -201,9 +188,8 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Contrôle de couverture : sans cela, des propriétés « vraies » pourraient
-/// l'être seulement parce que les chemins intéressants ne sont jamais atteints.
-/// Chaque chemin doit être atteint un nombre minimal de fois.
+/// Coverage check: without it, properties could pass only because interesting paths are never
+/// reached. Each path must be hit a minimum number of times.
 #[test]
 fn generator_reaches_interesting_paths() {
     use proptest::strategy::ValueTree;
@@ -235,28 +221,28 @@ fn generator_reaches_interesting_paths() {
     }
     total.write("generator_paths");
     let minimum = [
-        ("reprises (running → recovering)", 200),
-        ("tentatives ≥ 2 démarrées", 200),
-        ("sorties facturées sur accusé", 200),
-        ("sorties facturées provisoirement (témoin)", 200),
-        ("provisoires confirmées par le client", 20),
-        ("provisoires confirmées par expiration de fenêtre", 20),
-        ("sorties rejouées", 20),
-        ("sorties annulées (retour arrière)", 20),
-        ("retours arrière", 10),
-        ("contestations de livraison ouvertes", 30),
-        ("attestations tardives admises", 10),
-        ("tampons purgés après rétention", 10),
-        ("preuves complémentaires", 5),
-        ("paiements de contributions", 100),
-        ("paiements de récupération", 20),
-        ("contributions en attente de livraison", 30),
-        ("contributions annulées avec leur sortie", 3),
-        ("éléments contestés", 10),
-        ("paiements par arbitrage", 5),
-        ("remboursements par arbitrage", 10),
-        ("contestations de récompense", 10),
-        ("récompenses libérées", 100),
+        ("resumes (running → recovering)", 200),
+        ("attempts ≥ 2 started", 200),
+        ("outputs charged on ack", 200),
+        ("outputs charged provisionally (witness)", 200),
+        ("provisional confirmed by client", 20),
+        ("provisional confirmed by window expiry", 20),
+        ("outputs replayed", 20),
+        ("outputs voided (rewind)", 20),
+        ("rewinds", 10),
+        ("delivery contests opened", 30),
+        ("late attestations admitted", 10),
+        ("buffers purged after retention", 10),
+        ("supplementary proofs", 5),
+        ("contribution payments", 100),
+        ("recovery payments", 20),
+        ("contributions awaiting delivery", 30),
+        ("contributions voided with their output", 3),
+        ("items disputed", 10),
+        ("payments by arbitration", 5),
+        ("refunds by arbitration", 10),
+        ("reward contests", 10),
+        ("rewards released", 100),
     ];
     let missing: Vec<String> = minimum
         .iter()

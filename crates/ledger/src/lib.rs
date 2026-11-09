@@ -1,59 +1,51 @@
-//! Registre comptable en partie double (spécification v2.3, section 7).
-//!
-//! Chaque écriture déplace un montant d'un compte vers un autre : rien n'est
-//! créé ni détruit, sauf par les comptes `Issuance` (seul compte autorisé à
-//! devenir négatif, LEDGER-003) et `Burn`. Les écritures sont en insertion
-//! seule (LEDGER-002), portent une clé d'idempotence unique (LEDGER-001) et
-//! sont chaînées par empreinte (LEDGER-006).
-//!
-//! Le modèle n'utilise aucune base de données : l'atomicité d'une transition
-//! (JOB-R01) est obtenue en appliquant toute la transition sur une copie de
-//! l'état et en ne la conservant qu'en cas de succès.
+//! Double-entry ledger (spec section 7). Every entry moves an amount between two accounts; only
+//! `Issuance` creates credits and only `Burn` destroys them. Entries are append-only, carry a
+//! unique idempotency key and are hash-chained (LEDGER-001 to 006). Transition atomicity (JOB-R01)
+//! comes from applying each transition to a copy of the state.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Montant en plus petite unité de crédit. Jamais de flottants (LEDGER, à décider → tranché ici).
+/// Amount in the smallest credit unit. Never floats.
 pub type Amount = u64;
 
-/// Comptes du registre. Les identifiants sont des entiers bruts pour que la
-/// crate ne dépende pas du domaine.
+/// Ledger accounts. Raw integer ids keep this crate independent of the domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Account {
-    /// Seul compte qui crée des crédits. Son solde est l'opposé du total émis.
+    /// The only account that creates credits; its balance is minus the total issued.
     Issuance,
-    /// Crédits retirés de la circulation.
+    /// Credits removed from circulation.
     Burn,
-    /// Solde disponible d'un utilisateur.
+    /// A user's available balance.
     User(u32),
-    /// Trésorerie d'un pool (amorçage, relais du budget de récupération).
+    /// Pool treasury (bootstrap, recovery budget relay).
     PoolReserve(u32),
-    /// Escrow d'un job : part « travail normal ».
+    /// Job escrow: regular work.
     EscrowWork(u32),
-    /// Escrow d'un job : part « budget de récupération » (JOB-R18).
+    /// Job escrow: recovery budget (JOB-R18).
     EscrowRecovery(u32),
-    /// Prix des sorties validées d'un job, en attente de répartition entre contributions.
+    /// Price of a job's charged outputs, waiting to be split among contributions.
     OutputHold(u32),
-    /// Réserve d'une ligne de tranche `(job, tentative, tranche, prêteur)`.
+    /// Reserve of a slice line `(job, attempt, slice, lender)`.
     SliceLine {
         job: u32,
         attempt: u32,
         slice: u32,
         lender: u32,
     },
-    /// Récompenses retenues d'une ligne pendant la fenêtre de contestation.
+    /// Rewards of a line held during the contest window.
     PendingReward {
         job: u32,
         attempt: u32,
         slice: u32,
         lender: u32,
     },
-    /// Commissions de la plateforme ou du pool.
+    /// Platform or pool commissions.
     Commission,
 }
 
 impl Account {
-    /// Un seul compte peut être négatif : l'émission.
+    /// Only issuance may go negative.
     pub fn may_go_negative(self) -> bool {
         matches!(self, Account::Issuance)
     }
@@ -73,15 +65,15 @@ pub struct Entry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LedgerError {
-    /// Clé déjà utilisée : l'écriture a déjà eu lieu (LEDGER-001).
+    /// Key already used: the entry was already applied (LEDGER-001).
     DuplicateKey(String),
-    /// L'écriture rendrait un compte négatif (LEDGER-005 / JOB-R07).
+    /// The entry would make an account negative (LEDGER-005, JOB-R07).
     InsufficientFunds {
         account: Account,
         balance: Amount,
         requested: Amount,
     },
-    /// Montant nul ou écriture d'un compte vers lui-même.
+    /// Zero amount or self-transfer.
     Invalid(&'static str),
 }
 
@@ -93,7 +85,7 @@ impl fmt::Display for LedgerError {
 
 impl std::error::Error for LedgerError {}
 
-/// Violation d'un invariant du registre, détectée par [`Ledger::check_invariants`].
+/// Ledger invariant violation found by [`Ledger::check_invariants`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LedgerViolation {
     SumNotZero(i128),
@@ -121,9 +113,7 @@ fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Empreinte d'une écriture. FNV-1a suffit pour le modèle (détection
-/// d'altération accidentelle) ; le coordinateur réel utilisera une fonction
-/// cryptographique (SHA-256 ou BLAKE3).
+/// Entry hash. FNV-1a is enough for the model; the real coordinator will use SHA-256 or BLAKE3.
 fn entry_hash(prev: u64, seq: u64, key: &str, from: Account, to: Account, amount: Amount) -> u64 {
     let mut h = fnv(FNV_OFFSET, &prev.to_le_bytes());
     h = fnv(h, &seq.to_le_bytes());
@@ -141,7 +131,7 @@ impl Ledger {
         self.balances.get(&account).copied().unwrap_or(0)
     }
 
-    /// Solde d'un compte qui ne peut pas être négatif.
+    /// Balance of an account that cannot go negative.
     pub fn available(&self, account: Account) -> Amount {
         let b = self.balance(account);
         debug_assert!(b >= 0 || account.may_go_negative());
@@ -160,13 +150,13 @@ impl Ledger {
         self.balances.iter()
     }
 
-    /// Total des crédits en circulation (= crédits émis − crédits détruits).
+    /// Credits in circulation (issued minus burned).
     pub fn circulating(&self) -> i128 {
         -self.balance(Account::Issuance) - self.balance(Account::Burn)
     }
 
-    /// Déplace `amount` de `from` vers `to`. Un montant nul est accepté et
-    /// n'écrit rien (pools en partage libre), pour garder les appelants simples.
+    /// Moves `amount` from `from` to `to`. A zero amount is accepted and writes nothing (free
+    /// pools).
     pub fn transfer(
         &mut self,
         key: impl Into<String>,
@@ -212,7 +202,7 @@ impl Ledger {
         Ok(())
     }
 
-    /// Vérifie LEDGER-001, 002, 004, 005 et 006 en recalculant tout depuis le journal.
+    /// Checks LEDGER-001, 002, 004, 005 and 006 by recomputing everything from the journal.
     pub fn check_invariants(&self) -> Vec<LedgerViolation> {
         let mut out = Vec::new();
         let mut recomputed: BTreeMap<Account, i128> = BTreeMap::new();

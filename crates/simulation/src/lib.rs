@@ -1,5 +1,5 @@
-//! Simulation : horloge contrôlée, opérations aléatoires et adverses,
-//! vérificateur d'invariants. Aucune dépendance au réseau ni à une base.
+//! Simulation: controlled clock, random and adversarial operations, invariant checker. No network,
+//! no database.
 
 pub mod invariants;
 pub mod stats;

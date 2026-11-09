@@ -1,10 +1,7 @@
-//! Monde simulé, opérations abstraites et générateur `proptest`.
-//!
-//! Les opérations sont abstraites (indices) et résolues en commandes concrètes
-//! à partir de l'état courant : cela produit des traces réalistes (claims sur
-//! de vraies tranches, acks sur la tentative en cours) tout en gardant des
-//! opérations adverses (tentative périmée, plage d'un autre prêteur, doublons,
-//! versions concurrentes, reçus non engagés en rafale).
+//! Simulated world, abstract operations and the `proptest` generator. Operations are selectors
+//! resolved against the current state, so traces stay realistic (claims on real slices, acks on the
+//! live attempt) while still including adversarial ones (stale attempts, wrong lender, duplicates,
+//! concurrent versions, receipt bursts).
 
 use proptest::prelude::*;
 
@@ -17,10 +14,10 @@ pub const FREE_POOL: PoolId = PoolId(2);
 pub const BORROWERS: [AccountId; 2] = [AccountId(1), AccountId(2)];
 pub const LENDERS: [AccountId; 4] = [AccountId(10), AccountId(11), AccountId(12), AccountId(13)];
 pub const JOBS: [JobId; 3] = [JobId(1), JobId(2), JobId(3)];
-/// Témoin de livraison (relais) indépendant des prêteurs et des emprunteurs (JOB-R26).
+/// Delivery witness (relay), independent of lenders and borrowers (JOB-R26).
 pub const WITNESS: AccountId = AccountId(90);
 
-/// Commandes d'initialisation : pools, émissions, soumission des jobs.
+/// Setup commands: pools, issuance, job submissions.
 pub fn setup_commands() -> Vec<Command> {
     vec![
         Command::CreatePool {
@@ -48,7 +45,7 @@ pub fn setup_commands() -> Vec<Command> {
             to: IssueTarget::Pool(CREDIT_POOL),
             amount: 300,
         },
-        // Job 1 : 3 étages (3, 2, 1 couches), prix divisibles.
+        // Job 1: 3 stages (3, 2, 1 layers), divisible prices.
         Command::Submit {
             job: JOBS[0],
             borrower: BORROWERS[0],
@@ -57,7 +54,7 @@ pub fn setup_commands() -> Vec<Command> {
             price: [6, 12, 3],
             max_outputs: [4, 12, 3],
         },
-        // Job 2 : 2 étages, prix avec arrondi (7 / 2).
+        // Job 2: 2 stages, price with rounding (7 / 2).
         Command::Submit {
             job: JOBS[1],
             borrower: BORROWERS[1],
@@ -66,7 +63,7 @@ pub fn setup_commands() -> Vec<Command> {
             price: [4, 7, 2],
             max_outputs: [2, 8, 2],
         },
-        // Job 3 : pool en partage libre.
+        // Job 3: free pool.
         Command::Submit {
             job: JOBS[2],
             borrower: BORROWERS[0],
@@ -78,7 +75,7 @@ pub fn setup_commands() -> Vec<Command> {
     ]
 }
 
-/// Opération abstraite. Les `u8` sont des sélecteurs réduits modulo ce qui existe.
+/// Abstract operation. The `u8` fields are selectors taken modulo what exists.
 #[derive(Clone, Debug)]
 pub enum Op {
     Tick(u8),
@@ -174,101 +171,99 @@ pub enum Op {
         job: u8,
         pair: u8,
     },
-    /// Fait avancer le job sur son chemin nominal (une étape « sensée »),
-    /// pour que les traces atteignent les états profonds.
+    /// Moves the job one sensible step along its normal path, so traces reach deep states.
     Drive {
         job: u8,
         sel: u8,
     },
-    /// Le bon prêteur, sur la bonne plage, réclame des sorties d'une AUTRE
-    /// tentative (rejeu de rapport entre tentatives).
+    /// The right lender, on the right range, claims outputs of ANOTHER attempt.
     CrossAttemptClaim {
         job: u8,
         slice: u8,
         stage: u8,
         pos: u8,
     },
-    /// Renouvellement d'autorisation (JOB-R31).
+    /// Lease renewal (JOB-R31).
     Heartbeat(u8),
-    /// Attestation de livraison ; `forged` = signée par un prêteur (JOB-R26).
+    /// Delivery attestation; `forged` means signed by a lender (JOB-R26).
     Deliver {
         job: u8,
         wt: u8,
         n: u8,
         forged: bool,
     },
-    /// Déclaration du client à la reprise ou après la fin : honnête (tout
-    /// reçu), « rien reçu au-delà du validé », ou au-delà du livré (mensonge).
+    /// Client statement on resume or after the end: honest, "nothing after validated", or more than
+    /// delivered (a lie).
     Confirm {
         job: u8,
         wt: u8,
         sel: u8,
     },
-    /// Le témoin perd son tampon de rejeu (tentative courante ou précédente).
+    /// The witness loses its replay buffer (current or previous attempt).
     WitnessLost {
         job: u8,
         prev: bool,
     },
-    /// Pannes simultanées : client silencieux ET autorisation expirée, ou
-    /// perte du nœud ET du témoin dans la même seconde.
+    /// Simultaneous faults: silent client AND expired lease, or node AND witness lost in the same
+    /// second.
     DoubleFault {
         job: u8,
         kind: u8,
     },
-    /// Le témoin atteste tout le produit, les prêteurs engagent et réclament,
-    /// la tranche est close et évaluée avant toute réponse du client.
+    /// The witness attests everything produced, lenders commit and claim, and the slice is closed
+    /// and evaluated before the client answers.
     DeliverAndSettle {
         job: u8,
         sel: u8,
     },
-    /// Rafale de reçus non engagés (plafond anti-collusion, litiges, arbitrage).
+    /// Burst of uncommitted receipts (cap, disputes, arbitration).
     UncommittedBurst {
         job: u8,
         sel: u8,
     },
-    /// Un arbitre tranche une ligne contestée existante (JOB-S06).
+    /// An arbiter rules on an existing disputed line (JOB-S06).
     ArbitrateDisputed {
         job: u8,
         sel: u8,
     },
-    /// Fin de flux attestée, tampon et nœud perdus, reprise démarrée sans
-    /// attendre le client, puis le client déclare n'avoir rien reçu (JOB-F32).
+    /// Attested tail, buffer and node lost, resume started without waiting for the client, then the
+    /// client reports nothing received (JOB-F32).
     ContestUnderLiveResume {
         job: u8,
     },
-    /// Attestation complète arrivée pendant le drainage (JOB-R32), avec ou sans
-    /// engagement antérieur à la révocation.
+    /// Full attestation arriving while draining (JOB-R32), with or without a commitment before
+    /// revocation.
     LateDeliver {
         job: u8,
         commit_first: bool,
     },
-    /// Signe de vie du client, sans aucune position (JOB-R33).
+    /// Client keepalive, covers no position (JOB-R33).
     ClientHeartbeat(u8),
-    /// Le client déclare ne pas avoir reçu la fin de flux attestée d'une
-    /// tentative révoquée (tampon intact) : contestation et rejeu (JOB-R33).
+    /// The client reports the attested tail of a revoked attempt as not received (buffer intact):
+    /// contest and replay (JOB-R33).
     ContestReplay {
         job: u8,
         sel: u8,
     },
-    /// Le témoin tente de purger son tampon (JOB-R28).
+    /// The witness tries to purge its buffer (JOB-R28).
     PurgeBuffer {
         job: u8,
         prev: bool,
     },
-    /// Preuve complémentaire avant l'échéance (JOB-R35) ; `honest` = seulement
-    /// si un engagement antérieur existe vraiment.
+    /// Supplementary proof before the deadline (JOB-R35); `honest` means only if a prior commitment
+    /// really exists.
     Supplement {
         job: u8,
         sel: u8,
         honest: bool,
     },
-    /// Contestation une minute avant la fin de la fenêtre de 24 h, puis le
-    /// témoin tente de purger son tampon juste après (JOB-R28, JOB-F39).
+    /// Contest one minute before the 24 h window ends, then the witness tries to purge right after
+    /// (JOB-R28, JOB-F39).
     ContestAtWindowEnd {
         job: u8,
     },
-    /// Reçus non engagés juste avant minuit, contestation de la récompense,
-    /// puis nouveaux reçus juste après minuit (JOB-R19, JOB-F40).
+    /// Uncommitted receipts just before midnight, reward contested, new receipts just after
+    /// (JOB-R19, JOB-F40).
     BoundaryBurst {
         job: u8,
         sel: u8,
@@ -333,23 +328,22 @@ fn wt_of(sel: u8) -> WorkType {
     pick(&WorkType::ALL, sel)
 }
 
-/// Simulation : état du coordinateur, historique, violations relevées.
+/// Simulation: coordinator state, history, violations found.
 pub struct Sim {
     pub coord: Coordinator,
     pub history: Vec<Command>,
     pub violations: Vec<Violation>,
     pub applied: usize,
     pub refused: usize,
-    /// Contributions réclamées par le bon prêteur, sur une sortie liée à la
-    /// tentative de la tranche (TEST-P23) : (tranche, prêteur, contribution).
+    /// Contributions claimed by the right lender on an output bound to the slice's attempt
+    /// (TEST-P23): (slice, lender, contribution).
     pub structural_claims: Vec<(SliceId, AccountId, ContributionId)>,
-    /// Refus par type d'erreur (mesure de couverture).
+    /// Rejections per error type (coverage).
     pub refusal_counts: std::collections::BTreeMap<String, u64>,
 }
 
-/// Configuration de simulation : valeurs de la spec, sauf le plafond
-/// anti-collusion, abaissé (4 crédits sur 24 h glissantes) pour que les prix du monde simulé l'atteignent
-/// (sinon le chemin des litiges ne serait jamais exercé).
+/// Simulation config: spec values, except the anti-collusion cap, lowered to 4 credits per sliding
+/// 24 h so simulated prices reach it and disputes get exercised.
 pub fn sim_config() -> Config {
     Config {
         uncommitted_cap: 4,
@@ -380,7 +374,7 @@ impl Sim {
         sim
     }
 
-    /// Applique une commande concrète et vérifie toutes les propriétés.
+    /// Applies a concrete command and checks every property.
     pub fn exec(&mut self, cmd: Command) -> Result<Outcome, DomainError> {
         let before = self.coord.clone();
         let res = self.coord.apply(&cmd);
@@ -471,7 +465,7 @@ impl Sim {
         let c = &self.coord;
         match *op {
             Op::Tick(s) => {
-                // Petits pas le plus souvent, parfois un saut au-delà des échéances.
+                // Mostly small steps, sometimes a jump past the deadlines.
                 let dt = match s % 8 {
                     0 => 3 * 24 * 3600,
                     1 => 700,
@@ -492,7 +486,7 @@ impl Sim {
                 } else {
                     0
                 };
-                // Parfois un témoin non indépendant (un prêteur) : doit être refusé.
+                // Sometimes a non-independent witness (a lender), which must be rejected.
                 let witness = if est % 9 == 0 {
                     LENDERS[rot as usize % LENDERS.len()]
                 } else {
@@ -560,7 +554,7 @@ impl Sim {
             } => {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
-                // Engagement sur la tentative courante ou la précédente (engagement tardif).
+                // Commitment on the current or previous attempt (late commitment).
                 let attempt = if partial && j.attempt > 1 {
                     j.attempt - 1
                 } else {
@@ -596,7 +590,7 @@ impl Sim {
                 let a = &j.attempts[&sid.attempt];
                 let wt = wt_of(wt);
                 let st = stage as usize % a.lenders.len();
-                // Prêteur honnête : il réclame sa propre plage. Sinon : une plage au hasard.
+                // Honest lender claims its own range; otherwise a random one.
                 let lender = if honest {
                     a.lenders[st]
                 } else {
@@ -607,8 +601,7 @@ impl Sim {
                     2 => Evidence::Uncommitted,
                     _ => Evidence::None,
                 };
-                // Honnête : des sorties réellement validées sur cette tentative.
-                // Sinon : des positions quelconques (autre tentative, non validées).
+                // Honest: outputs actually validated on this attempt. Otherwise any position.
                 let positions: Vec<u32> = if honest {
                     let mine: Vec<u32> = c
                         .outputs
@@ -774,7 +767,7 @@ impl Sim {
                 .unwrap_or_default(),
             Op::Reconcile => vec![Command::Reconcile],
             Op::Duplicate(i) => {
-                // Livraison en double d'une commande passée (retry, outbox rejouée).
+                // Duplicate delivery of a past command (retry, replayed outbox).
                 let n = self.history.len();
                 if n == 0 {
                     vec![]
@@ -783,7 +776,7 @@ impl Sim {
                 }
             }
             Op::Concurrent { job, pair } => {
-                // Deux commandes calculées sur la même version du job (JOB-R03).
+                // Two commands computed from the same job version (JOB-R03).
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
                 let ver = Some(j.version);
@@ -826,14 +819,14 @@ impl Sim {
                 let Some(a) = j.current() else { return vec![] };
                 let wt = wt_of(wt);
                 let t = wt.idx();
-                // Parfois au-delà du produit (refusé), le plus souvent dans la fenêtre.
+                // Sometimes beyond what was produced (rejected), mostly within the window.
                 let upto = j.delivered[t] + 1 + u32::from(n % 4);
                 let witness = if forged {
                     pick(&a.lenders, n)
                 } else {
                     a.witness
                 };
-                // Trame substituée, ou trame valide d'une autre session (JOB-R34).
+                // Substituted frame, or a valid frame from another session (JOB-R34).
                 let digest = match n % 7 {
                     0 => c.frame_digest(id, wt, upto) ^ 1,
                     1 => c.frame_digest(pick(&JOBS, n.wrapping_add(1)), wt, upto),
@@ -861,10 +854,10 @@ impl Sim {
                     0 => d,
                     1 => v,
                     2 => v + (d - v) / 2,
-                    // Mensonge : le client prétend détenir plus que livré.
+                    // Lie: the client claims more than was delivered.
                     _ => d + 1,
                 };
-                // Parfois une déclaration signée dans une autre session (JOB-R34).
+                // Sometimes a statement signed in another session (JOB-R34).
                 let digest = if (sel / 4) % 5 == 0 {
                     c.frame_digest(pick(&JOBS, sel.wrapping_add(1)), wt, confirmed)
                 } else {
@@ -935,8 +928,8 @@ impl Sim {
                         upto: a.produced[t],
                     });
                 }
-                // Les réclamations sont calculées sur l'état courant : on
-                // anticipe l'attestation en visant toutes les sorties liées.
+                // Claims are computed on the current state, so target every bound output ahead of
+                // the attestation.
                 let mut tmp = Sim {
                     coord: c.clone(),
                     history: Vec::new(),
@@ -1061,7 +1054,7 @@ impl Sim {
                     digest: c.frame_digest(id, wt, upto),
                 };
                 if a.revoked_at.is_some() {
-                    // Après révocation : l'engagement éventuel est postérieur, donc sans valeur.
+                    // After revocation, any commitment comes too late and proves nothing.
                     let mut v = Vec::new();
                     if commit_first {
                         v.push(Command::WitnessCommit {
@@ -1078,7 +1071,7 @@ impl Sim {
                 if j.exec != ExecStatus::Running {
                     return vec![];
                 }
-                // Engagement (ou non) avant la panne, attestation complète pendant le drainage.
+                // Commitment (or not) before the fault, full attestation while draining.
                 let mut v = vec![Command::Heartbeat {
                     job: id,
                     attempt: j.attempt,
@@ -1104,7 +1097,7 @@ impl Sim {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
                 let w = c.cfg.delivery_window;
-                // Une sortie provisoire non contestée d'une tentative révoquée, fenêtre ouverte.
+                // An uncontested provisional output of a revoked attempt, window still open.
                 let target = c.charges.iter().find_map(|(o, ch)| {
                     let r = j.attempts.get(&ch.attempt)?.revoked_at?;
                     (o.job == id && !ch.definitive && ch.contest.is_none() && c.now + 60 < r + w)
@@ -1182,8 +1175,8 @@ impl Sim {
                     }
                 }
                 if cands.is_empty() {
-                    // Aucun candidat : le prêteur réclame sans preuve (la sienne n'est pas
-                    // encore revenue), la tranche est close, puis il complète (JOB-R35).
+                    // No candidate: the lender claims without proof (it hasn't come back yet), the
+                    // slice closes, then it supplements (JOB-R35).
                     return self.late_proof(id, sel, honest);
                 }
                 let (slice, lender, output) = cands[usize::from(sel) % cands.len()];
@@ -1219,7 +1212,7 @@ impl Sim {
                 }
                 let (slice, lender) = cands[usize::from(sel) % cands.len()];
                 let mut v = Vec::new();
-                // L'arbitre attend la fin de l'évaluation (échéance JOB-R35).
+                // The arbiter waits for the end of evaluation (JOB-R35 deadline).
                 if c.slices[&slice].status == SliceStatus::Closed {
                     v.push(Command::Tick {
                         dt: c.cfg.evaluation_deadline,
@@ -1237,7 +1230,7 @@ impl Sim {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
                 if kind.is_multiple_of(2) {
-                    // Client silencieux et autorisation expirée à la même échéance.
+                    // Silent client and expired lease at the same deadline.
                     vec![
                         Command::Tick {
                             dt: c.cfg.client_silence.max(c.cfg.lease_ttl),
@@ -1292,11 +1285,11 @@ impl Sim {
         }
     }
 
-    /// Étape nominale suivante pour un job, selon son état.
+    /// Next normal step for a job, given its state.
     fn drive(&self, id: JobId, sel: u8) -> Vec<Command> {
         let c = &self.coord;
         let Ok(j) = c.job(id) else { return vec![] };
-        // Les tranches à faire avancer d'abord, quel que soit l'état du job.
+        // Advance slices first, whatever the job state.
         let mut slice_work = Vec::new();
         for s in c.slices.values().filter(|s| s.id.job == id) {
             match s.status {
@@ -1308,7 +1301,7 @@ impl Sim {
                             .any(|i| i.status == ItemStatus::Disputed && !i.awaiting_delivery)
                     });
                     if let Some((l, _)) = arbitrable {
-                        // Un arbitre humain tranche avant l'échéance (JOB-S06).
+                        // A human arbiter rules before the deadline (JOB-S06).
                         return vec![Command::Arbitrate {
                             slice: s.id,
                             lender: *l,
@@ -1325,7 +1318,7 @@ impl Sim {
                                 lender: *l,
                             });
                         } else if sel.is_multiple_of(4) {
-                            // Fraude découverte pendant la fenêtre (JOB-R22).
+                            // Fraud found during the window (JOB-R22).
                             slice_work.push(Command::ContestReward {
                                 slice: s.id,
                                 lender: *l,
@@ -1334,7 +1327,7 @@ impl Sim {
                     }
                 }
                 SliceStatus::Draining => {
-                    // Le prêteur resté en ligne présente ses reçus (JOB-F16).
+                    // The lender still online presents its receipts (JOB-F16).
                     if let Some(cmd) = self.honest_claim(s.id, sel) {
                         slice_work.push(cmd);
                     }
@@ -1409,7 +1402,7 @@ impl Sim {
                         s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
                     })
                     .map(|s| s.id);
-                // Grappe saine : elle renouvelle son autorisation à chaque étape.
+                // Healthy cluster: renews its lease at every step.
                 let hb = Command::Heartbeat {
                     job: id,
                     attempt: j.attempt,
@@ -1427,7 +1420,7 @@ impl Sim {
                         wt,
                         upto: a.produced[t],
                     }],
-                    // Le témoin atteste ; le client n'acquitte pas tout de suite.
+                    // The witness attests; the client does not ack right away.
                     3 => vec![Command::Deliver {
                         job: id,
                         attempt: j.attempt,
@@ -1436,7 +1429,7 @@ impl Sim {
                         upto: a.produced[t],
                         digest: c.frame_digest(id, wt, a.produced[t]),
                     }],
-                    // Le témoin n'envoie que son engagement court (JOB-R32).
+                    // The witness only sends its short commitment (JOB-R32).
                     9 => vec![Command::WitnessCommit {
                         job: id,
                         attempt: j.attempt,
@@ -1473,7 +1466,7 @@ impl Sim {
                         v
                     }
                     _ => {
-                        // Récupération déclarée par le remplaçant (JOB-R18).
+                        // Recovery claimed by the replacement (JOB-R18).
                         if a.recovery_earmark > a.recovery_reserved {
                             open.map(|s| Command::Claim {
                                 slice: s,
@@ -1508,8 +1501,8 @@ impl Sim {
         }
     }
 
-    /// Réclamation sans preuve, clôture, évaluation (reportée), puis preuve
-    /// complémentaire : engagée si elle existe (honnête), sinon annoncée à tort.
+    /// Claim without proof, close, evaluate (deferred), then supplement: committed if it exists
+    /// (honest), wrongly claimed otherwise.
     fn late_proof(&self, id: JobId, sel: u8, honest: bool) -> Vec<Command> {
         let c = &self.coord;
         let Ok(j) = c.job(id) else { return vec![] };
@@ -1556,8 +1549,8 @@ impl Sim {
         out
     }
 
-    /// Deux salves de reçus non engagés autour d'un multiple de 24 h, séparées
-    /// par la contestation de la récompense de la première (JOB-R19).
+    /// Two bursts of uncommitted receipts around a multiple of 24 h, with the first reward
+    /// contested in between (JOB-R19).
     fn boundary_burst(&self, id: JobId, sel: u8) -> Vec<Command> {
         let c = &self.coord;
         let Ok(j) = c.job(id) else { return vec![] };
@@ -1579,7 +1572,7 @@ impl Sim {
             out.push(cmd);
         };
         let w = c.cfg.uncommitted_window;
-        // Entre 10 et 59 s avant le prochain multiple de 24 h.
+        // Between 10 and 59 s before the next multiple of 24 h.
         let dt = (w - c.now % w)
             .saturating_sub(10 + u64::from(sel % 50))
             .max(1);
@@ -1597,7 +1590,7 @@ impl Sim {
             else {
                 break;
             };
-            // Le prêteur de la plus petite part : celui qui peut atteindre le plafond.
+            // The lender with the smallest share is the one that can reach the cap.
             let last = (tmp.coord.jobs[&id].layout.len() - 1) as u8;
             let Some(Command::Claim {
                 slice,
@@ -1607,7 +1600,7 @@ impl Sim {
             else {
                 break;
             };
-            // Un seul reçu avant minuit, deux après : il reste des sorties à réclamer.
+            // One receipt before midnight, two after, so outputs remain to claim.
             items.truncate(if round == 0 { 1 } else { 2 });
             step(
                 &mut tmp,
@@ -1627,12 +1620,12 @@ impl Sim {
         out
     }
 
-    /// Déclaration du client sur ses sorties provisoires (JOB-R28) : le plus
-    /// souvent « tout reçu », parfois « rien reçu au-delà du validé ».
+    /// Client statement on its provisional outputs (JOB-R28): usually "all received", sometimes
+    /// "nothing after validated".
     fn client_confirm(&self, id: JobId, sel: u8) -> Vec<Command> {
         let c = &self.coord;
         let Ok(j) = c.job(id) else { return vec![] };
-        // Le client parle du type qui a des sorties provisoires, s'il y en a.
+        // The client talks about the type that has provisional outputs, if any.
         let Some(wt) = WorkType::ALL
             .into_iter()
             .find(|w| j.delivered[w.idx()] > j.validated[w.idx()])
@@ -1656,11 +1649,11 @@ impl Sim {
         }]
     }
 
-    /// Réclamation honnête : un prêteur de la tentative réclame sa plage pour
-    /// des sorties validées sur cette tentative, non encore réclamées.
+    /// Honest claim: an attempt's lender claims its range for outputs validated on that attempt and
+    /// not claimed yet.
     fn honest_claim(&self, slice: SliceId, sel: u8) -> Option<Command> {
-        // Un prêteur honnête envoie parfois sa réclamation avant que sa preuve
-        // ne revienne : il la complétera avant l'échéance (JOB-R35).
+        // An honest lender sometimes sends its claim before its proof comes back, and supplements
+        // it before the deadline (JOB-R35).
         let evidence = match sel % 7 {
             0 => Evidence::Uncommitted,
             1 => Evidence::None,
@@ -1725,9 +1718,8 @@ impl Sim {
         }
     }
 
-    /// Vivacité (TEST-P06, TEST-P13) : on arrête toute activité, on laisse
-    /// passer les échéances et on réconcilie. Tout job doit finir clos, escrow
-    /// à zéro, sans intervention humaine.
+    /// Liveness (TEST-P06, TEST-P13): stop all activity, let deadlines pass and reconcile. Every
+    /// job must end closed with zero escrow, without human action.
     pub fn drain(&mut self) {
         let jobs: Vec<JobId> = self.coord.jobs.keys().copied().collect();
         for id in &jobs {
@@ -1758,7 +1750,7 @@ impl Sim {
                     detail: format!("slice {:?} stuck in {:?}", s.id, s.status),
                 });
             }
-            // JOB-R22 : toute récompense retenue finit libérée ou contestée.
+            // JOB-R22: every held reward ends released or contested.
             for (l, line) in &s.lines {
                 if line.held != 0 {
                     self.violations.push(Violation {
@@ -1768,7 +1760,7 @@ impl Sim {
                 }
             }
         }
-        // JOB-R29 : aucune livraison ne reste provisoire.
+        // JOB-R29: no delivery stays provisional.
         for (o, ch) in &self.coord.charges {
             if !ch.definitive {
                 self.violations.push(Violation {

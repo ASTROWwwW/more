@@ -1,10 +1,5 @@
-//! Vérificateur d'invariants (spécification v2.5, section 9).
-//!
-//! Deux niveaux :
-//! - [`check_state`] : propriétés vraies dans tout état atteignable ;
-//! - [`check_step`] : propriétés d'une transition (avant, commande, après).
-//!
-//! Chaque violation porte l'identifiant de la propriété TEST-Pxx concernée.
+//! Invariant checker (spec section 9). `check_state` holds in every reachable state; `check_step`
+//! checks one transition (before, command, after). Each violation carries its TEST-Pxx id.
 
 use std::collections::BTreeMap;
 
@@ -41,9 +36,8 @@ fn pending_acct(s: SliceId, lender: AccountId) -> Account {
     }
 }
 
-/// Recalcul indépendant de JOB-R12 (a), sans appeler le code du domaine :
-/// l'engagement doit avoir été horodaté au plus tard à la révocation de la
-/// tentative ou à la clôture de la tranche, dans l'ordre du journal.
+/// JOB-R12 (a) recomputed without calling the domain: the commitment must come before the attempt's
+/// revocation or the slice's closure, in log order.
 fn committed_before_independent(
     c: &Coordinator,
     slice: SliceId,
@@ -53,8 +47,7 @@ fn committed_before_independent(
 ) -> bool {
     let job = &c.jobs[&slice.job];
     let attempt = &job.attempts[&slice.attempt];
-    // JOB-S03 : après la clôture, plus aucun reçu n'est accepté. La borne est
-    // donc la plus ancienne de la révocation et de la clôture de la tranche.
+    // No receipt is accepted after closure, so the bound is the earlier of revocation and closure.
     let closed = c.slices[&slice].closed_seq.unwrap_or(c.seq);
     let cutoff = attempt.revoked_seq.map_or(closed, |r| r.min(closed));
     c.commit_log
@@ -65,7 +58,7 @@ fn committed_before_independent(
         })
 }
 
-/// FNV-1a recalculé ici, sans appeler le domaine.
+/// FNV-1a recomputed here, without calling the domain.
 fn fnv_words(words: &[u64]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for w in words {
@@ -77,7 +70,7 @@ fn fnv_words(words: &[u64]) -> u64 {
     h
 }
 
-/// Empreinte attendue des trames `0..upto` (JOB-R34), recalculée indépendamment.
+/// Expected digest of frames `0..upto` (JOB-R34), recomputed independently.
 fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u64 {
     let Some(j) = c.jobs.get(&job) else { return 0 };
     let mut h = fnv_words(&[
@@ -100,12 +93,12 @@ fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u
 pub fn check_state(c: &Coordinator) -> Vec<Violation> {
     let mut out = Vec::new();
 
-    // TEST-P02 : invariants du registre (LEDGER-001 à 006).
+    // TEST-P02: ledger invariants (LEDGER-001 to 006).
     for lv in c.ledger.check_invariants() {
         out.push(v("TEST-P02", format!("{lv:?}")));
     }
 
-    // TEST-P01 : seules les transitions de la table ont été appliquées.
+    // TEST-P01: only transitions from the table were applied.
     for e in &c.audit {
         match e {
             AuditEvent::Exec {
@@ -136,8 +129,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P03 / TEST-P19 : facturation nette d'une sortie ∈ {0, 1} ; elle vaut
-    // 1 exactement pour les sorties enregistrées (JOB-R17, JOB-R29).
+    // TEST-P03, TEST-P19: an output's net charge is 0 or 1, and 1 exactly for registered outputs
+    // (JOB-R17, JOB-R29).
     let mut net: BTreeMap<OutputId, i64> = BTreeMap::new();
     for e in &c.audit {
         match e {
@@ -167,9 +160,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
     {
         out.push(v("TEST-P19", "outputs and charges disagree"));
     }
-    // TEST-P05 / TEST-P19 : positions facturées = exactement [0, livrées) ;
-    // validées ≤ livrées ; préfixe définitif puis suffixe provisoire ; toute
-    // position validée est définitive.
+    // TEST-P05, TEST-P19: charged positions are exactly [0, delivered); validated <= delivered;
+    // definitive prefix then provisional suffix; every validated position is definitive.
     for j in c.jobs.values() {
         for wt in WorkType::ALL {
             let t = wt.idx();
@@ -213,8 +205,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                     }
                 }
             }
-            // TEST-P21 : exposition bornée. Au plus K sorties livrées sans
-            // signature du client, pour tout le job (JOB-R13, JOB-R27).
+            // TEST-P21: bounded exposure, at most K outputs delivered without client signature for
+            // the whole job (JOB-R13, JOB-R27).
             if del.saturating_sub(val) > c.cfg.flow_budget[t] {
                 out.push(v(
                     "TEST-P21",
@@ -228,8 +220,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P03 / JOB-R21 : contributions payées au plus une fois, sur la bonne
-    // tentative, et somme par sortie ≤ prix de la sortie.
+    // TEST-P03, JOB-R21: contributions paid at most once, on the right attempt, and never more than
+    // the output's price in total.
     let mut paid_by_cid: BTreeMap<ContributionId, u32> = BTreeMap::new();
     let mut reserved_by_cid: BTreeMap<ContributionId, u32> = BTreeMap::new();
     let mut paid_by_output: BTreeMap<(OutputId, u32), Amount> = BTreeMap::new();
@@ -250,7 +242,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                 by_arbitration,
                 at,
             } => {
-                // TEST-P10 : jamais de paiement sans preuve, hors arbitrage.
+                // TEST-P10: no payment without proof, except by arbitration.
                 if *evidence == Evidence::None && !by_arbitration {
                     out.push(v("TEST-P10", format!("{slice:?} paid without evidence")));
                 }
@@ -324,8 +316,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
             ));
         }
     }
-    // TEST-P08 (v2.5) : plafond glissant, recalculé sur le journal des
-    // paiements : sur tout intervalle ]t − 24 h, t], montants bruts ≤ plafond.
+    // TEST-P08: sliding cap recomputed from the payment log; gross amounts within any 24 h window
+    // stay under the cap.
     let w = c.cfg.uncommitted_window;
     for (l, pays) in &uncommitted_by_lender {
         for (ti, _) in pays {
@@ -345,7 +337,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P12 : invariants de ligne et cohérence avec le registre.
+    // TEST-P12: line invariants and consistency with the ledger.
     for s in c.slices.values() {
         for (lender, l) in &s.lines {
             if l.claimed != l.pending + l.paid + l.refunded + l.disputed {
@@ -397,8 +389,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                 ));
             }
         }
-        // TEST-P22 : une contribution en attente concerne une sortie encore
-        // provisoire ; une contribution d'une facturation annulée est remboursée.
+        // TEST-P22: a waiting contribution points to a provisional output; a contribution of a
+        // voided charge is refunded.
         for (lender, l) in &s.lines {
             for it in &l.items {
                 if it.awaiting_delivery && it.status != ItemStatus::Disputed {
@@ -432,7 +424,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P13 : un règlement clos laisse un escrow à zéro.
+    // TEST-P13: a closed settlement leaves escrow at zero.
     for j in c.jobs.values() {
         if j.settle == SettleStatus::Closed {
             for acct in [
@@ -468,7 +460,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P14 : récupération payée ≤ enveloppes et ≤ crédits entrés en escrow de récupération.
+    // TEST-P14: recovery paid stays within the earmarks and the credits that entered recovery
+    // escrow.
     for j in c.jobs.values() {
         for a in j.attempts.values() {
             if a.recovery_reserved > a.recovery_earmark {
@@ -500,8 +493,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P17 (CE-02) : les crédits du pool ne profitent jamais à l'emprunteur.
-    // Budget de l'emprunteur consommé d'abord ; part pool non consommée rendue au pool.
+    // TEST-P17 (CE-02): pool credits never benefit the borrower. Borrower budget first; unspent
+    // pool share goes back to the pool.
     for j in c.jobs.values() {
         let sum_entries =
             |pred: &dyn Fn(&gpu_domain::Account, &gpu_domain::Account) -> bool| -> Amount {
@@ -576,8 +569,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P18 : la fenêtre non validée de la tentative vivante est couverte par
-    // l'escrow travail (JOB-R25) — une validation ne peut jamais manquer de fonds.
+    // TEST-P18: the live attempt's unbilled window is covered by work escrow (JOB-R25), so a charge
+    // never lacks funds.
     for j in c.jobs.values() {
         if let Some(a) = j.current() {
             if a.revoked_at.is_none() {
@@ -597,7 +590,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P09 : budget de flux, pour la tentative vivante.
+    // TEST-P09: flow budget for the live attempt.
     for j in c.jobs.values() {
         if let Some(a) = j.current() {
             for wt in WorkType::ALL {
@@ -631,9 +624,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P25 : une tentative vivante est construite sur des sorties qui
-    // existent : son point de départ ne dépasse jamais les positions livrées
-    // (un retour arrière sous ce point DOIT la révoquer, JOB-R29).
+    // TEST-P25: a live attempt is built on outputs that exist; its start never exceeds delivered
+    // positions (a rewind below it must revoke it, JOB-R29).
     for j in c.jobs.values() {
         let Some(a) = j.current() else { continue };
         if a.revoked_at.is_some() {
@@ -648,7 +640,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
             } if *job == j.id && *attempt == a.no => Some(*restored),
             _ => None,
         });
-        // En placement, la production vaut encore le point de départ.
+        // While placing, production still equals the start point.
         let start = start.unwrap_or(a.produced);
         if (0..3).any(|t| start[t] > j.delivered[t]) {
             out.push(v(
@@ -661,7 +653,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P24 : une autorisation n'est jamais prolongée au-delà d'un TTL.
+    // TEST-P24: a lease is never extended beyond one TTL.
     for j in c.jobs.values() {
         if let Some(a) = j.current() {
             if a.revoked_at.is_none() && a.lease_expires_at > c.now + c.cfg.lease_ttl {
@@ -673,8 +665,8 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
         }
     }
 
-    // TEST-P07 / TEST-P25 : toute (re)prise démarre exactement à la dernière
-    // position livrée : ce qui a été livré est rejoué, jamais régénéré.
+    // TEST-P07, TEST-P25: every (re)start begins exactly at the last delivered position; delivered
+    // output is replayed, never regenerated.
     for e in &c.audit {
         if let AuditEvent::AttemptStarted {
             job,
@@ -699,7 +691,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
     out
 }
 
-/// Fondement admissible de chaque événement de facturation d'un pas (TEST-P20).
+/// Admissible basis for each billing event of a step (TEST-P20).
 fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) -> Vec<Violation> {
     let mut out = Vec::new();
     let new = &after.audit[before.audit.len().min(after.audit.len())..];
@@ -714,7 +706,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 provisional: true,
                 ..
             } => {
-                // Seule une attestation du témoin assigné, indépendant, facture provisoirement.
+                // Only an attestation from the assigned, independent witness charges provisionally.
                 let ok = match cmd {
                     Command::Deliver {
                         job,
@@ -730,10 +722,10 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                                 && !a.buffer_purged
                                 && !a.lenders.contains(witness)
                                 && *witness != j.borrower;
-                            // JOB-R34 : trames du bon flux, non substituées.
+                            // JOB-R34: frames from the right stream, not substituted.
                             let frames = *digest == digest_independent(before, *job, *wt, *upto);
-                            // JOB-R32 : tardive = engagement antérieur à la révocation,
-                            // pendant le drainage, sans tentative plus récente.
+                            // JOB-R32: late means a commitment before revocation, during draining,
+                            // with no newer attempt.
                             let timely = match (a.revoked_at, a.revoked_seq) {
                                 (None, _) => true,
                                 (Some(r), Some(rs)) => {
@@ -780,8 +772,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                     .get(output)
                     .is_some_and(|ch| ch.contest.is_some());
                 let ok = match basis {
-                    // TEST-P27 : seule une signature du client COUVRANT la position
-                    // (accusé cumulatif ou déclaration liée au flux) la rend définitive.
+                    // TEST-P27: only a client signature COVERING the position (cumulative ack or
+                    // stream-bound statement) makes it definitive.
                     ChargeBasis::ClientSigned => match cmd {
                         Command::Ack { wt, upto, .. } => output.wt == *wt && output.pos < *upto,
                         Command::ConfirmDelivery {
@@ -797,8 +789,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                         _ => false,
                     },
                     ChargeBasis::WindowExpired => {
-                        // Recalcul indépendant : tentative productrice révoquée depuis
-                        // au moins la fenêtre, et jamais une sortie contestée.
+                        // Recomputed independently: producing attempt revoked for at least the
+                        // window, and never a contested output.
                         from_reconcile
                             && !contested
                             && after.charges.get(output).is_some_and(|ch| {
@@ -824,8 +816,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             }
             AuditEvent::OutputVoided { output, .. } => {
                 let was_provisional = before.charges.get(output).is_some_and(|ch| !ch.definitive);
-                // Annulation : tampon perdu sur déclaration du client, ou échéance
-                // d'une contestation non couverte (sur cette position ou une antérieure).
+                // Voiding: lost buffer on a client statement, or deadline of an uncovered contest
+                // on this position or an earlier one.
                 let by_deadline =
                     matches!(cmd, Command::Reconcile | Command::ResolveContests { .. })
                         && before.charges.iter().any(|(o, ch)| {
@@ -846,9 +838,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 }
             }
             AuditEvent::ContestOpened { output, deadline } => {
-                // TEST-P27 : une contestation s'ouvre sur déclaration signée du client,
-                // une seule fois, sur une sortie provisoire d'une tentative révoquée,
-                // pendant la fenêtre de livraison.
+                // TEST-P27: a contest opens on a signed client statement, once, on a provisional
+                // output of a revoked attempt, within the window.
                 let ok = match cmd {
                     Command::ConfirmDelivery { confirmed, wt, .. } => {
                         output.wt == *wt
@@ -871,8 +862,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 }
             }
             AuditEvent::BufferPurged { job, attempt } => {
-                // TEST-P26 : tampon conservé pendant la fenêtre et tant qu'une sortie
-                // de la tentative est provisoire ou contestée.
+                // TEST-P26: buffer kept during the window and while any output of the attempt is
+                // provisional or contested.
                 let a = &before.jobs[job].attempts[attempt];
                 let retention_over = a
                     .revoked_at
@@ -889,7 +880,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 }
             }
             AuditEvent::EvidenceSupplemented { slice, .. } => {
-                // TEST-P28 : preuve complémentaire seulement avant l'échéance.
+                // TEST-P28: supplementary proof only before the deadline.
                 let s = &before.slices[slice];
                 if after.now >= s.closed_at.unwrap_or(0) + after.cfg.evaluation_deadline {
                     out.push(v(
@@ -903,7 +894,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 reason: RefundReason::NoEvidence | RefundReason::EvidenceNotFound,
                 ..
             } => {
-                // TEST-P28 : un remboursement faute de preuve n'arrive qu'à l'échéance.
+                // TEST-P28: refunds for missing proof only at the deadline.
                 let s = &after.slices[slice];
                 if after.now < s.closed_at.unwrap_or(0) + after.cfg.evaluation_deadline {
                     out.push(v(
@@ -916,7 +907,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 kind: ItemKind::Contribution(cid),
                 ..
             } => {
-                // TEST-P22 : jamais payée tant que sa sortie est provisoire.
+                // TEST-P22: never paid while its output is provisional.
                 let ok = after
                     .charges
                     .get(&cid.output)
@@ -931,7 +922,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             AuditEvent::Produced {
                 job, wt, from, to, ..
             } => {
-                // TEST-P25 : une position facturée n'est jamais recalculée.
+                // TEST-P25: a charged position is never recomputed.
                 for pos in *from..*to {
                     if before.outputs.contains_key(&OutputId {
                         job: *job,
@@ -951,10 +942,9 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
     out
 }
 
-/// TEST-P23 — équité, vérifiée en fin de vidage : toute contribution honnête,
-/// prouvée et financée finit payée (et sa récompense libérée ou contestée) ;
-/// aucune réclamation structurellement valide n'est perdue à la clôture ;
-/// un reçu non engagé n'est jamais remboursé sans décision d'arbitrage.
+/// TEST-P23, fairness, checked after draining: every honest, proven, funded contribution ends paid
+/// with its reward released or contested; no valid claim is lost at closure; an uncommitted receipt
+/// is only refunded by arbitration.
 pub fn check_fairness(
     c: &Coordinator,
     claims: &[(SliceId, AccountId, ContributionId)],
@@ -1037,7 +1027,7 @@ pub fn check_fairness(
     out
 }
 
-/// Propriétés d'un pas : `before`, la commande, son résultat et `after`.
+/// Properties of one step: `before`, the command, its result and `after`.
 pub fn check_step(
     before: &Coordinator,
     cmd: &Command,
@@ -1046,7 +1036,7 @@ pub fn check_step(
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     match result {
-        // JOB-R01 : un refus ne laisse aucune trace.
+        // JOB-R01: a rejection leaves no trace.
         Err(e) => {
             if before != after {
                 out.push(v(
@@ -1069,8 +1059,8 @@ pub fn check_step(
         Ok(_) => {}
     }
     out.extend(check_charge_basis(before, cmd, after));
-    // TEST-P24 : rien n'est accepté sous une autorisation expirée ; après une
-    // réconciliation, aucune tentative vivante n'a d'autorisation expirée.
+    // TEST-P24: nothing accepted under an expired lease; after reconciliation no live attempt has
+    // an expired lease.
     if let Ok(Outcome::Applied) = result {
         if let Command::Produce { job, attempt, .. }
         | Command::Ack { job, attempt, .. }
@@ -1078,7 +1068,7 @@ pub fn check_step(
         | Command::AttemptReady { job, attempt, .. }
         | Command::Heartbeat { job, attempt } = cmd
         {
-            // Attestation tardive : régie par JOB-R32 (TEST-P20), pas par l'autorisation.
+            // Late attestation: governed by JOB-R32 (TEST-P20), not by the lease.
             let late = matches!(cmd, Command::Deliver { .. })
                 && before
                     .jobs
@@ -1121,7 +1111,7 @@ pub fn check_step(
             }
         }
     }
-    // TEST-P04 : production et validation seulement sur la tentative vivante.
+    // TEST-P04: production and acks only on the live attempt.
     if result.is_ok() {
         if let Command::Produce { job, attempt, .. } | Command::Ack { job, attempt, .. } = cmd {
             if let Ok(j) = before.job(*job) {
@@ -1140,14 +1130,14 @@ pub fn check_step(
     }
     for (id, ja) in &after.jobs {
         if let Some(jb) = before.jobs.get(id) {
-            // execution_intent monotone (JOB-T04, JOB-T12).
+            // execution_intent is monotonic (JOB-T04, JOB-T12).
             if jb.intent == Intent::Resume && ja.intent == Intent::Initial {
                 out.push(v(
                     "TEST-P07",
                     format!("{id:?}: execution_intent went back to initial on {cmd:?}"),
                 ));
             }
-            // TEST-P05 : les positions validées ne reculent jamais.
+            // TEST-P05: validated positions never go back.
             for t in 0..3 {
                 if ja.validated[t] < jb.validated[t] {
                     out.push(v(
@@ -1158,7 +1148,7 @@ pub fn check_step(
             }
         }
     }
-    // Le registre est en insertion seule (LEDGER-002).
+    // The ledger is append-only (LEDGER-002).
     let n = before.ledger.entries().len();
     if after.ledger.entries().len() < n
         || after.ledger.entries()[..n] != before.ledger.entries()[..]

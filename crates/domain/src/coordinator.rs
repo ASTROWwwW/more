@@ -1,10 +1,6 @@
-//! Coordinateur : applique les commandes sous forme de transitions atomiques
-//! (spécification v2.5).
-//!
-//! `apply` exécute la commande sur une copie complète de l'état (job, tranches,
-//! registre, journal d'audit) et ne remplace l'état que si toute la transition
-//! réussit. C'est l'équivalent en mémoire de la transaction unique de JOB-R01 :
-//! un refus ne laisse aucune trace.
+//! Coordinator: applies commands as atomic transitions. `apply` runs a command on a full copy of
+//! the state and keeps it only if the whole transition succeeds, the in-memory equivalent of
+//! JOB-R01's single transaction.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +12,7 @@ use crate::error::DomainError;
 use crate::ids::*;
 use crate::model::*;
 
-/// Journal d'audit (JOB-R10). Il sert aussi au vérificateur d'invariants.
+/// Audit log (JOB-R10), also read by the invariant checker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuditEvent {
     Exec {
@@ -64,31 +60,31 @@ pub enum AuditEvent {
         attempt: u32,
         amount: Amount,
         gen: u32,
-        /// Facturation provisoire sur attestation du témoin (JOB-R27).
+        /// Provisional charge on witness attestation (JOB-R27).
         provisional: bool,
     },
-    /// Sortie provisoire devenue définitive (JOB-R27 à JOB-R29).
+    /// Provisional output made definitive (JOB-R27 to JOB-R29).
     OutputConfirmed {
         output: OutputId,
         basis: ChargeBasis,
     },
-    /// Sortie provisoire annulée par retour arrière : prix rendu à l'escrow (JOB-R29).
+    /// Provisional output voided by a rewind; price back to escrow (JOB-R29).
     OutputVoided {
         output: OutputId,
         gen: u32,
         amount: Amount,
     },
-    /// Sortie rejouée depuis le tampon du témoin, sans nouvelle facturation (JOB-R28).
+    /// Output replayed from the witness buffer, not charged again (JOB-R28).
     Replayed {
         output: OutputId,
     },
-    /// Contestation ouverte : rejeu demandé, échéance fixée (JOB-R33).
+    /// Contest opened: replay requested, deadline set (JOB-R33).
     ContestOpened {
         output: OutputId,
         deadline: Time,
     },
-    /// Attestation complète reçue pendant le drainage, couverte par un
-    /// engagement antérieur à la révocation (JOB-R32).
+    /// Full attestation received while draining, covered by a commitment made before revocation
+    /// (JOB-R32).
     LateDelivery {
         job: JobId,
         attempt: u32,
@@ -118,7 +114,7 @@ pub enum AuditEvent {
         from: u32,
         to: u32,
     },
-    /// Contribution d'une sortie provisoire : en attente du sort de la sortie (JOB-R30).
+    /// Contribution to a provisional output, waiting for the output (JOB-R30).
     ItemAwaitingDelivery {
         slice: SliceId,
         lender: AccountId,
@@ -138,7 +134,7 @@ pub enum AuditEvent {
         amount: Amount,
         evidence: Evidence,
         by_arbitration: bool,
-        /// Heure du paiement : base du plafond glissant (JOB-R19).
+        /// Payment time, used by the sliding cap (JOB-R19).
         at: Time,
     },
     ItemRefunded {
@@ -175,32 +171,32 @@ pub struct Coordinator {
     pub pools: BTreeMap<PoolId, Pool>,
     pub jobs: BTreeMap<JobId, Job>,
     pub slices: BTreeMap<SliceId, Slice>,
-    /// Sortie facturée (provisoirement ou définitivement) → tentative qui l'a
-    /// produite (JOB-R17). Toujours égal aux clés de `charges`.
+    /// Charged output (provisional or definitive) to the attempt that produced it (JOB-R17). Same
+    /// keys as `charges`.
     pub outputs: BTreeMap<OutputId, u32>,
-    /// Détail de la facturation en vigueur de chaque sortie (JOB-R27).
+    /// Charge in force for each output (JOB-R27).
     pub charges: BTreeMap<OutputId, OutputCharge>,
-    /// Prochaine génération de facturation de chaque sortie.
+    /// Next billing generation of each output.
     pub charge_gens: BTreeMap<OutputId, u32>,
-    /// Contribution réservée ou payée → tranche (JOB-R21).
+    /// Reserved or paid contribution to its slice (JOB-R21).
     pub contributions: BTreeMap<ContributionId, SliceId>,
-    /// Travail de récupération réservé ou payé → tranche (JOB-R18).
+    /// Reserved or paid recovery work to its slice (JOB-R18).
     pub recovery_items: BTreeMap<RecoveryWorkId, SliceId>,
-    /// Paiements admis sur reçus non engagés, par compte : (heure, montant).
-    /// Montants bruts : un remboursement ne restaure pas le quota (JOB-R19).
+    /// Payments admitted on uncommitted receipts, per account: (time, amount). Gross amounts; a
+    /// refund does not restore quota (JOB-R19).
     pub uncommitted_paid: BTreeMap<AccountId, Vec<(Time, Amount)>>,
-    /// Engagements courts du témoin : (job, tentative, type) → [(jusqu'à, séquence)] (JOB-R32).
+    /// Short witness commitments: (job, attempt, type) to [(up to, seq)] (JOB-R32).
     pub witness_commits: BTreeMap<(JobId, u32, WorkType), Vec<(u32, u64)>>,
-    /// Historique des engagements de reçus : (couvert jusqu'à, heure, séquence) (JOB-R15).
+    /// Receipt commitment history: (covered up to, time, seq) (JOB-R15).
     pub commit_log: CommitLog,
-    /// Numéro de séquence logique : ordre total des commandes appliquées (CE-03).
+    /// Logical sequence number: total order of applied commands (CE-03).
     pub seq: u64,
     pub audit: Vec<AuditEvent>,
 }
 
 type R<T = ()> = Result<T, DomainError>;
 
-/// (job, tentative, producteur, type) → [(couvert jusqu'à, heure, séquence)].
+/// (job, attempt, producer, type) to [(covered up to, time, seq)].
 pub type CommitLog = BTreeMap<(JobId, u32, AccountId, WorkType), Vec<(u32, Time, u64)>>;
 
 fn job_acct(j: JobId) -> u32 {
@@ -247,11 +243,11 @@ impl Coordinator {
         }
     }
 
-    /// Applique une commande de façon atomique.
+    /// Applies a command atomically.
     pub fn apply(&mut self, cmd: &Command) -> R<Outcome> {
         let mut next = self.clone();
         let out = next.step(cmd)?;
-        // Une commande déjà appliquée ne change rien, pas même la séquence (JOB-R04).
+        // An already applied command changes nothing, not even the sequence (JOB-R04).
         if out == Outcome::Applied {
             *self = next;
         }
@@ -406,8 +402,7 @@ impl Coordinator {
             .collect()
     }
 
-    /// Révocation d'exécution de la tentative courante (JOB-R11) : les tranches
-    /// ouvertes passent en drainage (JOB-S02).
+    /// Revokes the current attempt (JOB-R11); its open slices start draining (JOB-S02).
     fn revoke_current(&mut self, job: JobId) -> R {
         let now = self.now;
         let seq = self.seq;
@@ -431,8 +426,8 @@ impl Coordinator {
         self.maybe_return_earmark(job, attempt)
     }
 
-    /// Rend au budget l'enveloppe de récupération non utilisée d'une tentative
-    /// révoquée dont toutes les tranches sont finales (JOB-R18).
+    /// Returns an attempt's unused recovery share to the budget once it is revoked and all its
+    /// slices are final (JOB-R18).
     fn maybe_return_earmark(&mut self, job: JobId, attempt: u32) -> R {
         let all_final = self
             .slices_of(job, Some(attempt))
@@ -456,8 +451,7 @@ impl Coordinator {
 
     fn step(&mut self, cmd: &Command) -> R<Outcome> {
         use Command::*;
-        // Ordre total des commandes appliquées : une commande refusée est annulée
-        // avec le reste de l'état, donc les numéros restent sans trou.
+        // Rejected commands roll back with the rest of the state, so sequence numbers have no gaps.
         self.seq += 1;
         match cmd {
             Tick { dt } => {
@@ -483,7 +477,7 @@ impl Coordinator {
                     Account::Issuance,
                     acct,
                     *amount,
-                    "LEDGER-003 émission",
+                    "LEDGER-003 issuance",
                 )?;
                 Ok(Outcome::Applied)
             }
@@ -557,8 +551,7 @@ impl Coordinator {
                 digest,
             } => self.confirm_delivery(*job, *wt, *confirmed, *digest),
             ClientHeartbeat { job } => {
-                // JOB-R33 : un signe de vie ne couvre aucune position ; il ne
-                // résout aucune contestation et ne change rien au règlement.
+                // JOB-R33: a keepalive covers no position, so it resolves nothing.
                 self.job(*job)?;
                 Ok(Outcome::AlreadyApplied)
             }
@@ -649,8 +642,8 @@ impl Coordinator {
                     ));
                 }
                 let j = self.job(*job)?;
-                // CE-01 : le pool ne peut financer qu'un job dont l'escrow est actif,
-                // sinon ses crédits n'ont plus de responsable (JOB-S13 n'écrit rien).
+                // CE-01: the pool may only fund a job with active escrow, otherwise nobody owns
+                // those credits.
                 if j.settle != SettleStatus::Active {
                     return Err(DomainError::Precondition("JOB-R18: settlement not active"));
                 }
@@ -661,7 +654,7 @@ impl Coordinator {
                     Account::PoolReserve(pool.0),
                     Account::EscrowRecovery(job_acct(*job)),
                     *amount,
-                    "JOB-R18 relais du pool",
+                    "JOB-R18 pool relay",
                 )?;
                 let j = self.job_mut(*job)?;
                 j.recovery_unearmarked += amount;
@@ -678,7 +671,7 @@ impl Coordinator {
                 let a = j
                     .current()
                     .ok_or_else(|| DomainError::Internal("no attempt".into()))?;
-                // JOB-T13 (v2.4) : toute unité produite est livrée (attestée ou acquittée).
+                // JOB-T13: every produced unit is delivered (attested or acked).
                 if a.produced != j.delivered {
                     return Err(DomainError::Precondition("JOB-T13: undelivered output"));
                 }
@@ -752,7 +745,7 @@ impl Coordinator {
             price
         };
         if let Some(existing) = self.jobs.get(&job) {
-            // JOB-T01 : même clé d'idempotence → on renvoie le job existant.
+            // JOB-T01: same idempotency key returns the existing job.
             let same = existing.borrower == borrower
                 && existing.pool == pool
                 && existing.layout == layout
@@ -822,21 +815,21 @@ impl Coordinator {
         let mode = self.pools[&j.pool].mode;
         match mode {
             PoolMode::Credits => {
-                // Escrow = travail estimé + budget de récupération (JOB-T02, JOB-R18).
+                // Escrow = estimated work + recovery budget (JOB-T02, JOB-R18).
                 let initial = j.est_cost.min(self.cfg.initial_reserve_max);
                 self.ledger.transfer(
                     format!("reserve/{}/work", job.0),
                     Account::User(j.borrower.0),
                     Account::EscrowWork(job_acct(job)),
                     initial,
-                    "JOB-T02 escrow travail",
+                    "JOB-T02 work escrow",
                 )?;
                 self.ledger.transfer(
                     format!("reserve/{}/recovery", job.0),
                     Account::User(j.borrower.0),
                     Account::EscrowRecovery(job_acct(job)),
                     j.recovery_budget,
-                    "JOB-T02 budget de récupération",
+                    "JOB-T02 recovery budget",
                 )?;
             }
             PoolMode::FreeShare { quota_per_borrower } => {
@@ -888,13 +881,13 @@ impl Coordinator {
         if j.attempt >= max_attempts {
             return Err(DomainError::Precondition("max attempts reached: JOB-T16"));
         }
-        // JOB-R26 : le témoin est indépendant des prêteurs et de l'emprunteur.
+        // JOB-R26: the witness is independent of lenders and borrower.
         if witness == j.borrower || lenders.contains(&witness) {
             return Err(DomainError::Precondition(
                 "JOB-R26: witness not independent",
             ));
         }
-        // JOB-R18 : une reprise n'est lancée que si son recalcul est financé.
+        // JOB-R18: a resume starts only if its recompute is funded.
         if j.intent == Intent::Resume {
             if recovery_estimate > j.recovery_unearmarked {
                 return Err(DomainError::RecoveryBudget);
@@ -908,8 +901,7 @@ impl Coordinator {
         j.recovery_unearmarked -= recovery_estimate;
         j.attempt += 1;
         let no = j.attempt;
-        // La tentative repart des positions livrées : celles-ci seront rejouées,
-        // jamais régénérées (JOB-R28).
+        // Start from delivered positions: they get replayed, never regenerated (JOB-R28).
         let produced = j.delivered;
         j.attempts.insert(
             no,
@@ -960,8 +952,8 @@ impl Coordinator {
         if attempt != j.attempt {
             return Err(DomainError::StaleAttempt);
         }
-        // JOB-T05 : en reprise, l'état doit être restauré exactement jusqu'à la
-        // dernière position livrée (v2.4) ; au premier lancement, 0.
+        // JOB-T05: on resume, state must be restored exactly to the last delivered position; 0 on
+        // first start.
         if restored != j.delivered {
             return Err(DomainError::Precondition(
                 "JOB-T05: state not restored to last delivered position",
@@ -1005,8 +997,8 @@ impl Coordinator {
         {
             return Err(DomainError::StaleAttempt);
         }
-        // JOB-R31 : rien n'est accepté sous une autorisation expirée, même avant
-        // que la réconciliation ne révoque la tentative.
+        // JOB-R31: nothing is accepted under an expired lease, even before reconciliation revokes
+        // the attempt.
         if self.now >= a.lease_expires_at {
             return Err(DomainError::LeaseExpired);
         }
@@ -1023,12 +1015,11 @@ impl Coordinator {
         if upto > j.max_outputs[t] {
             return Err(DomainError::Precondition("beyond max outputs"));
         }
-        // JOB-R13 : unités produites et non acquittées ≤ budget de flux.
+        // JOB-R13: produced and unacked units stay within the flow budget.
         if upto - j.validated[t] > self.cfg.flow_budget[t] {
             return Err(DomainError::FlowBudgetExceeded);
         }
-        // JOB-R25 : les unités produites et pas encore facturées (au-delà des
-        // positions livrées) doivent être couvertes par l'escrow travail.
+        // JOB-R25: produced but not yet charged units must be covered by work escrow.
         let mut produced = a.produced;
         produced[t] = upto;
         let window: Amount = (0..3)
@@ -1053,8 +1044,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// Facture une sortie (escrow travail → sorties facturées), provisoirement
-    /// ou définitivement, et la lie à la tentative qui l'a produite (JOB-R17).
+    /// Charges an output (work escrow to output hold), provisionally or definitively, and binds it
+    /// to its attempt (JOB-R17).
     fn charge_output(
         &mut self,
         output: OutputId,
@@ -1088,9 +1079,9 @@ impl Coordinator {
             Account::OutputHold(job_acct(output.job)),
             price,
             if definitive {
-                "JOB-R23 facturation d'une sortie validée"
+                "JOB-R23 charge validated output"
             } else {
-                "JOB-R27 facturation provisoire d'une sortie attestée"
+                "JOB-R27 provisional charge of attested output"
             },
         )?;
         self.charge_gens.insert(output, gen + 1);
@@ -1116,7 +1107,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Rend définitive une sortie provisoire. Renvoie vrai si elle l'était.
+    /// Makes a provisional output definitive. Returns true if it was provisional.
     fn make_definitive(&mut self, output: OutputId, basis: ChargeBasis) -> R<bool> {
         let ch = self
             .charges
@@ -1147,7 +1138,7 @@ impl Coordinator {
         if a.revoked_at.is_some() {
             return Err(DomainError::StaleAttempt);
         }
-        // JOB-R31 : une autorisation expirée ne se renouvelle pas.
+        // JOB-R31: an expired lease is never renewed.
         if now >= a.lease_expires_at {
             return Err(DomainError::LeaseExpired);
         }
@@ -1158,7 +1149,7 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R26, JOB-R27 : attestation de livraison par le témoin assigné.
+    /// JOB-R26, JOB-R27: delivery attestation by the assigned witness.
     fn deliver(
         &mut self,
         job: JobId,
@@ -1182,16 +1173,16 @@ impl Coordinator {
                 false
             }
             Some(r) => {
-                // JOB-R32 : attestation tardive seulement pendant le drainage, et
-                // tant qu'aucune tentative plus récente n'a été placée.
+                // JOB-R32: late attestations only while draining, and only if no newer attempt was
+                // placed.
                 if attempt != j.attempt || now > r + drain {
                     return Err(DomainError::StaleAttempt);
                 }
                 true
             }
         };
-        // Seul le témoin assigné peut attester ; un prêteur qui « atteste » sa
-        // propre livraison n'apporte aucune preuve (JOB-R26).
+        // Only the assigned witness can attest; a lender attesting its own delivery proves nothing
+        // (JOB-R26).
         if witness != a.witness || a.witness_lost || a.buffer_purged {
             return Err(DomainError::InadmissibleProof);
         }
@@ -1205,9 +1196,8 @@ impl Coordinator {
                 "JOB-R27: attestation beyond produced",
             ));
         }
-        // JOB-R34 : l'empreinte présentée doit être celle des trames signées par
-        // le nœud de sortie pour ce flux ; une trame substituée ou d'une autre
-        // session est refusée.
+        // JOB-R34: the digest must match the frames signed by the output node for this stream;
+        // substituted or foreign frames are rejected.
         if digest != self.frame_digest(job, wt, upto) {
             return Err(DomainError::InadmissibleProof);
         }
@@ -1252,9 +1242,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// Empreinte chaînée des trames `0..upto` d'un flux (JOB-R34) : couvre le
-    /// job, le flux client, le modèle, le type, chaque position et sa
-    /// génération de facturation. Symbolique (FNV-1a) dans le modèle.
+    /// Chained digest of a stream's frames `0..upto` (JOB-R34): job, client stream, model, type,
+    /// and each position with its billing generation. FNV-1a in the model.
     pub fn frame_digest(&self, job: JobId, wt: WorkType, upto: u32) -> u64 {
         let Ok(j) = self.job(job) else { return 0 };
         let mut h = fnv(&[
@@ -1275,7 +1264,7 @@ impl Coordinator {
         h
     }
 
-    /// JOB-R32 : engagement court du témoin, seulement sur la tentative vivante.
+    /// JOB-R32: short witness commitment, live attempt only.
     fn witness_commit(
         &mut self,
         job: JobId,
@@ -1315,9 +1304,8 @@ impl Coordinator {
         if upto > produced {
             return Err(DomainError::Precondition("ack beyond produced"));
         }
-        // JOB-R23 : l'accusé du client est cumulatif. Les positions déjà
-        // livrées (provisoires) deviennent définitives ; les suivantes sont
-        // facturées maintenant, une seule fois (JOB-R17).
+        // JOB-R23: client acks are cumulative. Delivered (provisional) positions become definitive;
+        // later ones are charged now, once (JOB-R17).
         let mut resolved = Vec::new();
         for pos in from..upto {
             let output = OutputId { job, wt, pos };
@@ -1349,10 +1337,9 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R28, JOB-R29 : déclaration signée du client, « je détiens exactement
-    /// `0..confirmed` ». Ce qui précède devient définitif ; ce qui manque est
-    /// rejoué depuis le tampon du témoin, ou, s'il est perdu, annulé avec tout
-    /// ce qui suit (retour arrière).
+    /// JOB-R28, JOB-R29: signed client statement "I hold exactly `0..confirmed`". Earlier positions
+    /// become definitive; missing ones are replayed, or voided with everything after them if the
+    /// buffer is lost.
     fn confirm_delivery(
         &mut self,
         job: JobId,
@@ -1379,13 +1366,13 @@ impl Coordinator {
                 "JOB-R28: confirmed beyond delivered",
             ));
         }
-        // JOB-R34 : la déclaration est liée au flux par l'empreinte du préfixe
-        // détenu ; une déclaration d'une autre session est refusée.
+        // JOB-R34: the statement is bound to the stream by the prefix digest; one from another
+        // session is rejected.
         if digest != self.frame_digest(job, wt, confirmed) {
             return Err(DomainError::InadmissibleProof);
         }
-        // Sorties déclarées manquantes : à contester (fenêtre ouverte), ou
-        // seulement à retransmettre (déjà définitives ou déjà contestées).
+        // Missing outputs: contest them (window open), or just retransmit (already definitive or
+        // contested).
         let mut to_contest = Vec::new();
         let mut first_lost = None;
         for pos in confirmed..delivered {
@@ -1397,7 +1384,7 @@ impl Coordinator {
                 .attempts
                 .get(&ch.attempt)
                 .ok_or_else(|| DomainError::Internal("attempt".into()))?;
-            // Une sortie de la tentative vivante se retransmet, elle ne se conteste pas.
+            // An output of the live attempt is retransmitted, not contested.
             let Some(revoked) = producer.revoked_at else {
                 return Err(DomainError::Precondition(
                     "JOB-R28: missing output of the live attempt (retransmit)",
@@ -1411,7 +1398,7 @@ impl Coordinator {
                         "JOB-R29: definitive output can no longer be replayed",
                     ));
                 }
-                // Témoin incapable de présenter le tampon : remboursement (JOB-R33).
+                // Witness cannot produce the buffer: refund (JOB-R33).
                 first_lost = Some(pos);
                 break;
             }
@@ -1434,8 +1421,8 @@ impl Coordinator {
             j.validated[t] = confirmed;
             j.version += 1;
         }
-        // Une contestation par sortie : rejeu demandé, échéance fixée. Seul un
-        // accusé cumulatif signé couvrant la sortie la rendra définitive.
+        // One contest per output: replay requested, deadline set. Only a signed cumulative ack
+        // covering it makes it definitive.
         for output in to_contest {
             let deadline = now + resolution;
             self.charges.get_mut(&output).unwrap().contest = Some(Contest {
@@ -1455,8 +1442,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R33 : à l'échéance d'une contestation, sans accusé cumulatif signé
-    /// couvrant la sortie, elle est remboursée avec toutes les suivantes.
+    /// JOB-R33: at the deadline, a contested output with no covering ack is refunded along with
+    /// everything after it.
     fn resolve_contests(&mut self, job: JobId) -> R<Outcome> {
         let now = self.now;
         let mut first: BTreeMap<WorkType, u32> = BTreeMap::new();
@@ -1475,9 +1462,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R28 : le témoin ne libère son tampon qu'après la fenêtre de
-    /// livraison ET quand plus aucune sortie de la tentative n'est provisoire
-    /// ou contestée (une contestation ouverte à 23 h 59 le retient).
+    /// JOB-R28: the witness keeps its buffer until the delivery window has passed AND no output of
+    /// the attempt is provisional or contested.
     fn purge_buffer(&mut self, job: JobId, attempt: u32) -> R<Outcome> {
         let now = self.now;
         let w = self.cfg.delivery_window;
@@ -1515,7 +1501,7 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R35 : preuve complémentaire, plus forte, avant l'échéance d'évaluation.
+    /// JOB-R35: stronger proof, before the evaluation deadline.
     fn supplement_evidence(
         &mut self,
         slice: SliceId,
@@ -1561,9 +1547,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R29 : retour arrière à la position `to`. Toute sortie facturée de ce
-    /// type à partir de `to` est provisoire et annulée ; une tentative vivante,
-    /// construite sur ces sorties, est révoquée.
+    /// JOB-R29: rewinds to `to`. Every charged output of this type from `to` on is provisional and
+    /// voided; a live attempt built on them is revoked.
     fn rewind(&mut self, job: JobId, wt: WorkType, to: u32) -> R {
         let t = wt.idx();
         let from = self.job(job)?.delivered[t];
@@ -1601,8 +1586,8 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Annule une sortie provisoire : ses contributions réservées sont rendues,
-    /// puis son prix revient à l'escrow travail (JOB-R29, JOB-R30).
+    /// Voids a provisional output: its reserved contributions are returned, then its price goes
+    /// back to work escrow (JOB-R29, JOB-R30).
     fn void_output(&mut self, output: OutputId) -> R {
         let ch = *self
             .charges
@@ -1639,7 +1624,7 @@ impl Coordinator {
             Account::OutputHold(job_acct(output.job)),
             Account::EscrowWork(job_acct(output.job)),
             price,
-            "JOB-R29 annulation d'une sortie provisoire",
+            "JOB-R29 void provisional output",
         )?;
         self.outputs.remove(&output);
         self.charges.remove(&output);
@@ -1654,7 +1639,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Éléments réservés d'une génération de facturation d'une sortie.
+    /// Reserved items of one billing generation of an output.
     fn items_of(&self, output: OutputId, gen: u32) -> Vec<(SliceId, AccountId, usize)> {
         let mut v = Vec::new();
         for (sid, s) in self.slices.iter().filter(|(k, _)| k.job == output.job) {
@@ -1671,8 +1656,8 @@ impl Coordinator {
         v
     }
 
-    /// JOB-R30 : une sortie est devenue définitive ; ses contributions en
-    /// attente sont évaluées selon les règles ordinaires de JOB-S04.
+    /// JOB-R30: the output became definitive; its waiting contributions are evaluated under the
+    /// usual JOB-S04 rules.
     fn resolve_awaiting(&mut self, output: OutputId) -> R {
         let Some(ch) = self.charges.get(&output).copied() else {
             return Ok(());
@@ -1698,8 +1683,8 @@ impl Coordinator {
                     });
                 }
                 Decision::Defer => {
-                    // JOB-R35 : avant l'échéance, l'élément redevient en attente
-                    // d'évaluation ; une preuve complémentaire reste possible.
+                    // JOB-R35: before the deadline the item goes back to pending, so a stronger
+                    // proof can still come.
                     let l = self.slice_mut(slice)?.lines.get_mut(&lender).unwrap();
                     let amount = l.items[idx].amount;
                     l.disputed -= amount;
@@ -1745,9 +1730,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// Sorties provisoires non contestées dont la fenêtre a expiré, dans l'ordre
-    /// des positions : on s'arrête à la première contestée ou non échue, car les
-    /// sorties suivantes en dépendent (JOB-R29, JOB-R33).
+    /// Uncontested provisional outputs whose window expired, in position order. Stops at the first
+    /// contested or not yet due one, since later outputs depend on it (JOB-R29, JOB-R33).
     fn window_due(&self, job: JobId) -> Vec<OutputId> {
         let now = self.now;
         let w = self.cfg.delivery_window;
@@ -1775,8 +1759,7 @@ impl Coordinator {
         due
     }
 
-    /// JOB-R29 : sans contestation pendant la fenêtre ouverte à la révocation
-    /// de la tentative productrice, une livraison attestée devient définitive.
+    /// JOB-R29: an attested delivery with no contest during the window becomes definitive.
     fn expire_delivery_window(&mut self, job: JobId) -> R<Outcome> {
         let due = self.window_due(job);
         if due.is_empty() {
@@ -1818,8 +1801,8 @@ impl Coordinator {
             return Ok(Outcome::AlreadyApplied);
         }
         a.commitments.insert((lender, wt), (upto, now));
-        // On garde tout l'historique : l'horodatage d'un engagement plus ancien
-        // reste la preuve d'antériorité de ce qu'il couvrait (JOB-R12 a).
+        // Keep the full history: an older commitment's timestamp still proves what it covered came
+        // first (JOB-R12 a).
         let seq = self.seq;
         self.commit_log
             .entry((job, attempt, lender, wt))
@@ -1828,9 +1811,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R12 (a) : la position est couverte par un engagement enregistré,
-    /// dans l'ordre du journal du coordinateur, AVANT la plus ancienne de la
-    /// révocation de la tentative et de la clôture de la tranche (CE-03).
+    /// JOB-R12 (a): the position is covered by a commitment recorded, in log order, BEFORE the
+    /// earlier of the attempt's revocation and the slice's closure (CE-03).
     pub fn committed_before(
         &self,
         slice: SliceId,
@@ -1888,7 +1870,7 @@ impl Coordinator {
         if items.is_empty() {
             return Err(DomainError::Precondition("empty claim"));
         }
-        // JOB-R12 (b) : en drainage, au plus « budget de flux » éléments non engagés par type.
+        // JOB-R12 (b): while draining, at most "flow budget" uncommitted items per type.
         if s.status == SliceStatus::Draining {
             for wt in WorkType::ALL {
                 let already = s
@@ -1915,7 +1897,7 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-S03 : clôture et réservation atomique des montants réclamés (JOB-R24).
+    /// JOB-S03: closes the slice and reserves all claimed amounts atomically (JOB-R24).
     fn close_slice(&mut self, slice: SliceId) -> R<Outcome> {
         let now = self.now;
         let s = self
@@ -1931,7 +1913,7 @@ impl Coordinator {
             .clone();
         let normal_close = match s.status {
             SliceStatus::Open => {
-                // Une tranche ouverte appartient forcément à la tentative vivante.
+                // An open slice always belongs to the live attempt.
                 if j.attempt != slice.attempt
                     || a.revoked_at.is_some()
                     || j.exec != ExecStatus::Running
@@ -1991,7 +1973,7 @@ impl Coordinator {
                                 Account::OutputHold(job_acct(slice.job)),
                                 line_acct(slice, *lender),
                                 amount,
-                                "JOB-S03 réservation d'une contribution",
+                                "JOB-S03 reserve contribution",
                             )?;
                             self.contributions.insert(cid, slice);
                             Some((ItemKind::Contribution(cid), amount, evidence))
@@ -2019,7 +2001,7 @@ impl Coordinator {
                             Account::EscrowRecovery(job_acct(slice.job)),
                             line_acct(slice, *lender),
                             amount,
-                            "JOB-S03 réservation de récupération",
+                            "JOB-S03 reserve recovery",
                         )?;
                         recovery_reserved += amount;
                         self.recovery_items.insert(rid, slice);
@@ -2062,7 +2044,7 @@ impl Coordinator {
         sm.rejected_items += rejected;
         self.set_slice(slice, SliceStatus::Closed, "JOB-S03")?;
         if normal_close {
-            // JOB-T07 : la tentative continue sur une nouvelle tranche.
+            // JOB-T07: the attempt continues on a new slice.
             self.open_slice(slice.job, slice.attempt)?;
         }
         Ok(Outcome::Applied)
@@ -2089,9 +2071,9 @@ impl Coordinator {
             line_acct(slice, lender),
             pending_acct(slice, lender),
             amount,
-            "JOB-S04 paiement retenu",
+            "JOB-S04 held payment",
         )?;
-        // CE-02 / JOB-R18 : budget de l'emprunteur consommé d'abord, puis relais du pool.
+        // CE-02, JOB-R18: borrower budget first, then pool relay.
         let mut pool_part = 0;
         if let ItemKind::Recovery(_) = kind {
             let j = self.job_mut(slice.job)?;
@@ -2117,7 +2099,7 @@ impl Coordinator {
         l.held += amount;
         l.items[idx].status = ItemStatus::Paid;
         l.items[idx].awaiting_delivery = false;
-        // Une récompense nulle (partage libre) n'a rien à retenir ni à libérer.
+        // A zero reward (free pool) has nothing to hold or release.
         l.items[idx].reward_done = amount == 0;
         self.audit.push(AuditEvent::ItemPaid {
             slice,
@@ -2152,7 +2134,7 @@ impl Coordinator {
             line_acct(slice, lender),
             back,
             amount,
-            "JOB-S04 remboursement",
+            "JOB-S04 refund",
         )?;
         if let ItemKind::Recovery(_) = kind {
             let a = self
@@ -2182,12 +2164,11 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Décision de JOB-S04 pour un élément réservé, selon sa preuve.
+    /// JOB-S04 decision for a reserved item, based on its proof.
     fn decide(&mut self, slice: SliceId, lender: AccountId, idx: usize) -> R<Decision> {
         let item = self.slices[&slice].lines[&lender].items[idx].clone();
         let attempt_ready = self.job(slice.job)?.attempts[&slice.attempt].ready;
-        // JOB-R35 : un remboursement faute de preuve n'est définitif qu'à
-        // l'échéance d'évaluation ; avant, l'élément attend une preuve.
+        // JOB-R35: a refund for missing proof only becomes final at the evaluation deadline.
         let before_deadline =
             self.now < self.slices[&slice].closed_at.unwrap_or(0) + self.cfg.evaluation_deadline;
         let refund = |r: RefundReason| {
@@ -2201,18 +2182,18 @@ impl Coordinator {
             (ItemKind::Contribution(cid), _)
                 if self.charges.get(&cid.output).map(|c| c.gen) != Some(cid.charge) =>
             {
-                // Sortie annulée depuis la réservation (JOB-R29).
+                // Output voided since reservation (JOB-R29).
                 Decision::Refund(RefundReason::OutputVoided)
             }
             (ItemKind::Contribution(cid), _) if !self.charges[&cid.output].definitive => {
-                // JOB-R30 : jamais payée tant que sa sortie est provisoire.
+                // JOB-R30: never paid while its output is provisional.
                 Decision::Await
             }
             (ItemKind::Contribution(cid), Evidence::Committed) => {
                 if self.committed_before(slice, lender, cid.output.wt, cid.output.pos) {
                     Decision::Pay
                 } else {
-                    // Preuve annoncée mais introuvable : traitée comme absente.
+                    // Commitment claimed but not found: treated as no proof.
                     refund(RefundReason::EvidenceNotFound)
                 }
             }
@@ -2224,7 +2205,7 @@ impl Coordinator {
                 }
             }
             (_, Evidence::Uncommitted) => {
-                // JOB-R19 : plafond glissant sur les montants bruts admis.
+                // JOB-R19: sliding cap on gross admitted amounts.
                 let now = self.now;
                 let w = self.cfg.uncommitted_window;
                 let log = self.uncommitted_paid.entry(lender).or_default();
@@ -2244,7 +2225,7 @@ impl Coordinator {
         })
     }
 
-    /// JOB-S04 : évaluation unique et atomique d'une tranche fermée.
+    /// JOB-S04: evaluates a closed slice.
     fn evaluate(&mut self, slice: SliceId) -> R<Outcome> {
         let s = self
             .slices
@@ -2261,8 +2242,7 @@ impl Coordinator {
         let mut deferred = false;
         for (lender, line) in &s.lines {
             for (idx, item) in line.items.iter().enumerate() {
-                // CE-04 : un élément déjà tranché depuis la clôture (contribution
-                // d'une sortie annulée, JOB-R29) n'est pas évalué une seconde fois.
+                // CE-04: an item already decided since closure is not evaluated again.
                 if item.status != ItemStatus::PendingEvaluation {
                     continue;
                 }
@@ -2302,11 +2282,9 @@ impl Coordinator {
                 changed = true;
             }
         }
-        // JOB-R35 : tant qu'un élément attend une preuve (avant l'échéance), la
-        // tranche reste close ; l'évaluation se termine à l'échéance au plus tard.
-        // CE-06 : une contribution en attente de livraison peut, avant l'échéance,
-        // redevenir « en attente de preuve » : la tranche ne se termine donc pas
-        // non plus avant l'échéance tant qu'une telle contribution existe.
+        // JOB-R35: while an item waits for proof, the slice stays closed until the deadline at
+        // most. CE-06: same while a contribution still waits for its output, since it may go back
+        // to pending.
         let before_deadline = self.now < s.closed_at.unwrap_or(0) + self.cfg.evaluation_deadline;
         let awaiting = self.slices[&slice]
             .lines
@@ -2330,7 +2308,7 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-S06 : arbitrage d'une ligne contestée.
+    /// JOB-S06: arbitrates a disputed line.
     fn arbitrate(&mut self, slice: SliceId, lender: AccountId, pay: bool) -> R<Outcome> {
         let s = self
             .slices
@@ -2350,8 +2328,8 @@ impl Coordinator {
             .items
             .iter()
             .enumerate()
-            // JOB-R30 : une contribution en attente de livraison suit le sort de
-            // sa sortie, elle n'est jamais arbitrée à part.
+            // JOB-R30: a contribution waiting for delivery follows its output, never arbitrated on
+            // its own.
             .filter(|(_, i)| i.status == ItemStatus::Disputed && !i.awaiting_delivery)
             .map(|(k, _)| k)
             .collect();
@@ -2385,7 +2363,7 @@ impl Coordinator {
                 Account::User(j.borrower.0),
                 Account::EscrowWork(job_acct(job)),
                 topup,
-                "JOB-T12 complément de réserve",
+                "JOB-T12 reserve top-up",
             )?;
             let remaining_needed =
                 (0..3).any(|i| j.delivered[i] < j.max_outputs[i] && j.price[i] > 0);
@@ -2405,7 +2383,7 @@ impl Coordinator {
         } else if topup != 0 {
             return Err(DomainError::Precondition("free pool takes no credits"));
         }
-        // execution_intent conservé (JOB-T12).
+        // execution_intent kept (JOB-T12).
         self.set_exec(job, ExecStatus::Reserved, "JOB-T12")?;
         Ok(Outcome::Applied)
     }
@@ -2433,7 +2411,7 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-S12 : restitution de tout le reste à l'emprunteur, escrow à zéro.
+    /// JOB-S12: returns everything left to the borrower; escrow ends at zero.
     fn settle(&mut self, job: JobId) -> R<Outcome> {
         let j = self.job(job)?.clone();
         if j.settle != SettleStatus::Finalizing {
@@ -2446,7 +2424,7 @@ impl Coordinator {
         {
             return Err(DomainError::Precondition("JOB-S12: slices not final"));
         }
-        // JOB-R29 : une livraison provisoire est résolue avant de solder l'escrow.
+        // JOB-R29: provisional deliveries are resolved before escrow is settled.
         if self
             .charges
             .iter()
@@ -2456,7 +2434,7 @@ impl Coordinator {
                 "JOB-S12: provisional outputs pending",
             ));
         }
-        // CE-02 : la part du relais du pool non consommée retourne au pool.
+        // CE-02: unspent pool relay goes back to the pool.
         let pool_unspent = j.pool_recovery_funded - j.recovery_paid_pool;
         let rec = self
             .ledger
@@ -2471,7 +2449,7 @@ impl Coordinator {
             Account::EscrowRecovery(job_acct(job)),
             Account::PoolReserve(j.pool.0),
             pool_unspent,
-            "JOB-S12 restitution au pool",
+            "JOB-S12 return to pool",
         )?;
         for (acct, tag) in [
             (Account::EscrowWork(job_acct(job)), "work"),
@@ -2484,7 +2462,7 @@ impl Coordinator {
                 acct,
                 Account::User(j.borrower.0),
                 amount,
-                "JOB-S12 restitution",
+                "JOB-S12 return",
             )?;
         }
         self.set_settle(job, SettleStatus::Closed, "JOB-S12")?;
@@ -2513,7 +2491,7 @@ impl Coordinator {
             pending_acct(slice, lender),
             Account::User(lender.0),
             to_lender,
-            "JOB-R22 libération",
+            "JOB-R22 release",
         )?;
         self.ledger.transfer(
             format!("commission/{:?}/{}", slice, lender.0),
@@ -2537,8 +2515,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R22 : une contestation rembourse l'emprunteur depuis les récompenses
-    /// retenues, sans jamais créer de crédits ni toucher au solde du prêteur.
+    /// JOB-R22: a contest refunds the borrower from held rewards; it never creates credits or
+    /// touches the lender's balance.
     fn contest_reward(&mut self, slice: SliceId, lender: AccountId) -> R<Outcome> {
         let s = self
             .slices
@@ -2557,7 +2535,7 @@ impl Coordinator {
             let j = self.job(slice.job)?;
             (j.borrower, j.pool)
         };
-        // CE-02 : chaque payeur récupère sa part (pool pour la récupération qu'il a financée).
+        // CE-02: each payer gets its own share back (the pool for the recovery it funded).
         let to_pool: Amount = s.lines[&lender]
             .items
             .iter()
@@ -2569,14 +2547,14 @@ impl Coordinator {
             pending_acct(slice, lender),
             Account::PoolReserve(pool.0),
             to_pool,
-            "JOB-R22 contestation (part pool)",
+            "JOB-R22 contest (pool share)",
         )?;
         self.ledger.transfer(
             format!("contest/{:?}/{}", slice, lender.0),
             pending_acct(slice, lender),
             Account::User(borrower.0),
             held - to_pool,
-            "JOB-R22 contestation",
+            "JOB-R22 contest",
         )?;
         self.job_mut(slice.job)?.recovery_contested_pool += to_pool;
         let l = self.slice_mut(slice)?.lines.get_mut(&lender).unwrap();
@@ -2593,8 +2571,8 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
-    /// JOB-R20 : applique toutes les transitions automatiques arrivées à échéance.
-    /// Chaque transition reste atomique ; la réconciliation est idempotente.
+    /// JOB-R20: applies every automatic transition that is due. Each stays atomic; reconciliation
+    /// is idempotent.
     fn reconcile(&mut self) -> R<Outcome> {
         let mut changed = false;
         for _ in 0..64 {
@@ -2626,7 +2604,7 @@ impl Coordinator {
                         todo.push(Command::ExpirePause { job: j.id })
                     }
                     ExecStatus::Running => {
-                        // JOB-R31 : autorisation expirée = nœud perdu.
+                        // JOB-R31: expired lease means lost node.
                         if j.current().is_some_and(|a| now >= a.lease_expires_at) {
                             todo.push(Command::NodeLost {
                                 job: j.id,
@@ -2685,7 +2663,7 @@ impl Coordinator {
                             }
                         }
                     }
-                    // JOB-R22 (v2.4) : libération automatique à la fin de la fenêtre.
+                    // JOB-R22: automatic release at the end of the window.
                     SliceStatus::Final
                         if s.final_at.is_some_and(|f| now >= f + c.reward_window) =>
                     {
@@ -2705,8 +2683,8 @@ impl Coordinator {
             for cmd in todo {
                 match self.apply(&cmd) {
                     Ok(Outcome::Applied) => progressed = true,
-                    // Une erreur interne n'est jamais avalée par la réconciliation :
-                    // elle bloquerait le job en silence (CE-04).
+                    // Reconciliation never swallows an internal error; it would silently block the
+                    // job (CE-04).
                     Err(DomainError::Internal(m)) => {
                         return Err(DomainError::Internal(format!("reconcile {cmd:?}: {m}")))
                     }
@@ -2730,13 +2708,13 @@ enum Decision {
     Pay,
     Refund(RefundReason),
     Dispute,
-    /// Sortie encore provisoire (JOB-R30).
+    /// Output still provisional (JOB-R30).
     Await,
-    /// Remboursement faute de preuve, reporté à l'échéance (JOB-R35).
+    /// Refund for missing proof, deferred to the deadline (JOB-R35).
     Defer,
 }
 
-/// FNV-1a sur des mots de 64 bits (empreintes symboliques du modèle).
+/// FNV-1a over 64-bit words (symbolic digests in the model).
 fn fnv(words: &[u64]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for w in words {

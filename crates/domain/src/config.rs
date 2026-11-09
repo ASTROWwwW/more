@@ -1,20 +1,19 @@
-//! Délais et limites (spécification v2.5, section 3, « Délais et limites »).
-//! Valeurs initiales, à calibrer sur grappe réelle.
+//! Timeouts and limits (spec section 3). Initial values, to be tuned on a real cluster.
 
 use crate::ids::{PerType, Time};
 use gpu_ledger::Amount;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// Budgets de flux `K_prefill`, `K_generate`, `K_batch` (JOB-R16).
+    /// Flow budgets `K_prefill`, `K_generate`, `K_batch` (JOB-R16).
     pub flow_budget: PerType<u32>,
-    /// Commission en points de base, prélevée à la libération d'une récompense.
+    /// Commission in basis points, taken when a reward is released.
     pub commission_bps: u64,
-    /// Budget de récupération, en pourcentage du coût estimé (JOB-R18).
+    /// Recovery budget, as a percentage of the estimated cost (JOB-R18).
     pub recovery_budget_pct: u64,
     pub max_attempts: u32,
     pub max_placement_failures: u32,
-    /// Plafond payable sur reçus non engagés, par compte (JOB-R19).
+    /// Cap on payments backed by uncommitted receipts, per account (JOB-R19).
     pub uncommitted_cap: Amount,
     pub placing_timeout: Time,
     pub recovery_timeout: Time,
@@ -25,20 +24,19 @@ pub struct Config {
     pub evaluation_deadline: Time,
     pub dispute_deadline: Time,
     pub pause_max: Time,
-    /// Fenêtre unique de contestation des récompenses retenues (JOB-R22).
+    /// Single contest window for held rewards (JOB-R22).
     pub reward_window: Time,
-    /// Réserve initiale maximale de la part « travail » (JOB-T02). Au-delà, le
-    /// job avance par compléments (JOB-T12). `Amount::MAX` = coût estimé complet.
+    /// Maximum initial work reserve (JOB-T02); beyond it the job runs on top-ups (JOB-T12).
+    /// `Amount::MAX` means the full estimated cost.
     pub initial_reserve_max: Amount,
-    /// Durée d'une autorisation sans renouvellement (JOB-R31).
+    /// Lease lifetime without renewal (JOB-R31).
     pub lease_ttl: Time,
-    /// Fenêtre de contestation d'une livraison attestée, ouverte à la
-    /// révocation de la tentative qui l'a produite (JOB-R29). C'est aussi la
-    /// durée minimale de conservation du tampon de rejeu (JOB-R28).
+    /// Contest window for an attested delivery, opened when the producing attempt is revoked
+    /// (JOB-R29). Also the minimum replay buffer retention (JOB-R28).
     pub delivery_window: Time,
-    /// Délai de résolution d'une contestation ouverte (JOB-R33).
+    /// Time to resolve an open contest (JOB-R33).
     pub contest_resolution: Time,
-    /// Fenêtre glissante du plafond anti-collusion (JOB-R19).
+    /// Sliding window of the anti-collusion cap (JOB-R19).
     pub uncommitted_window: Time,
 }
 

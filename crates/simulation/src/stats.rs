@@ -1,5 +1,4 @@
-//! Mesures de couverture, calculées sur les traces réellement exécutées par
-//! les tests de propriétés (une seule source pour le rapport).
+//! Coverage figures, computed on the traces the property tests actually run.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -35,62 +34,60 @@ impl Stats {
                     from: Some(ExecStatus::Running),
                     to: ExecStatus::Recovering,
                     ..
-                } => self.bump("reprises (running → recovering)"),
+                } => self.bump("resumes (running → recovering)"),
                 AuditEvent::AttemptStarted { attempt, .. } if *attempt >= 2 => {
-                    self.bump("tentatives ≥ 2 démarrées")
+                    self.bump("attempts ≥ 2 started")
                 }
                 AuditEvent::OutputCharged {
                     provisional: false, ..
-                } => self.bump("sorties facturées sur accusé"),
+                } => self.bump("outputs charged on ack"),
                 AuditEvent::OutputCharged {
                     provisional: true, ..
-                } => self.bump("sorties facturées provisoirement (témoin)"),
+                } => self.bump("outputs charged provisionally (witness)"),
                 AuditEvent::OutputConfirmed {
                     basis: ChargeBasis::ClientSigned,
                     ..
-                } => self.bump("provisoires confirmées par le client"),
+                } => self.bump("provisional confirmed by client"),
                 AuditEvent::OutputConfirmed {
                     basis: ChargeBasis::WindowExpired,
                     ..
-                } => self.bump("provisoires confirmées par expiration de fenêtre"),
-                AuditEvent::Replayed { .. } => self.bump("sorties rejouées"),
-                AuditEvent::OutputVoided { .. } => self.bump("sorties annulées (retour arrière)"),
-                AuditEvent::Rewound { .. } => self.bump("retours arrière"),
+                } => self.bump("provisional confirmed by window expiry"),
+                AuditEvent::Replayed { .. } => self.bump("outputs replayed"),
+                AuditEvent::OutputVoided { .. } => self.bump("outputs voided (rewind)"),
+                AuditEvent::Rewound { .. } => self.bump("rewinds"),
                 AuditEvent::ItemPaid {
                     kind: ItemKind::Contribution(_),
                     by_arbitration: false,
                     ..
-                } => self.bump("paiements de contributions"),
+                } => self.bump("contribution payments"),
                 AuditEvent::ItemPaid {
                     kind: ItemKind::Recovery(_),
                     by_arbitration: false,
                     ..
-                } => self.bump("paiements de récupération"),
+                } => self.bump("recovery payments"),
                 AuditEvent::ItemPaid {
                     by_arbitration: true,
                     ..
-                } => self.bump("paiements par arbitrage"),
+                } => self.bump("payments by arbitration"),
                 AuditEvent::ItemRefunded {
                     reason: RefundReason::Arbitration,
                     ..
-                } => self.bump("remboursements par arbitrage"),
+                } => self.bump("refunds by arbitration"),
                 AuditEvent::ItemRefunded {
                     reason: RefundReason::OutputVoided,
                     ..
-                } => self.bump("contributions annulées avec leur sortie"),
-                AuditEvent::ItemRefunded { .. } => self.bump("éléments remboursés faute de preuve"),
-                AuditEvent::ItemDisputed { .. } => self.bump("éléments contestés"),
+                } => self.bump("contributions voided with their output"),
+                AuditEvent::ItemRefunded { .. } => self.bump("items refunded for missing proof"),
+                AuditEvent::ItemDisputed { .. } => self.bump("items disputed"),
                 AuditEvent::ItemAwaitingDelivery { .. } => {
-                    self.bump("contributions en attente de livraison")
+                    self.bump("contributions awaiting delivery")
                 }
-                AuditEvent::RewardContested { .. } => self.bump("contestations de récompense"),
-                AuditEvent::RewardReleased { .. } => self.bump("récompenses libérées"),
-                AuditEvent::ContestOpened { .. } => {
-                    self.bump("contestations de livraison ouvertes")
-                }
-                AuditEvent::LateDelivery { .. } => self.bump("attestations tardives admises"),
-                AuditEvent::BufferPurged { .. } => self.bump("tampons purgés après rétention"),
-                AuditEvent::EvidenceSupplemented { .. } => self.bump("preuves complémentaires"),
+                AuditEvent::RewardContested { .. } => self.bump("reward contests"),
+                AuditEvent::RewardReleased { .. } => self.bump("rewards released"),
+                AuditEvent::ContestOpened { .. } => self.bump("delivery contests opened"),
+                AuditEvent::LateDelivery { .. } => self.bump("late attestations admitted"),
+                AuditEvent::BufferPurged { .. } => self.bump("buffers purged after retention"),
+                AuditEvent::EvidenceSupplemented { .. } => self.bump("supplementary proofs"),
                 _ => {}
             }
         }
@@ -112,18 +109,18 @@ impl Stats {
         let mut s = String::new();
         let _ = writeln!(s, "# {name}");
         let _ = writeln!(s, "traces\t{}", self.traces);
-        let _ = writeln!(s, "commandes exécutées et vérifiées\t{}", self.commands);
-        let _ = writeln!(s, "dont acceptées\t{}", self.accepted);
+        let _ = writeln!(s, "commands run and checked\t{}", self.commands);
+        let _ = writeln!(s, "accepted\t{}", self.accepted);
         for (k, n) in &self.counts {
             let _ = writeln!(s, "{k}\t{n}");
         }
         for (k, n) in &self.refusals {
-            let _ = writeln!(s, "refus {k}\t{n}");
+            let _ = writeln!(s, "rejected {k}\t{n}");
         }
         s
     }
 
-    /// Écrit les mesures dans `target/coverage/<name>.tsv`.
+    /// Writes the figures to `target/coverage/<name>.tsv`.
     pub fn write(&self, name: &str) {
         let dir = std::path::Path::new("target/coverage");
         let _ = std::fs::create_dir_all(dir);

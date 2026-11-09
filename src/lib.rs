@@ -1,1 +1,1 @@
-//! Paquet porteur des tests de conformité (voir tests/).
+//! Holds the conformance tests (see tests/).

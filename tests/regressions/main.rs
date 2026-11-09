@@ -1,9 +1,6 @@
-//! Non-régression : chaque contre-exemple trouvé par proptest est recopié ici
-//! sous forme réduite et lisible, avec la règle de la spécification qu'il a
-//! fait corriger. Ces tests ne doivent jamais être supprimés.
-//!
-//! Les graines brutes sont aussi conservées dans
-//! `tests/properties/proptest-regressions.txt` et rejouées en premier.
+//! Regression tests: each counterexample found by proptest is kept here in reduced, readable form,
+//! with the spec rule it fixed. Never delete these. Raw seeds are also kept in
+//! `tests/properties/proptest-regressions.txt`.
 
 use gpu_domain::*;
 use gpu_simulation::*;
@@ -22,15 +19,9 @@ fn assert_clean(sim: &Sim) {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
 }
 
-/// CE-01 — trouvé par `invariants_hold_under_heavy_faults` (TEST-P13).
-///
-/// Séquence réduite par proptest : `[Fund { job: 132, amount: 0 }]`.
-/// Le pool finançait la récupération d'un job encore `queued` ; le rejet du job
-/// (JOB-T03 / JOB-S13, « aucune écriture ») laissait ces crédits sans
-/// responsable dans `EscrowRecovery`.
-///
-/// Correction (spec v2.3, JOB-R18) : le relais du pool exige
-/// `settlement_status = active`.
+/// CE-01, found by `invariants_hold_under_heavy_faults` (TEST-P13), reduced to `[Fund { job: 132,
+/// amount: 0 }]`. The pool funded recovery for a job still `queued`; rejecting the job left those
+/// credits with no owner. Fix (JOB-R18): the pool relay requires `settlement_status = active`.
 #[test]
 fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     let sim = run(&[Op::Fund {
@@ -61,7 +52,7 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     .unwrap();
     c.apply(&Command::Settle { job: JobId(1) }).unwrap();
     assert_eq!(c.ledger.balance(Account::EscrowRecovery(1)), 0);
-    // (Avant CE-02, ce crédit du pool partait chez l'emprunteur.)
+    // (Before CE-02, this pool credit went to the borrower.)
     assert_eq!(
         c.ledger.balance(Account::PoolReserve(1)),
         300,
@@ -69,13 +60,9 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     );
 }
 
-/// CE-02 — trouvé en écrivant CE-01 : aucune propriété ne surveillait la
-/// destination des crédits du pool (trou du vérificateur, comblé par TEST-P17).
-///
-/// JOB-S12 rendait tout le budget de récupération non utilisé à l'emprunteur,
-/// y compris la part avancée par le pool. Correction (spec v2.3) : budget de
-/// l'emprunteur consommé d'abord, puis relais du pool ; à la clôture et en cas
-/// de contestation, chaque payeur récupère sa propre part.
+/// CE-02, found while writing CE-01. Settlement returned all unused recovery budget to the
+/// borrower, including the pool's share. Fix: borrower budget first, then pool relay; on close or
+/// contest each payer gets its own share back (TEST-P17).
 #[test]
 fn ce02_pool_relay_never_benefits_the_borrower() {
     let mut sim = Sim::default();
@@ -119,7 +106,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
         expected_version: None,
     })
     .unwrap();
-    // Budget emprunteur = 17. Le pool avance 10. Reprise estimée à 20 : 17 + 3 du pool.
+    // Borrower budget = 17. The pool adds 10. Resume estimated at 20: 17 + 3 from the pool.
     sim.exec(Command::FundRecovery {
         job: j1,
         amount: 10,
@@ -154,7 +141,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
         ),
         (17, 3)
     );
-    // Fraude : la récupération est contestée. Le pool récupère ses 3, l'emprunteur ses 17.
+    // Fraud: the recovery is contested. The pool gets its 3 back, the borrower its 17.
     let pool_before = sim.coord.ledger.balance(Account::PoolReserve(1));
     sim.exec(Command::ContestReward {
         slice: s,
@@ -167,22 +154,14 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     );
     sim.drain();
     assert_clean(&sim);
-    // Le pool a récupéré ses 10 (7 jamais utilisés + 3 contestés).
+    // The pool got its 10 back (7 unused + 3 contested).
     assert_eq!(sim.coord.ledger.balance(Account::PoolReserve(1)), 300);
 }
 
-/// CE-03 — trouvé par `invariants_hold_under_heavy_faults` (TEST-P08) une fois
-/// le vérificateur rendu indépendant du domaine (la mutation M09 n'était
-/// détectée que par un scénario).
-///
-/// Séquence réduite (8 opérations) : tranche fermée à t=0 avec une réclamation
-/// « engagée » ; saut d'horloge de 3 jours ; engagement enregistré ; annulation
-/// (révocation à la même seconde) ; évaluation. L'engagement, postérieur à la
-/// clôture, était accepté comme preuve.
-///
-/// Correction (spec v2.3, JOB-R12 / JOB-R15) : l'antériorité se juge dans
-/// l'ordre du journal du coordinateur, avant la plus ancienne de la révocation
-/// et de la clôture de la tranche.
+/// CE-03, found by `invariants_hold_under_heavy_faults` (TEST-P08) once the checker stopped relying
+/// on the domain. Reduced to 8 operations: a commitment recorded after the slice closed was
+/// accepted as proof. Fix (JOB-R12, JOB-R15): order is judged by the coordinator log, before the
+/// earlier of revocation and closure.
 #[test]
 fn ce03_commitment_after_slice_closure_proves_nothing() {
     let mut sim = Sim::default();
@@ -238,7 +217,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
     })
     .unwrap();
     sim.exec(Command::CloseSlice { slice: s }).unwrap();
-    // Engagement APRÈS la clôture, puis révocation à la même seconde.
+    // Commitment AFTER closure, then revocation in the same second.
     sim.exec(Command::CommitReceipts {
         job: j1,
         attempt: 1,
@@ -259,8 +238,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
         (0, 6),
         "a commitment recorded after closure is not proof: never paid"
     );
-    // v2.5 (JOB-R35) : le remboursement faute de preuve devient définitif à
-    // l'échéance d'évaluation, pas avant.
+    // JOB-R35: the refund for missing proof only becomes final at the evaluation deadline.
     sim.exec(Command::Tick { dt: 600 }).unwrap();
     sim.exec(Command::Reconcile).unwrap();
     let line = &sim.coord.slices[&s].lines[&l];
@@ -273,7 +251,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
     assert_clean(&sim);
 }
 
-/// CE-03, cas symétrique : un engagement enregistré AVANT la clôture reste une preuve.
+/// CE-03, mirror case: a commitment recorded BEFORE closure is still proof.
 #[test]
 fn ce03_commitment_before_closure_still_counts() {
     let mut sim = Sim::default();
@@ -343,14 +321,11 @@ fn ce03_commitment_before_closure_still_counts() {
     assert_clean(&sim);
 }
 
-/// CE-04 (v2.4) — contre-exemple `proptest` (TEST-P06), générateur
-/// « delivery », réduit à 16 opérations puis réécrit à la main.
-///
-/// La tranche est close (contribution réservée, pas encore évaluée) quand le
-/// client déclare n'avoir pas reçu une sortie dont le tampon est perdu : la
-/// sortie est annulée et sa contribution remboursée (JOB-R29). L'évaluation
-/// tentait ensuite de trancher cet élément une seconde fois, échouait avec une
-/// erreur interne avalée par la réconciliation, et le job restait bloqué.
+/// CE-04, found by proptest (TEST-P06, delivery generator), reduced to 16 operations. The slice was
+/// closed (contribution reserved, not evaluated) when the client reported an output as not received
+/// and its buffer was lost; the output was voided and the contribution refunded. Evaluation then
+/// tried to decide that item again, failed, the error was swallowed by reconciliation and the job
+/// got stuck.
 #[test]
 fn ce04_voided_output_after_closure_does_not_block_evaluation() {
     let mut sim = Sim::default();
@@ -430,9 +405,9 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
     })
     .unwrap();
     sim.exec(Command::Tick { dt: 121 }).unwrap();
-    sim.exec(Command::Reconcile).unwrap(); // clôture : les deux contributions réservées
+    sim.exec(Command::Reconcile).unwrap(); // closure: both contributions reserved
     assert_eq!(sim.coord.slices[&s].status, SliceStatus::Closed);
-    // Le client n'a pas reçu la position 1, que le témoin ne peut plus rejouer.
+    // The client never got position 1, and the witness can no longer replay it.
     sim.exec(Command::ConfirmDelivery {
         job: j,
         wt: gen,
@@ -446,7 +421,7 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
         pos: 1
     }));
     sim.exec(Command::Tick { dt: 601 }).unwrap();
-    sim.exec(Command::Reconcile).unwrap(); // évaluation : ne doit plus échouer
+    sim.exec(Command::Reconcile).unwrap(); // evaluation must not fail anymore
     assert_eq!(sim.coord.slices[&s].status, SliceStatus::Final);
     let line = &sim.coord.slices[&s].lines[&AccountId(10)];
     assert_eq!((line.paid, line.refunded), (6, 6));
@@ -454,12 +429,9 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
 }
 
-/// CE-05 (v2.4) — contre-exemple `proptest` (TEST-P23, nouvelle propriété
-/// d'équité), trouvé par les quatre générateurs dès la première exécution.
-///
-/// En partage libre, une contribution payée vaut 0 crédit : rien n'est retenu,
-/// donc rien n'est jamais libéré, et l'élément restait indéfiniment « ni
-/// libéré ni contesté ». Une récompense nulle est complète dès son paiement.
+/// CE-05, found by proptest (TEST-P23) in all four generators. In a free pool a paid contribution
+/// is worth 0, so nothing is held or released and the item stayed "neither released nor contested"
+/// forever. A zero reward is complete once paid.
 #[test]
 fn ce05_zero_reward_in_free_pool_completes_at_payment() {
     let mut sim = Sim::default();
@@ -530,15 +502,10 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
 }
 
-/// CE-06 (v2.5) — contre-exemple `proptest` (TEST-P12), générateurs général et
-/// réserve partielle, dès la première exécution de la v2.5.
-///
-/// Une tranche terminait son évaluation avant l'échéance alors qu'une
-/// contribution attendait la livraison de sa sortie. Quand la sortie devenait
-/// définitive, la contribution, sans preuve, redevenait « en attente de
-/// preuve » (JOB-R35) dans une tranche déjà évaluée : tranche finale avec un
-/// montant en attente. Correction : avant l'échéance, une tranche ne termine
-/// pas son évaluation tant qu'une contribution attend sa sortie.
+/// CE-06, found by proptest (TEST-P12). A slice finished evaluating before the deadline while a
+/// contribution was still waiting for its output. When the output became definitive, the
+/// contribution had no proof and went back to pending inside an already evaluated slice. Fix:
+/// before the deadline, a slice does not finish while a contribution waits for its output.
 #[test]
 fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
     let mut sim = Sim::default();
@@ -604,13 +571,13 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
     })
     .unwrap();
     sim.exec(Command::CloseSlice { slice: s }).unwrap();
-    sim.exec(Command::Evaluate { slice: s }).unwrap(); // sortie provisoire : en attente
+    sim.exec(Command::Evaluate { slice: s }).unwrap(); // provisional output: pending
     assert_eq!(
         sim.coord.slices[&s].status,
         SliceStatus::Closed,
         "not finished before deadline"
     );
-    // Le client signe : la sortie devient définitive avant l'échéance.
+    // The client signs: the output becomes definitive before the deadline.
     sim.exec(Command::Ack {
         job: j,
         attempt: 1,

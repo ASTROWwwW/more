@@ -3,13 +3,13 @@ use crate::model::{ExecStatus, SliceStatus};
 use gpu_ledger::LedgerError;
 use std::fmt;
 
-/// Refus d'une commande. Un refus ne modifie jamais l'état (JOB-R01).
+/// A rejected command. A rejection never changes state (JOB-R01).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DomainError {
     UnknownJob(JobId),
     UnknownSlice(SliceId),
     UnknownPool,
-    /// Transition non listée : interdite (section 2).
+    /// Transition not in the table, hence forbidden (section 2).
     InvalidTransition {
         from: ExecStatus,
         rule: &'static str,
@@ -18,28 +18,29 @@ pub enum DomainError {
         from: SliceStatus,
         rule: &'static str,
     },
-    /// Verrou optimiste (JOB-R03).
+    /// Optimistic lock (JOB-R03).
     VersionConflict {
         expected: u64,
         actual: u64,
     },
-    /// Message d'une tentative non courante ou révoquée (JOB-R05, JOB-R11).
+    /// Message from a non-current or revoked attempt (JOB-R05, JOB-R11).
     StaleAttempt,
-    /// Annulation ou échec demandés en `settling` (JOB-T15, JOB-T16).
+    /// Cancel or fail requested while `settling` (JOB-T15, JOB-T16).
     JobSettling,
-    /// Budget de flux dépassé (JOB-R13).
+    /// Flow budget exceeded (JOB-R13).
     FlowBudgetExceeded,
-    /// Escrow insuffisant pour couvrir la fenêtre non validée (JOB-R25).
+    /// Escrow cannot cover the unbilled window (JOB-R25).
     WindowNotCovered,
-    /// Budget de récupération insuffisant (JOB-R18).
+    /// Recovery budget exhausted (JOB-R18).
     RecoveryBudget,
-    /// Preuve non recevable : attestation d'un autre que le témoin assigné (JOB-R26).
+    /// Inadmissible proof: not signed by the assigned witness, or wrong frame digest (JOB-R26,
+    /// JOB-R34).
     InadmissibleProof,
-    /// Autorisation expirée (JOB-R31).
+    /// Lease expired (JOB-R31).
     LeaseExpired,
     Precondition(&'static str),
     Ledger(LedgerError),
-    /// Un invariant interne serait violé : bug du modèle, jamais attendu.
+    /// An internal invariant would break: a model bug, never expected.
     Internal(String),
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gpu-ledger"
-description = "Registre comptable en partie double du réseau GPU P2P (modèle en mémoire)"
+description = "Double-entry ledger for More (in-memory model)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,12 +1,7 @@
-//! Contrat de messages (spécification v2.5, section 5) — premier jet.
-//!
-//! Le protocole découle des transitions : chaque message est traduit en une
-//! commande du domaine. Le format binaire réel (Protobuf ou maison) n'est pas
-//! encore fixé ; cette crate fige ce qui en est indépendant :
-//! - l'enveloppe et ses champs obligatoires (PROTO-001) ;
-//! - la vérification de taille avant décodage (PROTO-002) ;
-//! - les codes d'erreur stables (PROTO-004) ;
-//! - l'anti-rejeu par numéro de séquence et la tentative courante (JOB-R05).
+//! Message contract (spec section 5), first draft. Each message becomes a domain command. The wire
+//! format is not fixed yet; this crate pins what does not depend on it: the envelope (PROTO-001),
+//! size checks before decoding (PROTO-002), stable error codes (PROTO-004) and replay protection
+//! (JOB-R05).
 
 use std::collections::BTreeMap;
 
@@ -14,19 +9,18 @@ use gpu_domain::*;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Enveloppe commune à tout message (PROTO-001).
+/// Envelope shared by every message (PROTO-001).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
     pub version: u16,
     pub sender: AccountId,
     pub seq: u64,
-    /// Signature de l'émetteur. Le modèle ne vérifie pas la cryptographie :
-    /// une signature nulle est simplement refusée.
+    /// Sender signature. The model does no cryptography; a zero signature is rejected.
     pub signature: u64,
     pub body: Message,
 }
 
-/// Messages par transition (tableau de la section 5).
+/// Messages per transition (spec section 5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     SubmitJob {
@@ -75,38 +69,38 @@ pub enum Message {
         slice: SliceId,
         items: Vec<ClaimItem>,
     },
-    /// Renouvellement d'autorisation (JOB-R31).
+    /// Lease renewal (JOB-R31).
     Heartbeat {
         job: JobId,
         attempt: u32,
     },
-    /// Témoin → coordinateur : positions `< upto` livrées au transport du
-    /// client (JOB-R26). Le signataire de l'enveloppe est l'attestant.
+    /// Witness to coordinator: positions `< upto` reached the client's transport (JOB-R26). The
+    /// envelope signer is the attester.
     DeliveryAttestation {
         job: JobId,
         attempt: u32,
         wt: WorkType,
         upto: u32,
-        /// Empreinte chaînée des trames signées par le nœud de sortie (JOB-R34).
+        /// Chained digest of the frames signed by the output node (JOB-R34).
         digest: u64,
     },
-    /// Témoin → coordinateur : engagement court, horodaté (JOB-R32).
+    /// Witness to coordinator: short stamped commitment (JOB-R32).
     WitnessCommitment {
         job: JobId,
         attempt: u32,
         wt: WorkType,
         upto: u32,
     },
-    /// Client → coordinateur : signe de vie, ne couvre aucune position (JOB-R33).
+    /// Client to coordinator: keepalive, covers no position (JOB-R33).
     ClientHeartbeat {
         job: JobId,
     },
-    /// Client → coordinateur : « je détiens exactement `0..confirmed` » (JOB-R28).
+    /// Client to coordinator: "I hold exactly `0..confirmed`" (JOB-R28).
     DeliveryConfirm {
         job: JobId,
         wt: WorkType,
         confirmed: u32,
-        /// Empreinte du préfixe détenu, liée au flux (JOB-R34).
+        /// Digest of the held prefix, bound to the stream (JOB-R34).
         digest: u64,
     },
 }
@@ -151,8 +145,7 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
-    /// Taille maximale d'une trame, vérifiée avant tout décodage (PROTO-002).
-    /// Valeurs provisoires.
+    /// Maximum frame size, checked before decoding (PROTO-002). Provisional values.
     pub fn max_frame_bytes(self) -> usize {
         match self {
             MessageKind::SubmitJob => 4 * 1024,
@@ -162,14 +155,14 @@ impl MessageKind {
     }
 }
 
-/// Codes d'erreur stables (PROTO-004).
+/// Stable error codes (PROTO-004).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtoError {
     UnsupportedVersion,
     FrameTooLarge,
     MissingSignature,
     Replay,
-    /// Erreur du domaine, avec son code stable.
+    /// Domain error with its stable code.
     Rejected(&'static str),
 }
 
@@ -185,7 +178,7 @@ impl ProtoError {
     }
 }
 
-/// Code stable associé à chaque refus du domaine (PROTO-004).
+/// Stable code for each domain rejection (PROTO-004).
 pub fn domain_code(e: &DomainError) -> &'static str {
     match e {
         DomainError::UnknownJob(_) => "UNKNOWN_JOB",
@@ -207,7 +200,7 @@ pub fn domain_code(e: &DomainError) -> &'static str {
     }
 }
 
-/// Vérifie la taille déclarée d'une trame AVANT de la décoder (PROTO-002).
+/// Checks a frame's declared size BEFORE decoding it (PROTO-002).
 pub fn check_frame(kind: MessageKind, declared_len: usize) -> Result<(), ProtoError> {
     if declared_len > kind.max_frame_bytes() {
         return Err(ProtoError::FrameTooLarge);
@@ -215,7 +208,7 @@ pub fn check_frame(kind: MessageKind, declared_len: usize) -> Result<(), ProtoEr
     Ok(())
 }
 
-/// Garde anti-rejeu : numéro de séquence strictement croissant par émetteur.
+/// Replay guard: strictly increasing sequence number per sender.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayGuard {
     last_seq: BTreeMap<AccountId, u64>,
@@ -238,7 +231,7 @@ impl ReplayGuard {
     }
 }
 
-/// Traduit un message admis en commande du domaine.
+/// Turns an admitted message into a domain command.
 pub fn to_command(env: &Envelope) -> Command {
     let sender = env.sender;
     match &env.body {
@@ -359,7 +352,7 @@ pub fn to_command(env: &Envelope) -> Command {
     }
 }
 
-/// Chaîne complète : admission, traduction, application atomique.
+/// Full chain: admission, translation, atomic application.
 pub fn handle(
     guard: &mut ReplayGuard,
     coord: &mut Coordinator,
@@ -421,8 +414,8 @@ mod tests {
         assert_eq!(r.unwrap_err().code(), "UNKNOWN_JOB");
     }
 
-    /// JOB-R26 : une attestation signée par un prêteur (et non par le témoin
-    /// assigné) est refusée avec un code stable, sans toucher à l'état.
+    /// JOB-R26: an attestation signed by a lender instead of the assigned witness is rejected with
+    /// a stable code and no state change.
     #[test]
     fn delivery_attested_by_a_lender_is_inadmissible() {
         let mut c = Coordinator::new(Config::default());

@@ -1,6 +1,6 @@
-//! Identifiants (spécification v2.3, section 1 « Vocabulaire »).
+//! Identifiers (spec section 1, vocabulary).
 
-/// Horloge du coordinateur, en secondes. Seule horloge qui fait foi (JOB-R09).
+/// Coordinator clock, in seconds. The only clock that counts (JOB-R09).
 pub type Time = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -12,7 +12,7 @@ pub struct AccountId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PoolId(pub u32);
 
-/// Type de travail : chacun a son propre budget de flux (JOB-R13).
+/// Work type; each has its own flow budget (JOB-R13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkType {
     Prefill,
@@ -32,7 +32,7 @@ impl WorkType {
     }
 }
 
-/// Une sortie livrée à l'emprunteur : facturée au plus une fois (JOB-R17).
+/// An output delivered to the borrower; charged at most once (JOB-R17).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OutputId {
     pub job: JobId,
@@ -42,17 +42,13 @@ pub struct OutputId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ContributionRole {
-    /// Exécution d'une tranche de couches.
+    /// Runs a range of layers.
     Executor,
 }
 
-/// Une contribution à une sortie : plusieurs contributions distinctes
-/// (une par plage de couches) sont rémunérées pour une même sortie,
-/// chacune au plus une fois (JOB-R21).
-///
-/// `charge` est la génération de facturation de la sortie (v2.4) : une sortie
-/// provisoire annulée par un retour arrière (JOB-R29) puis régénérée est une
-/// nouvelle facturation, dont les contributions sont distinctes des anciennes.
+/// One lender's part of an output: one per layer range, each paid at most once (JOB-R21). `charge`
+/// is the output's billing generation: an output voided by a rewind and produced again is a new
+/// charge with new contributions (JOB-R29).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContributionId {
     pub output: OutputId,
@@ -62,7 +58,7 @@ pub struct ContributionId {
     pub role: ContributionRole,
 }
 
-/// Tranche de facturation `(job, tentative, numéro)`.
+/// Billing slice `(job, attempt, number)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SliceId {
     pub job: JobId,
@@ -70,7 +66,7 @@ pub struct SliceId {
     pub slice: u32,
 }
 
-/// Travail de récupération `(job, tentative, segment)` (JOB-R18).
+/// Recovery work `(job, attempt, segment)` (JOB-R18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecoveryWorkId {
     pub job: JobId,
@@ -78,5 +74,5 @@ pub struct RecoveryWorkId {
     pub segment: u32,
 }
 
-/// Compteurs indexés par type de travail.
+/// Counters indexed by work type.
 pub type PerType<T> = [T; 3];

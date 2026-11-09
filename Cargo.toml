@@ -15,8 +15,8 @@ gpu-protocol = { path = "crates/protocol" }
 gpu-simulation = { path = "crates/simulation" }
 proptest = "1"
 
-# Paquet racine : il porte uniquement les tests de conformité
-# (tests/properties, tests/scenarios, tests/regressions).
+# Root package: only carries the conformance tests (tests/properties, tests/scenarios,
+# tests/regressions).
 [package]
 name = "more-conformance"
 version.workspace = true

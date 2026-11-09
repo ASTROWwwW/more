@@ -1,10 +1,6 @@
-//! Domaine du réseau GPU P2P : machine à états des jobs (section 2.1), cycle
-//! de vie des tranches (2.2), statut de règlement (2.3) et règles globales (3)
-//! de la spécification v2.3.
-//!
-//! Aucune dépendance au réseau, à la base de données ni au moteur GPU : ce sont
-//! des fonctions de transition pures, réutilisables telles quelles par le
-//! futur coordinateur (qui ajoutera la persistance et l'outbox).
+//! Domain of More: job state machine, slice lifecycle, settlement and global rules of the spec. No
+//! network, database or GPU engine: pure transition functions, meant to be reused as is by the real
+//! coordinator (which will add persistence and the outbox).
 
 pub mod command;
 pub mod config;

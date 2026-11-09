@@ -1,5 +1,4 @@
-//! Commandes appliquées par le coordinateur. Chaque commande correspond à une
-//! ou plusieurs transitions identifiées dans la spécification.
+//! Commands applied by the coordinator. Each maps to one or more transitions of the spec.
 
 use crate::ids::*;
 use crate::model::{ClaimItem, PauseReason, PoolMode};
@@ -13,11 +12,11 @@ pub enum IssueTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Avance l'horloge du coordinateur.
+    /// Advances the coordinator clock.
     Tick {
         dt: Time,
     },
-    /// Émission (LEDGER-003), clé d'idempotence `issue/{id}`.
+    /// Issuance (LEDGER-003), idempotency key `issue/{id}`.
     Issue {
         id: u32,
         to: IssueTarget,
@@ -44,33 +43,33 @@ pub enum Command {
     RejectQueued {
         job: JobId,
     },
-    /// JOB-T04 (depuis `reserved`) ou JOB-T09 (depuis `recovering`).
+    /// JOB-T04 (from `reserved`) or JOB-T09 (from `recovering`).
     Place {
         job: JobId,
         lenders: Vec<AccountId>,
         recovery_estimate: Amount,
-        /// Témoin de livraison assigné à la tentative (JOB-R26).
+        /// Delivery witness assigned to the attempt (JOB-R26).
         witness: AccountId,
         expected_version: Option<u64>,
     },
-    /// Renouvellement de l'autorisation de la tentative courante (JOB-R31).
+    /// Renews the lease of the current attempt (JOB-R31).
     Heartbeat {
         job: JobId,
         attempt: u32,
     },
-    /// Attestation du témoin : positions `< upto` livrées au transport du
-    /// client (JOB-R26, JOB-R27). `witness` = signataire de l'attestation.
+    /// Witness attestation: positions `< upto` reached the client's transport (JOB-R26, JOB-R27).
+    /// `witness` is the signer.
     Deliver {
         job: JobId,
         attempt: u32,
         witness: AccountId,
         wt: WorkType,
         upto: u32,
-        /// Empreinte chaînée des trames `0..upto` signées par le nœud de sortie (JOB-R34).
+        /// Chained digest of frames `0..upto`, signed by the output node (JOB-R34).
         digest: u64,
     },
-    /// Engagement court du témoin, horodaté par le coordinateur : rend
-    /// recevable une attestation complète arrivée pendant le drainage (JOB-R32).
+    /// Short witness commitment, stamped by the coordinator; makes a full attestation admissible
+    /// during draining (JOB-R32).
     WitnessCommit {
         job: JobId,
         attempt: u32,
@@ -78,41 +77,40 @@ pub enum Command {
         wt: WorkType,
         upto: u32,
     },
-    /// Déclaration signée du client : « je détiens exactement `0..confirmed` »,
-    /// avec l'empreinte du préfixe détenu (JOB-R28, JOB-R33, JOB-R34).
+    /// Client statement "I hold exactly `0..confirmed`", with the digest of that prefix (JOB-R28,
+    /// JOB-R33, JOB-R34).
     ConfirmDelivery {
         job: JobId,
         wt: WorkType,
         confirmed: u32,
         digest: u64,
     },
-    /// Signe de vie signé du client, sans aucune position : ne prouve aucune
-    /// réception (JOB-R33).
+    /// Signed client keepalive. Covers no position, proves no receipt (JOB-R33).
     ClientHeartbeat {
         job: JobId,
     },
-    /// JOB-R33 : échéance des contestations sans accusé couvrant.
+    /// JOB-R33: contests past their deadline without a covering ack.
     ResolveContests {
         job: JobId,
     },
-    /// Le témoin libère son tampon à la fin de la rétention (JOB-R28).
+    /// Witness frees its buffer after retention (JOB-R28).
     PurgeBuffer {
         job: JobId,
         attempt: u32,
     },
-    /// Preuve complémentaire d'un élément réservé, avant l'échéance d'évaluation (JOB-R35).
+    /// Stronger proof for a reserved item, before the evaluation deadline (JOB-R35).
     SupplementEvidence {
         slice: SliceId,
         lender: AccountId,
         output: OutputId,
         evidence: crate::model::Evidence,
     },
-    /// Le témoin a perdu son tampon de rejeu pour cette tentative (JOB-R28).
+    /// The witness lost its replay buffer for this attempt (JOB-R28).
     WitnessLost {
         job: JobId,
         attempt: u32,
     },
-    /// JOB-R29 : fenêtre de livraison expirée sans contestation.
+    /// JOB-R29: delivery window expired without contest.
     ExpireDeliveryWindow {
         job: JobId,
     },
@@ -120,27 +118,27 @@ pub enum Command {
     PlacementFailed {
         job: JobId,
     },
-    /// JOB-T05 : tous les nœuds ont accepté ; `restored` = positions restaurées par type.
+    /// JOB-T05: all nodes accepted; `restored` = restored positions per type.
     AttemptReady {
         job: JobId,
         attempt: u32,
         restored: PerType<u32>,
     },
-    /// Production d'unités par la grappe (JOB-R11, JOB-R13, JOB-R25).
+    /// Units produced by the cluster (JOB-R11, JOB-R13, JOB-R25).
     Produce {
         job: JobId,
         attempt: u32,
         wt: WorkType,
         upto: u32,
     },
-    /// Accusé du client, accepté par le coordinateur (JOB-R23).
+    /// Client ack accepted by the coordinator (JOB-R23).
     Ack {
         job: JobId,
         attempt: u32,
         wt: WorkType,
         upto: u32,
     },
-    /// Engagement de reçus d'un destinataire (JOB-R15).
+    /// Receipt commitment from a recipient (JOB-R15).
     CommitReceipts {
         job: JobId,
         attempt: u32,
@@ -148,13 +146,13 @@ pub enum Command {
         wt: WorkType,
         upto: u32,
     },
-    /// Réclamation d'un prêteur sur une tranche ouverte ou en drainage.
+    /// Lender claim on an open or draining slice.
     Claim {
         slice: SliceId,
         lender: AccountId,
         items: Vec<ClaimItem>,
     },
-    /// JOB-S03 (et JOB-T07 si la tranche appartient à la tentative en cours).
+    /// JOB-S03 (and JOB-T07 if the slice belongs to the live attempt).
     CloseSlice {
         slice: SliceId,
     },
@@ -162,7 +160,7 @@ pub enum Command {
     Evaluate {
         slice: SliceId,
     },
-    /// JOB-S06, ligne par ligne.
+    /// JOB-S06, one line at a time.
     Arbitrate {
         slice: SliceId,
         lender: AccountId,
@@ -188,7 +186,7 @@ pub enum Command {
     RecoveryTimeout {
         job: JobId,
     },
-    /// Le pool bloque des crédits pour la récupération (JOB-R18).
+    /// The pool locks credits for recovery (JOB-R18).
     FundRecovery {
         job: JobId,
         amount: Amount,
@@ -219,24 +217,24 @@ pub enum Command {
     Settle {
         job: JobId,
     },
-    /// JOB-R22 : libération d'une récompense retenue.
+    /// JOB-R22: release a held reward.
     ReleaseReward {
         slice: SliceId,
         lender: AccountId,
     },
-    /// JOB-R22 : contestation pendant la fenêtre.
+    /// JOB-R22: contest within the window.
     ContestReward {
         slice: SliceId,
         lender: AccountId,
     },
-    /// JOB-R20 : applique toutes les transitions automatiques arrivées à échéance.
+    /// JOB-R20: applies every automatic transition that is due.
     Reconcile,
 }
 
-/// Résultat d'une commande acceptée.
+/// Result of an accepted command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Applied,
-    /// Commande déjà appliquée (idempotence) : rien n'a changé.
+    /// Already applied (idempotency): nothing changed.
     AlreadyApplied,
 }
