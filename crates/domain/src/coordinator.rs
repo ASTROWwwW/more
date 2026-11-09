@@ -4,10 +4,15 @@
 
 use std::collections::BTreeMap;
 
-use gpu_ledger::{Account, Amount, Ledger};
+use gpu_ledger::{
+    Account, Amount, EscrowBucket, IssueTo, Ledger, LedgerApiError, LedgerOp, LedgerOutcome,
+    LedgerService, LineRef, LineSource,
+};
+use more_identity::{AuthContext, ServiceCredential, ServiceRole};
 
+use crate::authorization::authorize;
 use crate::command::{Command, IssueTarget, Outcome};
-use crate::config::Config;
+use crate::config::{Config, MAX_LAYERS, MAX_OUTPUTS, MAX_PRICE, MAX_TIME};
 use crate::error::DomainError;
 use crate::ids::*;
 use crate::model::*;
@@ -167,7 +172,11 @@ pub enum AuditEvent {
 pub struct Coordinator {
     pub cfg: Config,
     pub now: Time,
-    pub ledger: Ledger,
+    /// Ledger service. Private: the orchestrator reaches it only through typed operations, with
+    /// its own credential.
+    ledger: LedgerService,
+    /// The orchestrator's credential towards the ledger (role `Orchestrator`).
+    cred: ServiceCredential,
     pub pools: BTreeMap<PoolId, Pool>,
     pub jobs: BTreeMap<JobId, Job>,
     pub slices: BTreeMap<SliceId, Slice>,
@@ -203,8 +212,8 @@ fn job_acct(j: JobId) -> u32 {
     j.0
 }
 
-fn line_acct(s: SliceId, lender: AccountId) -> Account {
-    Account::SliceLine {
+fn line_ref(s: SliceId, lender: AccountId) -> LineRef {
+    LineRef {
         job: s.job.0,
         attempt: s.attempt,
         slice: s.slice,
@@ -212,21 +221,30 @@ fn line_acct(s: SliceId, lender: AccountId) -> Account {
     }
 }
 
-fn pending_acct(s: SliceId, lender: AccountId) -> Account {
-    Account::PendingReward {
-        job: s.job.0,
-        attempt: s.attempt,
-        slice: s.slice,
-        lender: lender.0,
-    }
+fn add(a: Amount, b: Amount, what: &'static str) -> R<Amount> {
+    a.checked_add(b).ok_or(DomainError::Overflow(what))
+}
+
+/// Subtraction on internal counters: going below zero is a model bug, never an input error.
+fn sub(a: Amount, b: Amount, what: &'static str) -> R<Amount> {
+    a.checked_sub(b)
+        .ok_or_else(|| DomainError::Internal(format!("{what}: {a} - {b}")))
 }
 
 impl Coordinator {
-    pub fn new(cfg: Config) -> Self {
-        Coordinator {
+    /// `ledger` is the Ledger service; `cred` must be an Orchestrator credential it accepts.
+    pub fn new(cfg: Config, ledger: LedgerService, cred: ServiceCredential) -> R<Self> {
+        cfg.validate().map_err(DomainError::InvalidInput)?;
+        if cred.role() != ServiceRole::Orchestrator {
+            return Err(DomainError::InvalidInput(
+                "orchestrator credential expected",
+            ));
+        }
+        Ok(Coordinator {
             cfg,
             now: 0,
-            ledger: Ledger::new(),
+            ledger,
+            cred,
             pools: BTreeMap::new(),
             jobs: BTreeMap::new(),
             slices: BTreeMap::new(),
@@ -240,18 +258,40 @@ impl Coordinator {
             commit_log: BTreeMap::new(),
             seq: 0,
             audit: Vec::new(),
-        }
+        })
     }
 
-    /// Applies a command atomically.
-    pub fn apply(&mut self, cmd: &Command) -> R<Outcome> {
+    /// Authorizes then applies a command atomically. An unauthorized command is refused before
+    /// anything is touched (SEC-001).
+    pub fn execute(&mut self, ctx: &AuthContext, cmd: &Command) -> R<Outcome> {
+        authorize(self, ctx, cmd)?;
         let mut next = self.clone();
-        let out = next.step(cmd)?;
+        let out = next.step(ctx, cmd)?;
         // An already applied command changes nothing, not even the sequence (JOB-R04).
         if out == Outcome::Applied {
             *self = next;
         }
         Ok(out)
+    }
+
+    /// Full read access to the ledger, for the Auditor role only.
+    pub fn audit_ledger(&self, auditor: &ServiceCredential) -> R<&Ledger> {
+        Ok(self.ledger.audit_view(auditor)?)
+    }
+
+    /// The ledger service itself, read-only, for audits of escrows and denials.
+    pub fn ledger_service(&self) -> &LedgerService {
+        &self.ledger
+    }
+
+    fn ledger_op(&mut self, op: LedgerOp) -> R<LedgerOutcome> {
+        Ok(self.ledger.execute(&self.cred, op)?)
+    }
+
+    fn escrow_work(&self, job: JobId) -> R<Amount> {
+        Ok(self
+            .ledger
+            .job_balance(&self.cred, Account::EscrowWork(job_acct(job)))?)
     }
 
     pub fn job(&self, id: JobId) -> R<&Job> {
@@ -266,6 +306,20 @@ impl Coordinator {
         self.slices
             .get_mut(&id)
             .ok_or(DomainError::UnknownSlice(id))
+    }
+
+    fn attempt_mut(&mut self, job: JobId, attempt: u32) -> R<&mut Attempt> {
+        self.job_mut(job)?
+            .attempts
+            .get_mut(&attempt)
+            .ok_or_else(|| DomainError::Internal(format!("missing attempt {attempt}")))
+    }
+
+    fn line_mut(&mut self, slice: SliceId, lender: AccountId) -> R<&mut Line> {
+        self.slice_mut(slice)?
+            .lines
+            .get_mut(&lender)
+            .ok_or_else(|| DomainError::Internal(format!("missing line {lender:?}")))
     }
 
     fn is_credits(&self, job: JobId) -> R<bool> {
@@ -445,67 +499,82 @@ impl Coordinator {
             .checked_sub(a.recovery_reserved)
             .ok_or_else(|| DomainError::Internal("recovery reserved > earmark".into()))?;
         a.earmark_returned = true;
-        j.recovery_unearmarked += unused;
+        j.recovery_unearmarked = add(j.recovery_unearmarked, unused, "recovery budget")?;
         Ok(())
     }
 
-    fn step(&mut self, cmd: &Command) -> R<Outcome> {
+    fn step(&mut self, ctx: &AuthContext, cmd: &Command) -> R<Outcome> {
         use Command::*;
         // Rejected commands roll back with the rest of the state, so sequence numbers have no gaps.
         self.seq += 1;
         match cmd {
             Tick { dt } => {
-                self.now += dt;
+                // SAFE-001: time stays below MAX_TIME, so `time + duration` never overflows.
+                let now = self
+                    .now
+                    .checked_add(*dt)
+                    .filter(|t| *t <= MAX_TIME)
+                    .ok_or(DomainError::Overflow("clock beyond MAX_TIME"))?;
+                self.now = now;
                 Ok(Outcome::Applied)
             }
             Issue { id, to, amount } => {
-                let key = format!("issue/{id}");
-                if self.ledger.has_key(&key) {
-                    return Ok(Outcome::AlreadyApplied);
-                }
-                let acct = match to {
-                    IssueTarget::User(a) => Account::User(a.0),
+                let to = match to {
+                    IssueTarget::User(a) => IssueTo::User(a.0),
                     IssueTarget::Pool(p) => {
                         if !self.pools.contains_key(p) {
                             return Err(DomainError::UnknownPool);
                         }
-                        Account::PoolReserve(p.0)
+                        IssueTo::Pool(p.0)
                     }
                 };
-                self.ledger.transfer(
-                    key,
-                    Account::Issuance,
-                    acct,
-                    *amount,
-                    "LEDGER-003 issuance",
-                )?;
-                Ok(Outcome::Applied)
-            }
-            CreatePool { pool, mode } => {
-                if let Some(p) = self.pools.get(pool) {
-                    return if p.mode == *mode {
+                // The treasury's own credential goes to the ledger: the orchestrator cannot issue.
+                let treasury = ctx
+                    .credential()
+                    .ok_or(DomainError::Unauthorized("only the treasury issues"))?;
+                let op = LedgerOp::Issue {
+                    key: format!("issue/{id}"),
+                    to,
+                    amount: *amount,
+                };
+                match self.ledger.execute(treasury, op) {
+                    Ok(_) => Ok(Outcome::Applied),
+                    Err(LedgerApiError::Ledger(gpu_ledger::LedgerError::DuplicateKey(_))) => {
                         Ok(Outcome::AlreadyApplied)
-                    } else {
-                        Err(DomainError::Precondition("pool id reused"))
-                    };
+                    }
+                    Err(e) => Err(e.into()),
                 }
-                self.pools.insert(
-                    *pool,
-                    Pool {
-                        id: *pool,
-                        mode: *mode,
-                    },
-                );
-                Ok(Outcome::Applied)
             }
+            CreatePool {
+                pool,
+                mode,
+                access,
+                admin,
+            } => self.create_pool(*pool, *mode, *access, *admin),
+            SetRights {
+                pool,
+                account,
+                rights,
+            } => self.set_rights(*pool, *account, *rights),
+            JoinPool { pool, account } => self.join_pool(*pool, *account),
+            RegisterModel { pool, model, spec } => self.register_model(*pool, *model, *spec),
             Submit {
                 job,
                 borrower,
                 pool,
-                layout,
-                price,
-                max_outputs,
-            } => self.submit(*job, *borrower, *pool, layout, *price, *max_outputs),
+                model,
+                outputs,
+                max_budget,
+                mandate,
+            } => self.submit(
+                *job,
+                *borrower,
+                *pool,
+                *model,
+                *outputs,
+                *max_budget,
+                mandate,
+            ),
             Reserve { job } => self.reserve(*job),
             RejectQueued { job } => {
                 if self.job(*job)?.exec != ExecStatus::Queued {
@@ -521,12 +590,13 @@ impl Coordinator {
             Place {
                 job,
                 lenders,
+                layout,
                 recovery_estimate,
                 witness,
                 expected_version,
             } => {
                 self.check_version(*job, *expected_version)?;
-                self.place(*job, lenders, *recovery_estimate, *witness)
+                self.place(*job, lenders, layout, *recovery_estimate, *witness)
             }
             Heartbeat { job, attempt } => self.heartbeat(*job, *attempt),
             Deliver {
@@ -589,7 +659,8 @@ impl Coordinator {
                 lender,
                 wt,
                 upto,
-            } => self.commit_receipts(*job, *attempt, *lender, *wt, *upto),
+                digest,
+            } => self.commit_receipts(*job, *attempt, *lender, *wt, *upto, *digest),
             Claim {
                 slice,
                 lender,
@@ -648,17 +719,16 @@ impl Coordinator {
                     return Err(DomainError::Precondition("JOB-R18: settlement not active"));
                 }
                 let key = format!("fund/{}/{}", job.0, self.audit.len());
-                let pool = j.pool;
-                self.ledger.transfer(
+                let unearmarked = add(j.recovery_unearmarked, *amount, "recovery budget")?;
+                let funded = add(j.pool_recovery_funded, *amount, "pool relay")?;
+                self.ledger_op(LedgerOp::FundRecovery {
+                    job: job_acct(*job),
                     key,
-                    Account::PoolReserve(pool.0),
-                    Account::EscrowRecovery(job_acct(*job)),
-                    *amount,
-                    "JOB-R18 pool relay",
-                )?;
+                    amount: *amount,
+                })?;
                 let j = self.job_mut(*job)?;
-                j.recovery_unearmarked += amount;
-                j.pool_recovery_funded += amount;
+                j.recovery_unearmarked = unearmarked;
+                j.pool_recovery_funded = funded;
                 Ok(Outcome::Applied)
             }
             Finish {
@@ -717,7 +787,7 @@ impl Coordinator {
             Settle { job } => self.settle(*job),
             ReleaseReward { slice, lender } => self.release_reward(*slice, *lender),
             ContestReward { slice, lender } => self.contest_reward(*slice, *lender),
-            Reconcile => self.reconcile(),
+            Reconcile => self.reconcile(ctx),
         }
     }
 
@@ -729,28 +799,108 @@ impl Coordinator {
         Ok(())
     }
 
+    fn create_pool(
+        &mut self,
+        pool: PoolId,
+        mode: PoolMode,
+        access: PoolAccess,
+        admin: AccountId,
+    ) -> R<Outcome> {
+        if let Some(p) = self.pools.get(&pool) {
+            return if p.mode == mode && p.access == access && p.is_admin(admin) {
+                Ok(Outcome::AlreadyApplied)
+            } else {
+                Err(DomainError::Precondition("pool id reused"))
+            };
+        }
+        self.pools.insert(
+            pool,
+            Pool {
+                id: pool,
+                mode,
+                access,
+                admins: [admin].into_iter().collect(),
+                members: BTreeMap::new(),
+                models: BTreeMap::new(),
+            },
+        );
+        Ok(Outcome::Applied)
+    }
+
+    fn set_rights(&mut self, pool: PoolId, account: AccountId, rights: Rights) -> R<Outcome> {
+        let p = self.pools.get_mut(&pool).ok_or(DomainError::UnknownPool)?;
+        if p.rights(account) == rights {
+            return Ok(Outcome::AlreadyApplied);
+        }
+        if rights == Rights::NONE {
+            p.members.remove(&account);
+        } else {
+            p.members.insert(account, rights);
+        }
+        Ok(Outcome::Applied)
+    }
+
+    fn join_pool(&mut self, pool: PoolId, account: AccountId) -> R<Outcome> {
+        let p = self.pools.get_mut(&pool).ok_or(DomainError::UnknownPool)?;
+        if p.access != PoolAccess::Open {
+            return Err(DomainError::Precondition(
+                "private pool: rights come from its admins",
+            ));
+        }
+        let r = p.members.entry(account).or_insert(Rights::NONE);
+        if r.borrow && r.lend {
+            return Ok(Outcome::AlreadyApplied);
+        }
+        r.borrow = true;
+        r.lend = true;
+        Ok(Outcome::Applied)
+    }
+
+    /// Model Registry: catalog and tariff, bounded so job costs cannot overflow (SAFE-001).
+    fn register_model(&mut self, pool: PoolId, model: ModelId, spec: ModelSpec) -> R<Outcome> {
+        let p = self.pools.get_mut(&pool).ok_or(DomainError::UnknownPool)?;
+        if spec.layers == 0 || spec.layers > MAX_LAYERS {
+            return Err(DomainError::InvalidInput("model layers out of range"));
+        }
+        if spec.price.iter().any(|x| *x > MAX_PRICE) {
+            return Err(DomainError::InvalidInput("price above MAX_PRICE"));
+        }
+        if spec.max_outputs.iter().any(|x| *x > MAX_OUTPUTS) {
+            return Err(DomainError::InvalidInput("max outputs above MAX_OUTPUTS"));
+        }
+        if matches!(p.mode, PoolMode::FreeShare { .. }) && spec.price != [0; 3] {
+            return Err(DomainError::InvalidInput(
+                "a free-sharing pool has no tariff",
+            ));
+        }
+        if p.models.get(&model) == Some(&spec) {
+            return Ok(Outcome::AlreadyApplied);
+        }
+        p.models.insert(model, spec);
+        Ok(Outcome::Applied)
+    }
+
+    /// JOB-T01. The price is the pool's tariff for the model; the client only chooses how many
+    /// outputs it wants and signs the most it agrees to lock (SEC-002).
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &mut self,
         job: JobId,
         borrower: AccountId,
         pool: PoolId,
-        layout: &[u32],
-        price: PerType<Amount>,
-        max_outputs: PerType<u32>,
+        model: ModelId,
+        outputs: PerType<u32>,
+        max_budget: Amount,
+        mandate: &[u8; 64],
     ) -> R<Outcome> {
         let p = self.pools.get(&pool).ok_or(DomainError::UnknownPool)?;
-        let price = if matches!(p.mode, PoolMode::FreeShare { .. }) {
-            [0; 3]
-        } else {
-            price
-        };
         if let Some(existing) = self.jobs.get(&job) {
             // JOB-T01: same idempotency key returns the existing job.
             let same = existing.borrower == borrower
                 && existing.pool == pool
-                && existing.layout == layout
-                && existing.price == price
-                && existing.max_outputs == max_outputs;
+                && existing.model == model
+                && existing.max_outputs == outputs
+                && existing.max_budget == max_budget;
             return if same {
                 Ok(Outcome::AlreadyApplied)
             } else {
@@ -759,13 +909,45 @@ impl Coordinator {
                 ))
             };
         }
-        if layout.is_empty() || layout.contains(&0) {
-            return Err(DomainError::Precondition("invalid layout"));
+        let spec = *p
+            .models
+            .get(&model)
+            .ok_or(DomainError::InvalidInput("model not in the pool's catalog"))?;
+        if outputs.iter().zip(spec.max_outputs).any(|(o, m)| *o > m) {
+            return Err(DomainError::InvalidInput(
+                "more outputs than the model allows",
+            ));
         }
-        let est_cost: Amount = (0..3)
-            .map(|i| price[i] * Amount::from(max_outputs[i]))
-            .sum();
-        let recovery_budget = est_cost * self.cfg.recovery_budget_pct / 100;
+        if outputs == [0; 3] {
+            return Err(DomainError::InvalidInput("no output requested"));
+        }
+        let price = spec.price;
+        let mut est_cost: Amount = 0;
+        for t in 0..3 {
+            let part = price[t]
+                .checked_mul(Amount::from(outputs[t]))
+                .ok_or(DomainError::Overflow("estimated cost"))?;
+            est_cost = add(est_cost, part, "estimated cost")?;
+        }
+        let recovery_budget = est_cost
+            .checked_mul(self.cfg.recovery_budget_pct)
+            .ok_or(DomainError::Overflow("recovery budget"))?
+            / 100;
+        let needed = add(est_cost, recovery_budget, "job budget")?;
+        if needed > max_budget {
+            return Err(DomainError::Precondition(
+                "JOB-T01: signed budget below the estimated cost",
+            ));
+        }
+        // The ledger checks the borrower's signature itself: a compromised orchestrator cannot
+        // open an escrow nobody agreed to.
+        self.ledger_op(LedgerOp::OpenEscrow {
+            job: job_acct(job),
+            owner: borrower.0,
+            pool: pool.0,
+            max_budget,
+            signature: *mandate,
+        })?;
         self.jobs.insert(
             job,
             Job {
@@ -773,7 +955,9 @@ impl Coordinator {
                 borrower,
                 pool,
                 stream: fnv(&[u64::from(job.0), u64::from(borrower.0), 0x5354_5245_414d]),
-                model: 1,
+                model,
+                model_layers: spec.layers,
+                max_budget,
                 version: 1,
                 exec: ExecStatus::Queued,
                 settle: SettleStatus::None,
@@ -781,9 +965,8 @@ impl Coordinator {
                 exec_since: self.now,
                 placing_from: None,
                 placement_failures: 0,
-                layout: layout.to_vec(),
                 price,
-                max_outputs,
+                max_outputs: outputs,
                 est_cost,
                 recovery_budget,
                 recovery_unearmarked: recovery_budget,
@@ -812,25 +995,27 @@ impl Coordinator {
     fn reserve(&mut self, job: JobId) -> R<Outcome> {
         self.require_exec(job, ExecStatus::Queued, "JOB-T02")?;
         let j = self.job(job)?.clone();
-        let mode = self.pools[&j.pool].mode;
+        let mode = self
+            .pools
+            .get(&j.pool)
+            .ok_or(DomainError::UnknownPool)?
+            .mode;
         match mode {
             PoolMode::Credits => {
                 // Escrow = estimated work + recovery budget (JOB-T02, JOB-R18).
                 let initial = j.est_cost.min(self.cfg.initial_reserve_max);
-                self.ledger.transfer(
-                    format!("reserve/{}/work", job.0),
-                    Account::User(j.borrower.0),
-                    Account::EscrowWork(job_acct(job)),
-                    initial,
-                    "JOB-T02 work escrow",
-                )?;
-                self.ledger.transfer(
-                    format!("reserve/{}/recovery", job.0),
-                    Account::User(j.borrower.0),
-                    Account::EscrowRecovery(job_acct(job)),
-                    j.recovery_budget,
-                    "JOB-T02 recovery budget",
-                )?;
+                self.ledger_op(LedgerOp::Reserve {
+                    job: job_acct(job),
+                    bucket: EscrowBucket::Work,
+                    key: format!("reserve/{}/work", job.0),
+                    amount: initial,
+                })?;
+                self.ledger_op(LedgerOp::Reserve {
+                    job: job_acct(job),
+                    bucket: EscrowBucket::Recovery,
+                    key: format!("reserve/{}/recovery", job.0),
+                    amount: j.recovery_budget,
+                })?;
             }
             PoolMode::FreeShare { quota_per_borrower } => {
                 let active = self
@@ -857,6 +1042,7 @@ impl Coordinator {
         &mut self,
         job: JobId,
         lenders: &[AccountId],
+        layout: &[u32],
         recovery_estimate: Amount,
         witness: AccountId,
     ) -> R<Outcome> {
@@ -875,8 +1061,35 @@ impl Coordinator {
                 })
             }
         };
-        if lenders.len() != j.layout.len() {
+        // Layout chosen by the scheduler: one non-empty range per lender, covering the model.
+        if lenders.is_empty() || lenders.len() != layout.len() || layout.contains(&0) {
             return Err(DomainError::Precondition("one lender per layer range"));
+        }
+        let covered = layout
+            .iter()
+            .try_fold(0u32, |acc, l| acc.checked_add(*l))
+            .ok_or(DomainError::Overflow("layout"))?;
+        if covered != j.model_layers {
+            return Err(DomainError::Precondition("layout does not cover the model"));
+        }
+        // JOB-T04: one layer range per lender. Two ranges on one account would let it commit its
+        // own receipts (SAFE-002).
+        let mut seen = std::collections::BTreeSet::new();
+        if !lenders.iter().all(|l| seen.insert(*l)) {
+            return Err(DomainError::Precondition(
+                "JOB-T04: a lender holds one range only",
+            ));
+        }
+        let pool = self.pools.get(&j.pool).ok_or(DomainError::UnknownPool)?;
+        if !lenders.iter().all(|l| pool.rights(*l).lend) {
+            return Err(DomainError::Precondition(
+                "lender without the lend right in this pool",
+            ));
+        }
+        if !pool.rights(witness).witness {
+            return Err(DomainError::Precondition(
+                "witness without the witness right in this pool",
+            ));
         }
         if j.attempt >= max_attempts {
             return Err(DomainError::Precondition("max attempts reached: JOB-T16"));
@@ -897,8 +1110,9 @@ impl Coordinator {
                 "no recovery work on an initial placement",
             ));
         }
+        let unearmarked = sub(j.recovery_unearmarked, recovery_estimate, "recovery budget")?;
         let j = self.job_mut(job)?;
-        j.recovery_unearmarked -= recovery_estimate;
+        j.recovery_unearmarked = unearmarked;
         j.attempt += 1;
         let no = j.attempt;
         // Start from delivered positions: they get replayed, never regenerated (JOB-R28).
@@ -908,6 +1122,7 @@ impl Coordinator {
             Attempt {
                 no,
                 lenders: lenders.to_vec(),
+                layout: layout.to_vec(),
                 issued_at: now,
                 witness,
                 lease_expires_at: now + ttl,
@@ -1016,24 +1231,30 @@ impl Coordinator {
             return Err(DomainError::Precondition("beyond max outputs"));
         }
         // JOB-R13: produced and unacked units stay within the flow budget.
-        if upto - j.validated[t] > self.cfg.flow_budget[t] {
+        let unacked = upto
+            .checked_sub(j.validated[t])
+            .ok_or_else(|| DomainError::Internal("produced below validated".into()))?;
+        if unacked > self.cfg.flow_budget[t] {
             return Err(DomainError::FlowBudgetExceeded);
         }
         // JOB-R25: produced but not yet charged units must be covered by work escrow.
         let mut produced = a.produced;
         produced[t] = upto;
-        let window: Amount = (0..3)
-            .map(|i| j.price[i] * Amount::from(produced[i] - j.delivered[i]))
-            .sum();
-        if window > self.ledger.available(Account::EscrowWork(job_acct(job))) {
+        let mut window: Amount = 0;
+        for ((p, d), price) in produced.iter().zip(j.delivered).zip(j.price) {
+            let units = p
+                .checked_sub(d)
+                .ok_or_else(|| DomainError::Internal("delivered beyond produced".into()))?;
+            let part = price
+                .checked_mul(Amount::from(units))
+                .ok_or(DomainError::Overflow("window"))?;
+            window = add(window, part, "window")?;
+        }
+        if window > self.escrow_work(job)? {
             return Err(DomainError::WindowNotCovered);
         }
         let from = a.produced[t];
-        self.job_mut(job)?
-            .attempts
-            .get_mut(&attempt)
-            .unwrap()
-            .produced[t] = upto;
+        self.attempt_mut(job, attempt)?.produced[t] = upto;
         self.audit.push(AuditEvent::Produced {
             job,
             attempt,
@@ -1070,20 +1291,14 @@ impl Coordinator {
             )
         };
         let gen = self.charge_gens.get(&output).copied().unwrap_or(0);
-        self.ledger.transfer(
-            format!(
+        self.ledger_op(LedgerOp::ChargeOutput {
+            job: job_acct(output.job),
+            key: format!(
                 "charge/{}/{:?}/{}/{}",
                 output.job.0, output.wt, output.pos, gen
             ),
-            Account::EscrowWork(job_acct(output.job)),
-            Account::OutputHold(job_acct(output.job)),
-            price,
-            if definitive {
-                "JOB-R23 charge validated output"
-            } else {
-                "JOB-R27 provisional charge of attested output"
-            },
-        )?;
+            amount: price,
+        })?;
         self.charge_gens.insert(output, gen + 1);
         self.outputs.insert(output, attempt);
         self.charges.insert(
@@ -1249,7 +1464,7 @@ impl Coordinator {
         let mut h = fnv(&[
             u64::from(job.0),
             j.stream,
-            u64::from(j.model),
+            u64::from(j.model.0),
             wt.idx() as u64,
         ]);
         for pos in 0..upto {
@@ -1425,7 +1640,11 @@ impl Coordinator {
         // covering it makes it definitive.
         for output in to_contest {
             let deadline = now + resolution;
-            self.charges.get_mut(&output).unwrap().contest = Some(Contest {
+            let ch = self
+                .charges
+                .get_mut(&output)
+                .ok_or_else(|| DomainError::Internal(format!("contest uncharged {output:?}")))?;
+            ch.contest = Some(Contest {
                 opened_at: now,
                 deadline,
             });
@@ -1487,11 +1706,7 @@ impl Coordinator {
                 "JOB-R28: provisional or contested outputs pending",
             ));
         }
-        self.job_mut(job)?
-            .attempts
-            .get_mut(&attempt)
-            .unwrap()
-            .buffer_purged = true;
+        self.attempt_mut(job, attempt)?.buffer_purged = true;
         for (o, ch) in self.charges.iter_mut() {
             if o.job == job && ch.attempt == attempt {
                 ch.replayable = false;
@@ -1537,7 +1752,7 @@ impl Coordinator {
         if evidence.rank() <= line.items[idx].evidence.rank() {
             return Ok(Outcome::AlreadyApplied);
         }
-        self.slice_mut(slice)?.lines.get_mut(&lender).unwrap().items[idx].evidence = evidence;
+        self.line_mut(slice, lender)?.items[idx].evidence = evidence;
         self.audit.push(AuditEvent::EvidenceSupplemented {
             slice,
             lender,
@@ -1616,16 +1831,14 @@ impl Coordinator {
             }
         }
         let price = self.job(output.job)?.price[output.wt.idx()];
-        self.ledger.transfer(
-            format!(
+        self.ledger_op(LedgerOp::VoidOutput {
+            job: job_acct(output.job),
+            key: format!(
                 "void/{}/{:?}/{}/{}",
                 output.job.0, output.wt, output.pos, ch.gen
             ),
-            Account::OutputHold(job_acct(output.job)),
-            Account::EscrowWork(job_acct(output.job)),
-            price,
-            "JOB-R29 void provisional output",
-        )?;
+            amount: price,
+        })?;
         self.outputs.remove(&output);
         self.charges.remove(&output);
         self.audit.push(AuditEvent::OutputVoided {
@@ -1668,8 +1881,7 @@ impl Coordinator {
             if !(it.status == ItemStatus::Disputed && it.awaiting_delivery) {
                 continue;
             }
-            self.slice_mut(slice)?.lines.get_mut(&lender).unwrap().items[idx].awaiting_delivery =
-                false;
+            self.line_mut(slice, lender)?.items[idx].awaiting_delivery = false;
             match self.decide(slice, lender, idx)? {
                 Decision::Pay => self.pay_item(slice, lender, idx, false)?,
                 Decision::Refund(r) => self.refund_item(slice, lender, idx, r)?,
@@ -1685,10 +1897,10 @@ impl Coordinator {
                 Decision::Defer => {
                     // JOB-R35: before the deadline the item goes back to pending, so a stronger
                     // proof can still come.
-                    let l = self.slice_mut(slice)?.lines.get_mut(&lender).unwrap();
+                    let l = self.line_mut(slice, lender)?;
                     let amount = l.items[idx].amount;
-                    l.disputed -= amount;
-                    l.pending += amount;
+                    l.disputed = sub(l.disputed, amount, "disputed")?;
+                    l.pending = add(l.pending, amount, "pending")?;
                     l.items[idx].status = ItemStatus::PendingEvaluation;
                 }
                 Decision::Await => {
@@ -1776,6 +1988,29 @@ impl Coordinator {
         Ok(Outcome::Applied)
     }
 
+    /// Digest binding a receipt commitment to its job, attempt, producer, type and covered
+    /// positions (SEC-004). Symbolic (FNV-1a) in the model, like the frame digest: the real one
+    /// will hash the signed receipts themselves.
+    pub fn receipt_digest(
+        &self,
+        job: JobId,
+        attempt: u32,
+        producer: AccountId,
+        wt: WorkType,
+        upto: u32,
+    ) -> u64 {
+        let stream = self.jobs.get(&job).map_or(0, |j| j.stream);
+        fnv(&[
+            0x5245_4345_4950_5453,
+            u64::from(job.0),
+            stream,
+            u64::from(attempt),
+            u64::from(producer.0),
+            wt.idx() as u64,
+            u64::from(upto),
+        ])
+    }
+
     fn commit_receipts(
         &mut self,
         job: JobId,
@@ -1783,7 +2018,11 @@ impl Coordinator {
         lender: AccountId,
         wt: WorkType,
         upto: u32,
+        digest: u64,
     ) -> R<Outcome> {
+        if digest != self.receipt_digest(job, attempt, lender, wt, upto) {
+            return Err(DomainError::InadmissibleProof);
+        }
         let now = self.now;
         let j = self.job_mut(job)?;
         let a = j
@@ -1952,11 +2191,9 @@ impl Coordinator {
                     let stage = stage as usize;
                     let ok_binding = output.job == slice.job
                         && self.outputs.get(&output) == Some(&slice.attempt);
-                    let ok_stage = stage < j.layout.len() && a.lenders.get(stage) == Some(lender);
-                    if !(ok_binding && ok_stage) {
-                        None
-                    } else {
-                        let (ls, le) = j.layer_range(stage).unwrap();
+                    let ok_stage = stage < a.layout.len() && a.lenders.get(stage) == Some(lender);
+                    let range = a.layer_range(stage);
+                    if let (true, Some((ls, le))) = (ok_binding && ok_stage, range) {
                         let cid = ContributionId {
                             output,
                             charge: self.charges[&output].gen,
@@ -1967,17 +2204,20 @@ impl Coordinator {
                         if self.contributions.contains_key(&cid) {
                             None
                         } else {
-                            let amount = j.share(output.wt, stage);
-                            self.ledger.transfer(
-                                format!("claim/{:?}/{}/{:?}", slice, lender.0, cid),
-                                Account::OutputHold(job_acct(slice.job)),
-                                line_acct(slice, *lender),
+                            let amount = j.share(&a, output.wt, stage).ok_or_else(|| {
+                                DomainError::Internal("share of a missing stage".into())
+                            })?;
+                            self.ledger_op(LedgerOp::ReserveLine {
+                                line: line_ref(slice, *lender),
+                                source: LineSource::OutputHold,
+                                key: format!("claim/{:?}/{}/{:?}", slice, lender.0, cid),
                                 amount,
-                                "JOB-S03 reserve contribution",
-                            )?;
+                            })?;
                             self.contributions.insert(cid, slice);
                             Some((ItemKind::Contribution(cid), amount, evidence))
                         }
+                    } else {
+                        None
                     }
                 }
                 ClaimItem::Recovery {
@@ -1996,14 +2236,13 @@ impl Coordinator {
                     if !a.ready || self.recovery_items.contains_key(&rid) || !fits || amount == 0 {
                         None
                     } else {
-                        self.ledger.transfer(
-                            format!("claim/{:?}/{}/{:?}", slice, lender.0, rid),
-                            Account::EscrowRecovery(job_acct(slice.job)),
-                            line_acct(slice, *lender),
+                        self.ledger_op(LedgerOp::ReserveLine {
+                            line: line_ref(slice, *lender),
+                            source: LineSource::Recovery,
+                            key: format!("claim/{:?}/{}/{:?}", slice, lender.0, rid),
                             amount,
-                            "JOB-S03 reserve recovery",
-                        )?;
-                        recovery_reserved += amount;
+                        })?;
+                        recovery_reserved = add(recovery_reserved, amount, "recovery reserved")?;
                         self.recovery_items.insert(rid, slice);
                         Some((ItemKind::Recovery(rid), amount, evidence))
                     }
@@ -2013,8 +2252,8 @@ impl Coordinator {
                 None => rejected += 1,
                 Some((kind, amount, evidence)) => {
                     let line = lines.entry(*lender).or_default();
-                    line.claimed += amount;
-                    line.pending += amount;
+                    line.claimed = add(line.claimed, amount, "claimed")?;
+                    line.pending = add(line.pending, amount, "pending")?;
                     line.items.push(LineItem {
                         kind,
                         amount,
@@ -2033,10 +2272,7 @@ impl Coordinator {
                 }
             }
         }
-        self.job_mut(slice.job)?
-            .attempts
-            .get_mut(&slice.attempt)
-            .unwrap()
+        self.attempt_mut(slice.job, slice.attempt)?
             .recovery_reserved = recovery_reserved;
         let sm = self.slice_mut(slice)?;
         sm.staged.clear();
@@ -2065,38 +2301,40 @@ impl Coordinator {
                 l.items[idx].evidence,
             )
         };
-        let key = format!("pay/{:?}/{}/{:?}", slice, lender.0, kind);
-        self.ledger.transfer(
-            key,
-            line_acct(slice, lender),
-            pending_acct(slice, lender),
+        self.ledger_op(LedgerOp::PayLine {
+            line: line_ref(slice, lender),
+            key: format!("pay/{:?}/{}/{:?}", slice, lender.0, kind),
             amount,
-            "JOB-S04 held payment",
-        )?;
+        })?;
         // CE-02, JOB-R18: borrower budget first, then pool relay.
         let mut pool_part = 0;
         if let ItemKind::Recovery(_) = kind {
             let j = self.job_mut(slice.job)?;
-            let from_borrower = amount.min(j.recovery_budget - j.recovery_paid_borrower);
+            let left = sub(
+                j.recovery_budget,
+                j.recovery_paid_borrower,
+                "borrower budget",
+            )?;
+            let from_borrower = amount.min(left);
             pool_part = amount - from_borrower;
-            if j.recovery_paid_pool + pool_part > j.pool_recovery_funded {
+            let pool_paid = add(j.recovery_paid_pool, pool_part, "pool relay paid")?;
+            if pool_paid > j.pool_recovery_funded {
                 return Err(DomainError::Internal(
                     "recovery paid beyond borrower budget and pool relay".into(),
                 ));
             }
-            j.recovery_paid_borrower += from_borrower;
-            j.recovery_paid_pool += pool_part;
+            j.recovery_paid_borrower = add(j.recovery_paid_borrower, from_borrower, "paid")?;
+            j.recovery_paid_pool = pool_paid;
         }
-        let s = self.slice_mut(slice)?;
-        let l = s.lines.get_mut(&lender).unwrap();
+        let l = self.line_mut(slice, lender)?;
         l.items[idx].pool_part = pool_part;
         match l.items[idx].status {
-            ItemStatus::PendingEvaluation => l.pending -= amount,
-            ItemStatus::Disputed => l.disputed -= amount,
+            ItemStatus::PendingEvaluation => l.pending = sub(l.pending, amount, "pending")?,
+            ItemStatus::Disputed => l.disputed = sub(l.disputed, amount, "disputed")?,
             st => return Err(DomainError::Internal(format!("pay from {st:?}"))),
         }
-        l.paid += amount;
-        l.held += amount;
+        l.paid = add(l.paid, amount, "paid")?;
+        l.held = add(l.held, amount, "held")?;
         l.items[idx].status = ItemStatus::Paid;
         l.items[idx].awaiting_delivery = false;
         // A zero reward (free pool) has nothing to hold or release.
@@ -2125,33 +2363,26 @@ impl Coordinator {
             (l.items[idx].kind, l.items[idx].amount)
         };
         let back = match kind {
-            ItemKind::Contribution(_) => Account::OutputHold(job_acct(slice.job)),
-            ItemKind::Recovery(_) => Account::EscrowRecovery(job_acct(slice.job)),
+            ItemKind::Contribution(_) => LineSource::OutputHold,
+            ItemKind::Recovery(_) => LineSource::Recovery,
         };
-        let key = format!("refund/{:?}/{}/{:?}", slice, lender.0, kind);
-        self.ledger.transfer(
-            key,
-            line_acct(slice, lender),
-            back,
+        self.ledger_op(LedgerOp::RefundLine {
+            line: line_ref(slice, lender),
+            to: back,
+            key: format!("refund/{:?}/{}/{:?}", slice, lender.0, kind),
             amount,
-            "JOB-S04 refund",
-        )?;
+        })?;
         if let ItemKind::Recovery(_) = kind {
-            let a = self
-                .job_mut(slice.job)?
-                .attempts
-                .get_mut(&slice.attempt)
-                .unwrap();
-            a.recovery_reserved -= amount;
+            let a = self.attempt_mut(slice.job, slice.attempt)?;
+            a.recovery_reserved = sub(a.recovery_reserved, amount, "recovery reserved")?;
         }
-        let s = self.slice_mut(slice)?;
-        let l = s.lines.get_mut(&lender).unwrap();
+        let l = self.line_mut(slice, lender)?;
         match l.items[idx].status {
-            ItemStatus::PendingEvaluation => l.pending -= amount,
-            ItemStatus::Disputed => l.disputed -= amount,
+            ItemStatus::PendingEvaluation => l.pending = sub(l.pending, amount, "pending")?,
+            ItemStatus::Disputed => l.disputed = sub(l.disputed, amount, "disputed")?,
             st => return Err(DomainError::Internal(format!("refund from {st:?}"))),
         }
-        l.refunded += amount;
+        l.refunded = add(l.refunded, amount, "refunded")?;
         l.items[idx].status = ItemStatus::Refunded;
         l.items[idx].awaiting_delivery = false;
         self.audit.push(AuditEvent::ItemRefunded {
@@ -2209,12 +2440,12 @@ impl Coordinator {
                 let now = self.now;
                 let w = self.cfg.uncommitted_window;
                 let log = self.uncommitted_paid.entry(lender).or_default();
-                let recent: Amount = log
+                let recent = log
                     .iter()
                     .filter(|(t, _)| t + w > now)
-                    .map(|(_, a)| a)
-                    .sum();
-                if recent + item.amount <= self.cfg.uncommitted_cap {
+                    .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+                    .ok_or(DomainError::Overflow("sliding cap"))?;
+                if add(recent, item.amount, "sliding cap")? <= self.cfg.uncommitted_cap {
                     log.push((now, item.amount));
                     Decision::Pay
                 } else {
@@ -2256,10 +2487,9 @@ impl Coordinator {
                     }
                     Decision::Dispute | Decision::Await => {
                         let awaiting = matches!(decision, Decision::Await);
-                        let sm = self.slice_mut(slice)?;
-                        let l = sm.lines.get_mut(lender).unwrap();
-                        l.pending -= item.amount;
-                        l.disputed += item.amount;
+                        let l = self.line_mut(slice, *lender)?;
+                        l.pending = sub(l.pending, item.amount, "pending")?;
+                        l.disputed = add(l.disputed, item.amount, "disputed")?;
                         l.items[idx].status = ItemStatus::Disputed;
                         l.items[idx].awaiting_delivery = awaiting;
                         self.audit.push(if awaiting {
@@ -2357,14 +2587,12 @@ impl Coordinator {
             return Err(DomainError::Precondition("JOB-T12: pause expired"));
         }
         if self.is_credits(job)? {
-            let key = format!("topup/{}/{}", job.0, j.version);
-            self.ledger.transfer(
-                key,
-                Account::User(j.borrower.0),
-                Account::EscrowWork(job_acct(job)),
-                topup,
-                "JOB-T12 reserve top-up",
-            )?;
+            self.ledger_op(LedgerOp::Reserve {
+                job: job_acct(job),
+                bucket: EscrowBucket::Work,
+                key: format!("topup/{}/{}", job.0, j.version),
+                amount: topup,
+            })?;
             let remaining_needed =
                 (0..3).any(|i| j.delivered[i] < j.max_outputs[i] && j.price[i] > 0);
             let min_price = (0..3)
@@ -2373,9 +2601,7 @@ impl Coordinator {
                 .filter(|p| *p > 0)
                 .min()
                 .unwrap_or(0);
-            if remaining_needed
-                && self.ledger.available(Account::EscrowWork(job_acct(job))) < min_price
-            {
+            if remaining_needed && self.escrow_work(job)? < min_price {
                 return Err(DomainError::Precondition(
                     "JOB-T12: escrow cannot cover one output",
                 ));
@@ -2434,37 +2660,17 @@ impl Coordinator {
                 "JOB-S12: provisional outputs pending",
             ));
         }
-        // CE-02: unspent pool relay goes back to the pool.
-        let pool_unspent = j.pool_recovery_funded - j.recovery_paid_pool;
-        let rec = self
-            .ledger
-            .available(Account::EscrowRecovery(job_acct(job)));
-        if pool_unspent > rec {
-            return Err(DomainError::Internal(
-                "pool share exceeds recovery escrow".into(),
-            ));
-        }
-        self.ledger.transfer(
-            format!("settle/{}/recovery-pool", job.0),
-            Account::EscrowRecovery(job_acct(job)),
-            Account::PoolReserve(j.pool.0),
+        // CE-02: unspent pool relay goes back to the pool; everything else to the borrower. The
+        // ledger takes both destinations from the escrow record.
+        let pool_unspent = sub(j.pool_recovery_funded, j.recovery_paid_pool, "pool relay")?;
+        self.ledger_op(LedgerOp::SettleJob {
+            job: job_acct(job),
             pool_unspent,
-            "JOB-S12 return to pool",
-        )?;
-        for (acct, tag) in [
-            (Account::EscrowWork(job_acct(job)), "work"),
-            (Account::EscrowRecovery(job_acct(job)), "recovery"),
-            (Account::OutputHold(job_acct(job)), "hold"),
-        ] {
-            let amount = self.ledger.available(acct);
-            self.ledger.transfer(
-                format!("settle/{}/{tag}", job.0),
-                acct,
-                Account::User(j.borrower.0),
-                amount,
-                "JOB-S12 return",
-            )?;
-        }
+        })
+        .map_err(|e| match e {
+            DomainError::Ledger(LedgerApiError::Invalid(m)) => DomainError::Internal(m.into()),
+            other => other,
+        })?;
         self.set_settle(job, SettleStatus::Closed, "JOB-S12")?;
         Ok(Outcome::Applied)
     }
@@ -2484,25 +2690,19 @@ impl Coordinator {
         if held == 0 {
             return Err(DomainError::Precondition("nothing held"));
         }
-        let commission = held * self.cfg.commission_bps / 10_000;
-        let to_lender = held - commission;
-        self.ledger.transfer(
-            format!("release/{:?}/{}", slice, lender.0),
-            pending_acct(slice, lender),
-            Account::User(lender.0),
+        let LedgerOutcome::Released {
             to_lender,
-            "JOB-R22 release",
-        )?;
-        self.ledger.transfer(
-            format!("commission/{:?}/{}", slice, lender.0),
-            pending_acct(slice, lender),
-            Account::Commission,
             commission,
-            "JOB-R22 commission",
-        )?;
-        let l = self.slice_mut(slice)?.lines.get_mut(&lender).unwrap();
+        } = self.ledger_op(LedgerOp::ReleaseReward {
+            line: line_ref(slice, lender),
+            key: format!("{:?}/{}", slice, lender.0),
+        })?
+        else {
+            return Err(DomainError::Internal("release outcome".into()));
+        };
+        let l = self.line_mut(slice, lender)?;
         l.held = 0;
-        l.released += held;
+        l.released = add(l.released, held, "released")?;
         for it in l.items.iter_mut().filter(|i| i.status == ItemStatus::Paid) {
             it.reward_done = true;
         }
@@ -2531,35 +2731,23 @@ impl Coordinator {
         if held == 0 {
             return Err(DomainError::Precondition("nothing held"));
         }
-        let (borrower, pool) = {
-            let j = self.job(slice.job)?;
-            (j.borrower, j.pool)
-        };
         // CE-02: each payer gets its own share back (the pool for the recovery it funded).
-        let to_pool: Amount = s.lines[&lender]
+        let to_pool = s.lines[&lender]
             .items
             .iter()
             .filter(|i| i.status == ItemStatus::Paid && !i.reward_done)
-            .map(|i| i.pool_part)
-            .sum();
-        self.ledger.transfer(
-            format!("contest/{:?}/{}/pool", slice, lender.0),
-            pending_acct(slice, lender),
-            Account::PoolReserve(pool.0),
-            to_pool,
-            "JOB-R22 contest (pool share)",
-        )?;
-        self.ledger.transfer(
-            format!("contest/{:?}/{}", slice, lender.0),
-            pending_acct(slice, lender),
-            Account::User(borrower.0),
-            held - to_pool,
-            "JOB-R22 contest",
-        )?;
-        self.job_mut(slice.job)?.recovery_contested_pool += to_pool;
-        let l = self.slice_mut(slice)?.lines.get_mut(&lender).unwrap();
+            .try_fold(0u64, |acc, i| acc.checked_add(i.pool_part))
+            .ok_or(DomainError::Overflow("pool part"))?;
+        self.ledger_op(LedgerOp::ContestReward {
+            line: line_ref(slice, lender),
+            key: format!("{:?}/{}", slice, lender.0),
+            pool_part: to_pool,
+        })?;
+        let j = self.job_mut(slice.job)?;
+        j.recovery_contested_pool = add(j.recovery_contested_pool, to_pool, "contested pool")?;
+        let l = self.line_mut(slice, lender)?;
         l.held = 0;
-        l.contested += held;
+        l.contested = add(l.contested, held, "contested")?;
         for it in l.items.iter_mut().filter(|i| i.status == ItemStatus::Paid) {
             it.reward_done = true;
         }
@@ -2573,7 +2761,7 @@ impl Coordinator {
 
     /// JOB-R20: applies every automatic transition that is due. Each stays atomic; reconciliation
     /// is idempotent.
-    fn reconcile(&mut self) -> R<Outcome> {
+    fn reconcile(&mut self, ctx: &AuthContext) -> R<Outcome> {
         let mut changed = false;
         for _ in 0..64 {
             let mut todo: Vec<Command> = Vec::new();
@@ -2681,11 +2869,16 @@ impl Coordinator {
             }
             let mut progressed = false;
             for cmd in todo {
-                match self.apply(&cmd) {
+                match self.execute(ctx, &cmd) {
                     Ok(Outcome::Applied) => progressed = true,
                     // Reconciliation never swallows an internal error; it would silently block the
                     // job (CE-04).
                     Err(DomainError::Internal(m)) => {
+                        return Err(DomainError::Internal(format!("reconcile {cmd:?}: {m}")))
+                    }
+                    // A due transition the reconciler may not run is a permission matrix bug: it
+                    // would stay due forever.
+                    Err(DomainError::Unauthorized(m)) => {
                         return Err(DomainError::Internal(format!("reconcile {cmd:?}: {m}")))
                     }
                     _ => {}

@@ -1,14 +1,21 @@
 [workspace]
-members = ["crates/ledger", "crates/domain", "crates/protocol", "crates/simulation"]
+members = [
+    "crates/identity",
+    "crates/ledger",
+    "crates/domain",
+    "crates/protocol",
+    "crates/simulation",
+]
 resolver = "2"
 
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-rust-version = "1.75"
+rust-version = "1.87"
 
 [workspace.dependencies]
+more-identity = { path = "crates/identity" }
 gpu-ledger = { path = "crates/ledger" }
 gpu-domain = { path = "crates/domain" }
 gpu-protocol = { path = "crates/protocol" }
@@ -25,6 +32,7 @@ license.workspace = true
 publish = false
 
 [dev-dependencies]
+more-identity = { workspace = true, features = ["test-support"] }
 gpu-ledger.workspace = true
 gpu-domain.workspace = true
 gpu-protocol.workspace = true
@@ -45,3 +53,7 @@ path = "tests/regressions/main.rs"
 
 [profile.test]
 opt-level = 2
+
+[[test]]
+name = "security"
+path = "tests/security/main.rs"

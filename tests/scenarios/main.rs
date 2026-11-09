@@ -59,7 +59,7 @@ impl T {
     }
 
     fn bal(&self, a: Account) -> i128 {
-        self.c().ledger.balance(a)
+        self.sim.balance(a)
     }
 
     fn attempt(&self, j: JobId) -> u32 {
@@ -71,10 +71,11 @@ impl T {
         if self.job(j).exec == ExecStatus::Queued {
             self.ok(Command::Reserve { job: j });
         }
-        let n = self.job(j).layout.len();
+        let n = layout_of(j).len();
         self.ok(Command::Place {
             job: j,
             lenders: L[..n].to_vec(),
+            layout: layout_of(j),
             recovery_estimate: est,
             witness: WITNESS,
             expected_version: None,
@@ -117,6 +118,9 @@ impl T {
                 lender: *l,
                 wt: GEN,
                 upto: att.produced[GEN.idx()],
+                digest: self
+                    .c()
+                    .receipt_digest(j, a, *l, GEN, att.produced[GEN.idx()]),
             });
         }
     }
@@ -270,6 +274,15 @@ impl T {
 fn f01_partial_transition_leaves_no_trace() {
     // A two-entry transition whose second entry fails writes nothing (JOB-R01).
     let mut t = T::new();
+    t.sim.register(AccountId(3));
+    t.ok(Command::SetRights {
+        pool: CREDIT_POOL,
+        account: AccountId(3),
+        rights: Rights {
+            borrow: true,
+            ..Rights::NONE
+        },
+    });
     t.ok(Command::Issue {
         id: 50,
         to: IssueTarget::User(AccountId(3)),
@@ -279,9 +292,10 @@ fn f01_partial_transition_leaves_no_trace() {
         job: JobId(4),
         borrower: AccountId(3),
         pool: CREDIT_POOL,
-        layout: vec![3, 2, 1],
-        price: [6, 12, 3],
-        max_outputs: [4, 12, 3],
+        model: ModelId(1),
+        outputs: [4, 12, 3],
+        max_budget: 1_000,
+        mandate: mandate(JobId(4), CREDIT_POOL, AccountId(3), 1_000),
     });
     // Enough for the work part (177), not for the recovery budget (17).
     let e = t.err(Command::Reserve { job: JobId(4) });
@@ -298,6 +312,7 @@ fn f02_redelivered_assignments_are_harmless() {
     let place = Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 0,
         witness: WITNESS,
         expected_version: None,
@@ -655,6 +670,7 @@ fn f13_scheduler_restart_replays_nothing() {
     let place = Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 0,
         witness: WITNESS,
         expected_version: None,
@@ -791,6 +807,7 @@ fn f17_receipts_fabricated_after_revocation() {
         lender: L[0],
         wt: GEN,
         upto: 4,
+        digest: t.c().receipt_digest(J1, 1, L[0], GEN, 4),
     });
     let ev = |p| ClaimItem::Contribution {
         output: OutputId {
@@ -902,6 +919,7 @@ fn f19_resume_after_pause_keeps_intent() {
     t.ok(Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 2,
         witness: WITNESS,
         expected_version: None,
@@ -1115,6 +1133,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
         t.err(Command::Place {
             job: J1,
             lenders: L.to_vec(),
+            layout: layout_of(J1),
             recovery_estimate: 1,
             witness: WITNESS,
             expected_version: None
@@ -1136,6 +1155,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
     t.err(Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 1,
         witness: WITNESS,
         expected_version: None,
@@ -1196,6 +1216,7 @@ fn r21_rounding_never_exceeds_price() {
     t.ok(Command::Place {
         job: j2,
         lenders: L[..2].to_vec(),
+        layout: layout_of(j2),
         recovery_estimate: 0,
         witness: WITNESS,
         expected_version: None,
@@ -1266,7 +1287,7 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
         SettleStatus::Closed,
         "job financially closed"
     );
-    let circulating = t.c().ledger.circulating();
+    let circulating = t.sim.ledger().circulating();
     let borrower = t.bal(Account::User(1));
     // Fraud found: lender 11's line is contested within the window.
     t.ok(Command::ContestReward {
@@ -1278,7 +1299,11 @@ fn r22_contest_after_job_closed_refunds_from_held_rewards() {
         borrower + 8,
         "refund comes from held rewards"
     );
-    assert_eq!(t.c().ledger.circulating(), circulating, "no credit created");
+    assert_eq!(
+        t.sim.ledger().circulating(),
+        circulating,
+        "no credit created"
+    );
     // After the window: release is final, no more contest.
     t.ok(Command::Tick { dt: 48 * 3600 });
     t.ok(Command::ReleaseReward {
@@ -1343,7 +1368,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
     );
     assert_eq!(t.line(s, L[2]).paid, 5 * 2);
     // The client contests too late: free retransmission, no refund.
-    let before = t.c().ledger.entries().len();
+    let before = t.sim.ledger().entries().len();
     t.ok(Command::ConfirmDelivery {
         job: J1,
         wt: GEN,
@@ -1351,7 +1376,7 @@ fn f24_withheld_acks_with_witness_bill_provisionally_and_pay_lenders() {
         digest: t.c().frame_digest(J1, GEN, 1),
     });
     assert_eq!(
-        t.c().ledger.entries().len(),
+        t.sim.ledger().entries().len(),
         before,
         "replay moves no credits"
     );
@@ -1367,6 +1392,7 @@ fn f25_lender_cannot_attest_its_own_delivery() {
         t.err(Command::Place {
             job: J1,
             lenders: L.to_vec(),
+            layout: layout_of(J1),
             recovery_estimate: 0,
             witness: L[2],
             expected_version: None,
@@ -1424,6 +1450,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
     t.ok(Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 2,
         witness: WITNESS,
         expected_version: None,
@@ -1486,9 +1513,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
     assert_eq!(t.line(s, L[0]).disputed, 4 * 6);
     assert!(
         t.sim
-            .coord
-            .clone()
-            .apply(&Command::Arbitrate {
+            .try_on_copy(&Command::Arbitrate {
                 slice: s,
                 lender: L[0],
                 pay: true,
@@ -1530,6 +1555,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
     t.ok(Command::Place {
         job: J1,
         lenders: L.to_vec(),
+        layout: layout_of(J1),
         recovery_estimate: 2,
         witness: WITNESS,
         expected_version: None,
@@ -1680,7 +1706,7 @@ fn f31_contest_after_window_replays_but_never_refunds() {
     t.ok(Command::Tick { dt: 24 * 3600 });
     t.ok(Command::Reconcile);
     assert_eq!(t.charge(J1, 3).unwrap().basis, ChargeBasis::WindowExpired);
-    let entries = t.c().ledger.entries().len();
+    let entries = t.sim.ledger().entries().len();
     t.ok(Command::ConfirmDelivery {
         job: J1,
         wt: GEN,
@@ -1689,7 +1715,7 @@ fn f31_contest_after_window_replays_but_never_refunds() {
     });
     // Window over: plain retransmission, no contest, no ledger entry.
     assert!(t.charge(J1, 3).unwrap().contest.is_none());
-    assert_eq!(t.c().ledger.entries().len(), entries);
+    assert_eq!(t.sim.ledger().entries().len(), entries);
     t.ok(Command::WitnessLost {
         job: J1,
         attempt: 1,
@@ -2056,6 +2082,7 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
     t.ok(Command::Place {
         job: j2,
         lenders: vec![L[2], L[0]],
+        layout: layout_of(j2),
         recovery_estimate: 0,
         witness: WITNESS,
         expected_version: None,

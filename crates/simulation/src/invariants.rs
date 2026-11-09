@@ -76,7 +76,7 @@ fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u
     let mut h = fnv_words(&[
         u64::from(job.0),
         j.stream,
-        u64::from(j.model),
+        u64::from(j.model.0),
         wt.idx() as u64,
     ]);
     for pos in 0..upto {
@@ -90,11 +90,14 @@ fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u
     h
 }
 
-pub fn check_state(c: &Coordinator) -> Vec<Violation> {
+pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violation> {
     let mut out = Vec::new();
+    let Ok(ledger) = c.audit_ledger(auditor) else {
+        return vec![v("TEST-P02", "the auditor cannot read the ledger")];
+    };
 
     // TEST-P02: ledger invariants (LEDGER-001 to 006).
-    for lv in c.ledger.check_invariants() {
+    for lv in ledger.check_invariants() {
         out.push(v("TEST-P02", format!("{lv:?}")));
     }
 
@@ -358,7 +361,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                     format!("{:?}/{lender:?}: final with pending/disputed", s.id),
                 ));
             }
-            let bal = c.ledger.balance(line_acct(s.id, *lender));
+            let bal = ledger.balance(line_acct(s.id, *lender));
             if bal != i128::from(l.pending + l.disputed) {
                 out.push(v(
                     "TEST-P12",
@@ -368,7 +371,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                     ),
                 ));
             }
-            let held = c.ledger.balance(pending_acct(s.id, *lender));
+            let held = ledger.balance(pending_acct(s.id, *lender));
             if held != i128::from(l.held) {
                 out.push(v(
                     "TEST-P12",
@@ -432,14 +435,10 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                 Account::EscrowRecovery(j.id.0),
                 Account::OutputHold(j.id.0),
             ] {
-                if c.ledger.balance(acct) != 0 {
+                if ledger.balance(acct) != 0 {
                     out.push(v(
                         "TEST-P13",
-                        format!(
-                            "{:?} closed with {acct:?} = {}",
-                            j.id,
-                            c.ledger.balance(acct)
-                        ),
+                        format!("{:?} closed with {acct:?} = {}", j.id, ledger.balance(acct)),
                     ));
                 }
             }
@@ -474,8 +473,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                 ));
             }
         }
-        let inflow: Amount = c
-            .ledger
+        let inflow: Amount = ledger
             .entries()
             .iter()
             .filter(|e| {
@@ -498,7 +496,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
     for j in c.jobs.values() {
         let sum_entries =
             |pred: &dyn Fn(&gpu_domain::Account, &gpu_domain::Account) -> bool| -> Amount {
-                c.ledger
+                ledger
                     .entries()
                     .iter()
                     .filter(|e| pred(&e.from, &e.to))
@@ -579,7 +577,7 @@ pub fn check_state(c: &Coordinator) -> Vec<Violation> {
                         j.price[i] * Amount::from(a.produced[i].saturating_sub(j.delivered[i]))
                     })
                     .sum();
-                let escrow = c.ledger.balance(Account::EscrowWork(j.id.0));
+                let escrow = ledger.balance(Account::EscrowWork(j.id.0));
                 if i128::from(window) > escrow {
                     out.push(v(
                         "TEST-P18",
@@ -1030,11 +1028,28 @@ pub fn check_fairness(
 /// Properties of one step: `before`, the command, its result and `after`.
 pub fn check_step(
     before: &Coordinator,
+    ctx: &AuthContext,
     cmd: &Command,
     result: &Result<Outcome, DomainError>,
     after: &Coordinator,
+    auditor: &ServiceCredential,
 ) -> Vec<Violation> {
     let mut out = Vec::new();
+    // TEST-P29: an accepted command came from a principal the matrix allows; an allowed principal
+    // is never refused as unauthorized. Combined with TEST-P16 (a refusal changes nothing), an
+    // unauthorized sender never changes state, credits, positions, leases or the audit log.
+    let allowed = crate::authz_oracle::allowed(before, ctx, cmd);
+    match result {
+        Ok(_) if !allowed => out.push(v(
+            "TEST-P29",
+            format!("{cmd:?} accepted from {:?}", ctx.principal()),
+        )),
+        Err(DomainError::Unauthorized(why)) if allowed => out.push(v(
+            "TEST-P29",
+            format!("{cmd:?} from {:?} refused: {why}", ctx.principal()),
+        )),
+        _ => {}
+    }
     match result {
         // JOB-R01: a rejection leaves no trace.
         Err(e) => {
@@ -1089,7 +1104,8 @@ pub fn check_step(
             }
         }
     }
-    if matches!(cmd, Command::Reconcile) {
+    // Only a reconciliation that actually ran (a refused one changes nothing, TEST-P16).
+    if matches!(cmd, Command::Reconcile) && result.is_ok() {
         for (o, ch) in &after.charges {
             if !ch.definitive && ch.contest.is_some_and(|k| after.now >= k.deadline) {
                 out.push(v(
@@ -1149,10 +1165,12 @@ pub fn check_step(
         }
     }
     // The ledger is append-only (LEDGER-002).
-    let n = before.ledger.entries().len();
-    if after.ledger.entries().len() < n
-        || after.ledger.entries()[..n] != before.ledger.entries()[..]
-    {
+    let (Ok(lb), Ok(la)) = (before.audit_ledger(auditor), after.audit_ledger(auditor)) else {
+        out.push(v("TEST-P02", "the auditor cannot read the ledger"));
+        return out;
+    };
+    let n = lb.entries().len();
+    if la.entries().len() < n || la.entries()[..n] != lb.entries()[..] {
         out.push(v(
             "TEST-P02",
             format!("ledger history rewritten by {cmd:?}"),

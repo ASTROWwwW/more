@@ -1,6 +1,6 @@
 use crate::ids::{JobId, SliceId};
 use crate::model::{ExecStatus, SliceStatus};
-use gpu_ledger::LedgerError;
+use gpu_ledger::LedgerApiError;
 use std::fmt;
 
 /// A rejected command. A rejection never changes state (JOB-R01).
@@ -39,13 +39,21 @@ pub enum DomainError {
     /// Lease expired (JOB-R31).
     LeaseExpired,
     Precondition(&'static str),
-    Ledger(LedgerError),
+    /// The caller may not send this command for this resource (SEC-001, SEC-003). Checked before
+    /// any mutation.
+    Unauthorized(&'static str),
+    /// Malformed or out-of-bounds input.
+    InvalidInput(&'static str),
+    /// An amount, position or time would leave its range (SAFE-001).
+    Overflow(&'static str),
+    /// The ledger refused the operation.
+    Ledger(LedgerApiError),
     /// An internal invariant would break: a model bug, never expected.
     Internal(String),
 }
 
-impl From<LedgerError> for DomainError {
-    fn from(e: LedgerError) -> Self {
+impl From<LedgerApiError> for DomainError {
+    fn from(e: LedgerApiError) -> Self {
         DomainError::Ledger(e)
     }
 }
@@ -57,3 +65,30 @@ impl fmt::Display for DomainError {
 }
 
 impl std::error::Error for DomainError {}
+
+impl DomainError {
+    /// Stable code for every rejection (PROTO-004).
+    pub fn code(&self) -> &'static str {
+        match self {
+            DomainError::UnknownJob(_) => "UNKNOWN_JOB",
+            DomainError::UnknownSlice(_) => "UNKNOWN_SLICE",
+            DomainError::UnknownPool => "UNKNOWN_POOL",
+            DomainError::InvalidTransition { .. } => "INVALID_TRANSITION",
+            DomainError::InvalidSliceTransition { .. } => "INVALID_SLICE_TRANSITION",
+            DomainError::VersionConflict { .. } => "VERSION_CONFLICT",
+            DomainError::StaleAttempt => "STALE_ATTEMPT",
+            DomainError::JobSettling => "JOB_SETTLING",
+            DomainError::FlowBudgetExceeded => "FLOW_BUDGET_EXCEEDED",
+            DomainError::WindowNotCovered => "WINDOW_NOT_COVERED",
+            DomainError::RecoveryBudget => "RECOVERY_BUDGET",
+            DomainError::InadmissibleProof => "INADMISSIBLE_PROOF",
+            DomainError::LeaseExpired => "LEASE_EXPIRED",
+            DomainError::Precondition(_) => "PRECONDITION_FAILED",
+            DomainError::Unauthorized(_) => "UNAUTHORIZED",
+            DomainError::InvalidInput(_) => "INVALID_INPUT",
+            DomainError::Overflow(_) => "ARITHMETIC_OVERFLOW",
+            DomainError::Ledger(e) => e.code(),
+            DomainError::Internal(_) => "INTERNAL",
+        }
+    }
+}

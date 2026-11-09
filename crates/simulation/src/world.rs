@@ -5,7 +5,13 @@
 
 use proptest::prelude::*;
 
+use std::sync::Arc;
+
 use gpu_domain::*;
+use gpu_ledger::{LedgerLimits, LedgerService};
+use more_identity::{
+    assume_account, mandate_message, IdentityAuthority, KeyDirectory, ServiceRole, UserKey,
+};
 
 use crate::invariants::{check_state, check_step, Violation};
 
@@ -16,20 +22,112 @@ pub const LENDERS: [AccountId; 4] = [AccountId(10), AccountId(11), AccountId(12)
 pub const JOBS: [JobId; 3] = [JobId(1), JobId(2), JobId(3)];
 /// Delivery witness (relay), independent of lenders and borrowers (JOB-R26).
 pub const WITNESS: AccountId = AccountId(90);
+/// Admin of both pools: members, catalog, arbitration, pool relay.
+pub const POOL_ADMIN: AccountId = AccountId(80);
+/// An authenticated account with no right anywhere.
+pub const STRANGER: AccountId = AccountId(66);
 
-/// Setup commands: pools, issuance, job submissions.
+/// Catalog of the simulated pools: (pool, model, spec).
+pub fn catalog() -> [(PoolId, ModelId, ModelSpec); 3] {
+    [
+        // Job 1's model: 6 layers, divisible prices.
+        (
+            CREDIT_POOL,
+            ModelId(1),
+            ModelSpec {
+                layers: 6,
+                price: [6, 12, 3],
+                max_outputs: [4, 12, 3],
+            },
+        ),
+        // Job 2's model: prices with rounding (7 / 2).
+        (
+            CREDIT_POOL,
+            ModelId(2),
+            ModelSpec {
+                layers: 4,
+                price: [4, 7, 2],
+                max_outputs: [2, 8, 2],
+            },
+        ),
+        // Job 3's model, in the free pool.
+        (
+            FREE_POOL,
+            ModelId(3),
+            ModelSpec {
+                layers: 2,
+                price: [0; 3],
+                max_outputs: [1, 6, 1],
+            },
+        ),
+    ]
+}
+
+/// Layout the simulated scheduler uses for each job.
+pub fn layout_of(job: JobId) -> Vec<u32> {
+    match job.0 {
+        1 => vec![3, 2, 1],
+        2 => vec![2, 2],
+        _ => vec![1, 1],
+    }
+}
+
+/// Deterministic signing key of a simulated account.
+pub fn user_key(a: AccountId) -> UserKey {
+    let mut seed = [0x5au8; 32];
+    seed[..4].copy_from_slice(&a.0.to_le_bytes());
+    UserKey::from_seed(seed)
+}
+
+/// Mandate signed by `borrower` for `job` (checked by the ledger).
+pub fn mandate(job: JobId, pool: PoolId, borrower: AccountId, max_budget: Amount) -> [u8; 64] {
+    user_key(borrower).sign(&mandate_message(job.0, pool.0, borrower.0, max_budget))
+}
+
+/// Setup commands: pools, members, catalog, issuance, job submissions.
 pub fn setup_commands() -> Vec<Command> {
-    vec![
+    let mut v = vec![
         Command::CreatePool {
             pool: CREDIT_POOL,
             mode: PoolMode::Credits,
+            access: PoolAccess::Private,
+            admin: POOL_ADMIN,
         },
         Command::CreatePool {
             pool: FREE_POOL,
             mode: PoolMode::FreeShare {
                 quota_per_borrower: 1,
             },
+            access: PoolAccess::Private,
+            admin: POOL_ADMIN,
         },
+    ];
+    for pool in [CREDIT_POOL, FREE_POOL] {
+        let mut grant = |account, borrow, lend, witness| {
+            v.push(Command::SetRights {
+                pool,
+                account,
+                rights: Rights {
+                    borrow,
+                    lend,
+                    witness,
+                },
+            })
+        };
+        for b in BORROWERS {
+            grant(b, true, false, false);
+        }
+        for l in LENDERS {
+            // LENDERS[0] may also witness, so placing it as the witness of its own attempt reaches
+            // the independence check (JOB-R26).
+            grant(l, false, true, l == LENDERS[0]);
+        }
+        grant(WITNESS, false, false, true);
+    }
+    for (pool, model, spec) in catalog() {
+        v.push(Command::RegisterModel { pool, model, spec });
+    }
+    v.extend([
         Command::Issue {
             id: 1,
             to: IssueTarget::User(BORROWERS[0]),
@@ -45,39 +143,49 @@ pub fn setup_commands() -> Vec<Command> {
             to: IssueTarget::Pool(CREDIT_POOL),
             amount: 300,
         },
-        // Job 1: 3 stages (3, 2, 1 layers), divisible prices.
-        Command::Submit {
-            job: JOBS[0],
-            borrower: BORROWERS[0],
-            pool: CREDIT_POOL,
-            layout: vec![3, 2, 1],
-            price: [6, 12, 3],
-            max_outputs: [4, 12, 3],
-        },
-        // Job 2: 2 stages, price with rounding (7 / 2).
-        Command::Submit {
-            job: JOBS[1],
-            borrower: BORROWERS[1],
-            pool: CREDIT_POOL,
-            layout: vec![2, 2],
-            price: [4, 7, 2],
-            max_outputs: [2, 8, 2],
-        },
-        // Job 3: free pool.
-        Command::Submit {
-            job: JOBS[2],
-            borrower: BORROWERS[0],
-            pool: FREE_POOL,
-            layout: vec![1, 1],
-            price: [5, 5, 5],
-            max_outputs: [1, 6, 1],
-        },
-    ]
+    ]);
+    for (job, borrower, pool, model, outputs, budget) in [
+        (
+            JOBS[0],
+            BORROWERS[0],
+            CREDIT_POOL,
+            ModelId(1),
+            [4, 12, 3],
+            1_000,
+        ),
+        (
+            JOBS[1],
+            BORROWERS[1],
+            CREDIT_POOL,
+            ModelId(2),
+            [2, 8, 2],
+            1_000,
+        ),
+        (JOBS[2], BORROWERS[0], FREE_POOL, ModelId(3), [1, 6, 1], 0),
+    ] {
+        v.push(Command::Submit {
+            job,
+            borrower,
+            pool,
+            model,
+            outputs,
+            max_budget: budget,
+            mandate: mandate(job, pool, borrower, budget),
+        });
+    }
+    v
 }
 
 /// Abstract operation. The `u8` fields are selectors taken modulo what exists.
 #[derive(Clone, Debug)]
 pub enum Op {
+    /// A realistic command sent by a random principal instead of its honest sender: borrower,
+    /// lender, witness, pool admin, stranger or any service (TEST-P29).
+    Impersonate {
+        job: u8,
+        sel: u8,
+        sender: u8,
+    },
     Tick(u8),
     Reserve(u8),
     Place {
@@ -317,6 +425,7 @@ pub fn op_strategy() -> impl Strategy<Value = Op> {
         1 => b().prop_map(Op::ClientHeartbeat),
         1 => (b(), any::<bool>()).prop_map(|(job, prev)| Op::PurgeBuffer { job, prev }),
         1 => (b(), b(), any::<bool>()).prop_map(|(job, sel, honest)| Op::Supplement { job, sel, honest }),
+        4 => (b(), b(), b()).prop_map(|(job, sel, sender)| Op::Impersonate { job, sel, sender }),
     ]
 }
 
@@ -329,8 +438,60 @@ fn wt_of(sel: u8) -> WorkType {
 }
 
 /// Simulation: coordinator state, history, violations found.
+/// Identities of the simulated world: one credential per service, one key per account.
+pub struct SimIdentity {
+    pub keys: KeyDirectory,
+    pub clock: ServiceCredential,
+    pub treasury: ServiceCredential,
+    pub platform: ServiceCredential,
+    pub scheduler: ServiceCredential,
+    pub reconciler: ServiceCredential,
+    pub auditor: ServiceCredential,
+    /// Valid credential with no right in the domain, for compromise tests.
+    pub delivery: ServiceCredential,
+    authority: IdentityAuthority,
+}
+
+impl SimIdentity {
+    fn new() -> (Self, ServiceCredential) {
+        let mut authority = IdentityAuthority::new([0x42; 32]);
+        let keys = KeyDirectory::new();
+        for a in BORROWERS
+            .iter()
+            .chain(&LENDERS)
+            .chain(&[WITNESS, POOL_ADMIN, STRANGER])
+        {
+            // Accounts are distinct constants: registration cannot collide.
+            let _ = keys.register(a.0, user_key(*a).public());
+        }
+        let orchestrator = authority.issue(ServiceRole::Orchestrator);
+        let ids = SimIdentity {
+            keys,
+            clock: authority.issue(ServiceRole::Clock),
+            treasury: authority.issue(ServiceRole::Treasury),
+            platform: authority.issue(ServiceRole::PlatformAdmin),
+            scheduler: authority.issue(ServiceRole::Scheduler),
+            reconciler: authority.issue(ServiceRole::Reconciler),
+            auditor: authority.issue(ServiceRole::Auditor),
+            delivery: authority.issue(ServiceRole::Delivery),
+            authority,
+        };
+        (ids, orchestrator)
+    }
+
+    /// Credential of a service that is not part of the standard set (compromise tests).
+    pub fn verifier_ledger(&self) -> LedgerService {
+        LedgerService::new(
+            self.authority.verifier(),
+            self.keys.clone(),
+            LedgerLimits::default(),
+        )
+    }
+}
+
 pub struct Sim {
     pub coord: Coordinator,
+    pub ids: Arc<SimIdentity>,
     pub history: Vec<Command>,
     pub violations: Vec<Violation>,
     pub applied: usize,
@@ -359,8 +520,12 @@ impl Default for Sim {
 
 impl Sim {
     pub fn new(cfg: Config) -> Self {
+        let (ids, orchestrator) = SimIdentity::new();
+        let coord = Coordinator::new(cfg, ids.verifier_ledger(), orchestrator)
+            .expect("valid simulation config");
         let mut sim = Sim {
-            coord: Coordinator::new(cfg),
+            coord,
+            ids: Arc::new(ids),
             history: Vec::new(),
             violations: Vec::new(),
             applied: 0,
@@ -374,10 +539,152 @@ impl Sim {
         sim
     }
 
-    /// Applies a concrete command and checks every property.
+    /// A scratch copy of `coord` with the same identities, for look-ahead.
+    fn scratch(&self, coord: Coordinator) -> Sim {
+        Sim {
+            coord,
+            ids: Arc::clone(&self.ids),
+            history: Vec::new(),
+            violations: Vec::new(),
+            applied: 0,
+            refused: 0,
+            structural_claims: Vec::new(),
+            refusal_counts: Default::default(),
+        }
+    }
+
+    /// Runs a command on a copy, as its honest sender, without checks.
+    pub fn try_on_copy(&self, cmd: &Command) -> Result<Outcome, DomainError> {
+        let mut c = self.coord.clone();
+        c.execute(&self.actor(cmd), cmd)
+    }
+
+    fn quiet(&mut self, cmd: &Command) {
+        let ctx = self.actor(cmd);
+        let _ = self.coord.execute(&ctx, cmd);
+    }
+
+    /// Registers the key of an account that is not in the default set.
+    pub fn register(&self, a: AccountId) {
+        let _ = self.ids.keys.register(a.0, user_key(a).public());
+    }
+
+    /// Full read access to the ledger (Auditor credential).
+    pub fn ledger(&self) -> &Ledger {
+        self.coord
+            .audit_ledger(&self.ids.auditor)
+            .expect("the auditor reads the ledger")
+    }
+
+    pub fn balance(&self, a: Account) -> i128 {
+        self.ledger().balance(a)
+    }
+
+    /// Service context.
+    pub fn as_service(&self, role: ServiceRole) -> AuthContext {
+        let ids = &self.ids;
+        let cred = match role {
+            ServiceRole::Clock => &ids.clock,
+            ServiceRole::Treasury => &ids.treasury,
+            ServiceRole::PlatformAdmin => &ids.platform,
+            ServiceRole::Scheduler => &ids.scheduler,
+            ServiceRole::Reconciler => &ids.reconciler,
+            ServiceRole::Auditor => &ids.auditor,
+            ServiceRole::Delivery | ServiceRole::Orchestrator => &ids.delivery,
+        };
+        AuthContext::service(cred.clone())
+    }
+
+    /// The honest sender of `cmd` in the current state: the borrower of the job, the lender of the
+    /// attempt, the assigned witness, the right service. Adversarial operations pick other
+    /// senders explicitly.
+    pub fn actor(&self, cmd: &Command) -> AuthContext {
+        use Command::*;
+        let c = &self.coord;
+        let svc = |r| self.as_service(r);
+        let acct = |a: AccountId| assume_account(a.0);
+        let borrower = |job: &JobId| c.jobs.get(job).map(|j| j.borrower);
+        let attempt = |job: &JobId, n: u32| c.jobs.get(job).and_then(|j| j.attempts.get(&n));
+        match cmd {
+            Tick { .. } => svc(ServiceRole::Clock),
+            Issue { .. } => svc(ServiceRole::Treasury),
+            CreatePool { .. } => svc(ServiceRole::PlatformAdmin),
+            SetRights { .. } | RegisterModel { .. } | FundRecovery { .. } => acct(POOL_ADMIN),
+            Arbitrate { pay: true, .. } => acct(POOL_ADMIN),
+            JoinPool { account, .. } => acct(*account),
+            Submit { borrower: b, .. } => acct(*b),
+            Place { .. } | Finish { .. } | PlacementFailed { .. } => svc(ServiceRole::Scheduler),
+            Pause { reason, job, .. } => match reason {
+                PauseReason::Requested => borrower(job).map_or(svc(ServiceRole::Scheduler), acct),
+                PauseReason::ClientSilent => svc(ServiceRole::Reconciler),
+                _ => svc(ServiceRole::Scheduler),
+            },
+            Heartbeat { job, attempt: n }
+            | AttemptReady {
+                job, attempt: n, ..
+            } => match attempt(job, *n).and_then(|a| a.lenders.first()) {
+                Some(l) => acct(*l),
+                None => svc(ServiceRole::Scheduler),
+            },
+            Produce {
+                job, attempt: n, ..
+            } => match attempt(job, *n).and_then(|a| a.output_node()) {
+                Some(l) => acct(l),
+                None => svc(ServiceRole::Scheduler),
+            },
+            Ack { job, .. }
+            | ConfirmDelivery { job, .. }
+            | ClientHeartbeat { job }
+            | Resume { job, .. }
+            | Cancel { job, .. } => borrower(job).map_or(svc(ServiceRole::Scheduler), acct),
+            ContestReward { slice, .. } => {
+                borrower(&slice.job).map_or(svc(ServiceRole::Scheduler), acct)
+            }
+            Deliver { witness, .. } | WitnessCommit { witness, .. } => acct(*witness),
+            WitnessLost { job, attempt: n } | PurgeBuffer { job, attempt: n } => {
+                match attempt(job, *n) {
+                    Some(a) => acct(a.witness),
+                    None => svc(ServiceRole::Reconciler),
+                }
+            }
+            CommitReceipts {
+                job,
+                attempt: n,
+                lender,
+                ..
+            } => match attempt(job, *n)
+                .and_then(|a| a.stage_of(*lender).and_then(|st| a.recipient_of(st)))
+            {
+                Some(r) => acct(r),
+                None => acct(*lender),
+            },
+            Claim { lender, .. } | SupplementEvidence { lender, .. } => acct(*lender),
+            Arbitrate { .. } | ReleaseReward { .. } | Reconcile => svc(ServiceRole::Reconciler),
+            Reserve { .. }
+            | RejectQueued { .. }
+            | CloseSlice { .. }
+            | Evaluate { .. }
+            | NodeLost { .. }
+            | RecoveryTimeout { .. }
+            | CompleteSettling { .. }
+            | Settle { .. }
+            | ExpirePause { .. }
+            | ExpireDeliveryWindow { .. }
+            | ResolveContests { .. }
+            | Fail { .. } => svc(ServiceRole::Scheduler),
+        }
+    }
+
+    /// Applies a concrete command, sent by its honest sender, and checks every property.
     pub fn exec(&mut self, cmd: Command) -> Result<Outcome, DomainError> {
+        let ctx = self.actor(&cmd);
+        self.exec_as(&ctx, cmd)
+    }
+
+    /// Applies a command sent by `ctx` and checks every property, including TEST-P29.
+    pub fn exec_as(&mut self, ctx: &AuthContext, cmd: Command) -> Result<Outcome, DomainError> {
         let before = self.coord.clone();
-        let res = self.coord.apply(&cmd);
+        let res = self.coord.execute(ctx, &cmd);
         if let (
             Ok(Outcome::Applied),
             Command::Claim {
@@ -389,8 +696,9 @@ impl Sim {
         {
             self.record_claims(&before, *slice, *lender, items);
         }
-        let mut vs = check_step(&before, &cmd, &res, &self.coord);
-        vs.extend(check_state(&self.coord));
+        let auditor = &self.ids.auditor;
+        let mut vs = check_step(&before, ctx, &cmd, &res, &self.coord, auditor);
+        vs.extend(check_state(&self.coord, auditor));
         for v in vs {
             if !self.violations.contains(&v) {
                 self.violations.push(v);
@@ -416,8 +724,7 @@ impl Sim {
         lender: AccountId,
         items: &[ClaimItem],
     ) {
-        let j = &c.jobs[&slice.job];
-        let a = &j.attempts[&slice.attempt];
+        let a = &c.jobs[&slice.job].attempts[&slice.attempt];
         for it in items {
             if let ClaimItem::Contribution { output, stage, .. } = it {
                 let st = *stage as usize;
@@ -426,7 +733,9 @@ impl Sim {
                 {
                     continue;
                 }
-                let (ls, le) = j.layer_range(st).unwrap();
+                let Some((ls, le)) = a.layer_range(st) else {
+                    continue;
+                };
                 self.structural_claims.push((
                     slice,
                     lender,
@@ -464,6 +773,8 @@ impl Sim {
     pub fn resolve(&self, op: &Op) -> Vec<Command> {
         let c = &self.coord;
         match *op {
+            // Needs a sender other than the honest one: see `run_op`.
+            Op::Impersonate { job, sel, .. } => self.impersonated(job, sel).into_iter().collect(),
             Op::Tick(s) => {
                 // Mostly small steps, sometimes a jump past the deadlines.
                 let dt = match s % 8 {
@@ -478,7 +789,7 @@ impl Sim {
             Op::Place { job, rot, est } => {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
-                let lenders = (0..j.layout.len())
+                let lenders = (0..layout_of(id).len())
                     .map(|k| LENDERS[(k + rot as usize) % LENDERS.len()])
                     .collect();
                 let recovery_estimate = if j.intent == Intent::Resume {
@@ -495,6 +806,7 @@ impl Sim {
                 vec![Command::Place {
                     job: id,
                     lenders,
+                    layout: layout_of(id),
                     recovery_estimate,
                     witness,
                     expected_version: None,
@@ -571,6 +883,7 @@ impl Sim {
                     lender,
                     wt,
                     upto: a.produced[wt.idx()],
+                    digest: c.receipt_digest(id, attempt, lender, wt, a.produced[wt.idx()]),
                 }]
             }
             Op::Claim {
@@ -926,27 +1239,20 @@ impl Sim {
                         lender: *l,
                         wt,
                         upto: a.produced[t],
+                        digest: c.receipt_digest(id, j.attempt, *l, wt, a.produced[t]),
                     });
                 }
                 // Claims are computed on the current state, so target every bound output ahead of
                 // the attestation.
-                let mut tmp = Sim {
-                    coord: c.clone(),
-                    history: Vec::new(),
-                    violations: Vec::new(),
-                    applied: 0,
-                    refused: 0,
-                    structural_claims: Vec::new(),
-                    refusal_counts: Default::default(),
-                };
+                let mut tmp = self.scratch(c.clone());
                 for cmd in &v {
-                    let _ = tmp.coord.apply(cmd);
+                    tmp.quiet(cmd);
                 }
                 for k in 0..a.lenders.len() as u8 {
                     if let Some(cl) =
                         tmp.honest_claim_with(open, sel.wrapping_add(k), Evidence::Committed)
                     {
-                        let _ = tmp.coord.apply(&cl);
+                        tmp.quiet(&cl);
                         v.push(cl);
                     }
                 }
@@ -1017,6 +1323,7 @@ impl Sim {
                     Command::Place {
                         job: id,
                         lenders,
+                        layout: layout_of(id),
                         recovery_estimate: 0,
                         witness: WITNESS,
                         expected_version: None,
@@ -1344,7 +1651,7 @@ impl Sim {
         match j.exec {
             ExecStatus::Queued => vec![Command::Reserve { job: id }],
             ExecStatus::Reserved | ExecStatus::Recovering => {
-                let lenders = (0..j.layout.len())
+                let lenders = (0..layout_of(id).len())
                     .map(|k| LENDERS[(k + usize::from(sel)) % LENDERS.len()])
                     .collect();
                 let est = if j.intent == Intent::Resume {
@@ -1356,6 +1663,7 @@ impl Sim {
                 v.push(Command::Place {
                     job: id,
                     lenders,
+                    layout: layout_of(id),
                     recovery_estimate: est,
                     witness: WITNESS,
                     expected_version: None,
@@ -1446,6 +1754,7 @@ impl Sim {
                             lender: *l,
                             wt,
                             upto: a.produced[t],
+                            digest: c.receipt_digest(id, j.attempt, *l, wt, a.produced[t]),
                         })
                         .collect(),
                     5 | 6 => open
@@ -1557,18 +1866,10 @@ impl Sim {
         if j.exec != ExecStatus::Running {
             return vec![];
         }
-        let mut tmp = Sim {
-            coord: c.clone(),
-            history: Vec::new(),
-            violations: Vec::new(),
-            applied: 0,
-            refused: 0,
-            structural_claims: Vec::new(),
-            refusal_counts: Default::default(),
-        };
+        let mut tmp = self.scratch(c.clone());
         let mut out = Vec::new();
         let mut step = |tmp: &mut Sim, cmd: Command| {
-            let _ = tmp.coord.apply(&cmd);
+            tmp.quiet(&cmd);
             out.push(cmd);
         };
         let w = c.cfg.uncommitted_window;
@@ -1591,7 +1892,7 @@ impl Sim {
                 break;
             };
             // The lender with the smallest share is the one that can reach the cap.
-            let last = (tmp.coord.jobs[&id].layout.len() - 1) as u8;
+            let last = (layout_of(id).len() - 1) as u8;
             let Some(Command::Claim {
                 slice,
                 lender,
@@ -1668,7 +1969,7 @@ impl Sim {
         let a = j.attempts.get(&slice.attempt)?;
         let stage = usize::from(sel) % a.lenders.len();
         let lender = a.lenders[stage];
-        let (ls, le) = j.layer_range(stage)?;
+        let (ls, le) = a.layer_range(stage)?;
         let staged: Vec<OutputId> = c.slices[&slice]
             .staged
             .iter()
@@ -1713,9 +2014,77 @@ impl Sim {
     }
 
     pub fn run_op(&mut self, op: &Op) {
+        if let Op::Impersonate { job, sel, sender } = *op {
+            if let Some(cmd) = self.impersonated(job, sel) {
+                let ctx = self.principal(sender);
+                let _ = self.exec_as(&ctx, cmd);
+            }
+            return;
+        }
         for cmd in self.resolve(op) {
             let _ = self.exec(cmd);
         }
+    }
+
+    /// Any principal of the simulated world.
+    pub fn principal(&self, sel: u8) -> AuthContext {
+        const SERVICES: [ServiceRole; 7] = [
+            ServiceRole::Clock,
+            ServiceRole::Treasury,
+            ServiceRole::PlatformAdmin,
+            ServiceRole::Scheduler,
+            ServiceRole::Reconciler,
+            ServiceRole::Auditor,
+            ServiceRole::Delivery,
+        ];
+        let accounts = [
+            BORROWERS[0],
+            BORROWERS[1],
+            LENDERS[0],
+            LENDERS[1],
+            LENDERS[2],
+            LENDERS[3],
+            WITNESS,
+            POOL_ADMIN,
+            STRANGER,
+        ];
+        let k = usize::from(sel) % (accounts.len() + SERVICES.len());
+        match accounts.get(k) {
+            Some(a) => assume_account(a.0),
+            None => self.as_service(SERVICES[k - accounts.len()]),
+        }
+    }
+
+    /// A command that makes sense in the current state, to be sent by someone else.
+    fn impersonated(&self, job: u8, sel: u8) -> Option<Command> {
+        let id = self.job(job);
+        let fixed = match sel % 8 {
+            0 => Some(Command::Issue {
+                id: 900 + u32::from(sel),
+                to: IssueTarget::User(STRANGER),
+                amount: 1_000,
+            }),
+            1 => Some(Command::Cancel {
+                job: id,
+                expected_version: None,
+            }),
+            2 => Some(Command::FundRecovery { job: id, amount: 5 }),
+            3 => Some(Command::SetRights {
+                pool: CREDIT_POOL,
+                account: STRANGER,
+                rights: Rights {
+                    borrow: true,
+                    lend: true,
+                    witness: true,
+                },
+            }),
+            _ => None,
+        };
+        fixed.or_else(|| {
+            self.resolve(&Op::Drive { job, sel })
+                .into_iter()
+                .find(|c| !matches!(c, Command::Tick { .. }))
+        })
     }
 
     /// Liveness (TEST-P06, TEST-P13): stop all activity, let deadlines pass and reconcile. Every
