@@ -149,6 +149,8 @@ MUTATIONS = [
      [("key.verify(message, &Signature::from_bytes(signature))\n            .map_err(|_| AuthError::BadSignature)?;", "let _ = key.verify(message, &Signature::from_bytes(signature));")]),
     ("M61", "Coordinator accepts revoked or forged service credentials", COORD,
      [(".map_err(|_| DomainError::Unauthorized(\"invalid or revoked service credential\"))?;", ".ok();")]),
+    ("M62", "Service credential accepted without checking the authority's signature", COORD,
+     [(".map_err(|_| AuthError::InvalidCredential)?;", ".ok();")]),
 ]
 
 EXTRA = {
