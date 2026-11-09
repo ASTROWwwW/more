@@ -1,0 +1,8 @@
+[package]
+name = "gpu-ledger"
+description = "Registre comptable en partie double du réseau GPU P2P (modèle en mémoire)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

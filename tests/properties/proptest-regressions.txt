@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 517575ece5175216b06d51a07d6f8dfcee20e442c84a0a920ad3a89cd22c8233 # shrinks to ops = [Fund { job: 27, amount: 0 }]
+cc eb6a7256dd7745f5d8b1cd95b249a9afa499c89299779ad7a084c05eb649ff48 # shrinks to ops = [Fund { job: 132, amount: 0 }]
+cc eaac8e0a52dbf2c5806bc5e4589460c15145f2a717bf87b51e0d69b96339e54e # shrinks to ops = [Drive { job: 202, sel: 0 }, Drive { job: 82, sel: 0 }, Drive { job: 28, sel: 0 }, Concurrent { job: 232, pair: 70 }, Drive { job: 1, sel: 0 }, Drive { job: 34, sel: 0 }, Pause(64), Drive { job: 109, sel: 0 }, Tick(0), Drive { job: 145, sel: 1 }]
+cc b9f49e5029722ddb88e7d7ae7907eb64c4c47b6cfe776df08a72471d2f5a1708 # shrinks to ops = [Drive { job: 69, sel: 0 }, Place { job: 87, rot: 0, est: 0 }, Drive { job: 78, sel: 0 }, Produce { job: 78, wt: 25, n: 15 }, Ack { job: 45, wt: 16, n: 0 }, Drive { job: 198, sel: 23 }]
+cc ec9d84e46ef69a4ecaccb998251425ca6a72ef4b58735ea466042d4c3d8edf52 # shrinks to [Drive { job: 68, sel: 0 }, Place { job: 20, rot: 0, est: 1 }, Drive { job: 128, sel: 0 }, Produce { job: 95, wt: 0, n: 25 }, DeliverAndSettle { job: 11, sel: 0 }]
+cc 22f906ae1570e9c829f07bc5d4a78dd5b00e675af40d73cffe4fd86d6b88a092 # shrinks to [Drive { job: 146, sel: 0 }, Drive { job: 65, sel: 0 }, Drive { job: 29, sel: 0 }, Drive { job: 47, sel: 150 }, Ack { job: 2, wt: 15, n: 0 }, Drive { job: 32, sel: 235 }]
+cc 05490b96754734353c9f439734f4158b41f625ff685650d89781224ec4a9b171 # shrinks to [Ready { job: 0, correct: true }, Ready { job: 0, correct: true }, Drive { job: 33, sel: 0 }, Drive { job: 139, sel: 0 }, Drive { job: 142, sel: 0 }, Drive { job: 76, sel: 0 }, Drive { job: 202, sel: 10 }, NodeLost(74), Pause(8), Pause(62), NodeLost(44), Drive { job: 33, sel: 0 }, Drive { job: 15, sel: 0 }, Drive { job: 142, sel: 223 }, Drive { job: 46, sel: 25 }, Finish(69), DoubleFault { job: 169, kind: 29 }, Drive { job: 39, sel: 0 }, Confirm { job: 100, wt: 0, sel: 37 }]
+cc 0a54446a6565e97b12a4fe7004c7437d74bbe6148cfc7c376081dfe0cd3a0edb # shrinks to [Drive { job: 24, sel: 0 }, Drive { job: 66, sel: 0 }, Drive { job: 63, sel: 0 }, Produce { job: 42, wt: 115, n: 126 }, Deliver { job: 9, wt: 43, n: 20, forged: false }, DoubleFault { job: 0, kind: 0 }, Drive { job: 204, sel: 93 }, Tick(129), Reconcile, Drive { job: 21, sel: 87 }, Drive { job: 108, sel: 28 }]
+cc 92c1e2dba2bb5b3000bacaa91da8f78b93f7063e7831a9bfadbb09b5d5c13830 # shrinks to [Drive { job: 130, sel: 0 }, Drive { job: 46, sel: 0 }, Drive { job: 160, sel: 0 }, Produce { job: 205, wt: 40, n: 15 }, Drive { job: 25, sel: 53 }, Claim { job: 190, slice: 0, stage: 0, wt: 16, pos: 0, ev: 23, honest: true }, Drive { job: 46, sel: 157 }, Evaluate { job: 229, slice: 104 }, Pause(70), Drive { job: 34, sel: 92 }]

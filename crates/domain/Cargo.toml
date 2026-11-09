@@ -1,0 +1,9 @@
+[package]
+name = "gpu-domain"
+description = "Machine à états des jobs, tranches et règlement du réseau GPU P2P (fonctions de transition pures)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpu-ledger.workspace = true

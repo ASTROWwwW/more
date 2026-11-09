@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/ledger", "crates/domain", "crates/protocol", "crates/simulation"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.75"
+
+[workspace.dependencies]
+gpu-ledger = { path = "crates/ledger" }
+gpu-domain = { path = "crates/domain" }
+gpu-protocol = { path = "crates/protocol" }
+gpu-simulation = { path = "crates/simulation" }
+proptest = "1"
+
+# Paquet racine : il porte uniquement les tests de conformité
+# (tests/properties, tests/scenarios, tests/regressions).
+[package]
+name = "more-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+gpu-ledger.workspace = true
+gpu-domain.workspace = true
+gpu-protocol.workspace = true
+gpu-simulation.workspace = true
+proptest.workspace = true
+
+[[test]]
+name = "properties"
+path = "tests/properties/main.rs"
+
+[[test]]
+name = "scenarios"
+path = "tests/scenarios/main.rs"
+
+[[test]]
+name = "regressions"
+path = "tests/regressions/main.rs"
+
+[profile.test]
+opt-level = 2

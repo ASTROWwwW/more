@@ -1,0 +1,10 @@
+[package]
+name = "gpu-simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpu-domain.workspace = true
+gpu-ledger.workspace = true
+proptest.workspace = true

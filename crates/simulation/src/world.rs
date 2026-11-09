@@ -1,0 +1,1783 @@
+//! Monde simulé, opérations abstraites et générateur `proptest`.
+//!
+//! Les opérations sont abstraites (indices) et résolues en commandes concrètes
+//! à partir de l'état courant : cela produit des traces réalistes (claims sur
+//! de vraies tranches, acks sur la tentative en cours) tout en gardant des
+//! opérations adverses (tentative périmée, plage d'un autre prêteur, doublons,
+//! versions concurrentes, reçus non engagés en rafale).
+
+use proptest::prelude::*;
+
+use gpu_domain::*;
+
+use crate::invariants::{check_state, check_step, Violation};
+
+pub const CREDIT_POOL: PoolId = PoolId(1);
+pub const FREE_POOL: PoolId = PoolId(2);
+pub const BORROWERS: [AccountId; 2] = [AccountId(1), AccountId(2)];
+pub const LENDERS: [AccountId; 4] = [AccountId(10), AccountId(11), AccountId(12), AccountId(13)];
+pub const JOBS: [JobId; 3] = [JobId(1), JobId(2), JobId(3)];
+/// Témoin de livraison (relais) indépendant des prêteurs et des emprunteurs (JOB-R26).
+pub const WITNESS: AccountId = AccountId(90);
+
+/// Commandes d'initialisation : pools, émissions, soumission des jobs.
+pub fn setup_commands() -> Vec<Command> {
+    vec![
+        Command::CreatePool {
+            pool: CREDIT_POOL,
+            mode: PoolMode::Credits,
+        },
+        Command::CreatePool {
+            pool: FREE_POOL,
+            mode: PoolMode::FreeShare {
+                quota_per_borrower: 1,
+            },
+        },
+        Command::Issue {
+            id: 1,
+            to: IssueTarget::User(BORROWERS[0]),
+            amount: 2_000,
+        },
+        Command::Issue {
+            id: 2,
+            to: IssueTarget::User(BORROWERS[1]),
+            amount: 2_000,
+        },
+        Command::Issue {
+            id: 3,
+            to: IssueTarget::Pool(CREDIT_POOL),
+            amount: 300,
+        },
+        // Job 1 : 3 étages (3, 2, 1 couches), prix divisibles.
+        Command::Submit {
+            job: JOBS[0],
+            borrower: BORROWERS[0],
+            pool: CREDIT_POOL,
+            layout: vec![3, 2, 1],
+            price: [6, 12, 3],
+            max_outputs: [4, 12, 3],
+        },
+        // Job 2 : 2 étages, prix avec arrondi (7 / 2).
+        Command::Submit {
+            job: JOBS[1],
+            borrower: BORROWERS[1],
+            pool: CREDIT_POOL,
+            layout: vec![2, 2],
+            price: [4, 7, 2],
+            max_outputs: [2, 8, 2],
+        },
+        // Job 3 : pool en partage libre.
+        Command::Submit {
+            job: JOBS[2],
+            borrower: BORROWERS[0],
+            pool: FREE_POOL,
+            layout: vec![1, 1],
+            price: [5, 5, 5],
+            max_outputs: [1, 6, 1],
+        },
+    ]
+}
+
+/// Opération abstraite. Les `u8` sont des sélecteurs réduits modulo ce qui existe.
+#[derive(Clone, Debug)]
+pub enum Op {
+    Tick(u8),
+    Reserve(u8),
+    Place {
+        job: u8,
+        rot: u8,
+        est: u8,
+    },
+    PlacementFailed(u8),
+    Ready {
+        job: u8,
+        correct: bool,
+    },
+    Produce {
+        job: u8,
+        wt: u8,
+        n: u8,
+    },
+    Ack {
+        job: u8,
+        wt: u8,
+        n: u8,
+    },
+    Commit {
+        job: u8,
+        stage: u8,
+        wt: u8,
+        partial: bool,
+    },
+    Claim {
+        job: u8,
+        slice: u8,
+        stage: u8,
+        wt: u8,
+        pos: u8,
+        ev: u8,
+        honest: bool,
+    },
+    ClaimRecovery {
+        job: u8,
+        slice: u8,
+        stage: u8,
+        amount: u8,
+        ev: u8,
+    },
+    StaleProduce {
+        job: u8,
+    },
+    Close {
+        job: u8,
+        slice: u8,
+    },
+    Evaluate {
+        job: u8,
+        slice: u8,
+    },
+    Arbitrate {
+        job: u8,
+        slice: u8,
+        lender: u8,
+        pay: bool,
+    },
+    NodeLost(u8),
+    Pause(u8),
+    Resume {
+        job: u8,
+        topup: u8,
+    },
+    RecoveryTimeout(u8),
+    Fund {
+        job: u8,
+        amount: u8,
+    },
+    Finish(u8),
+    CompleteSettling(u8),
+    Cancel(u8),
+    Fail(u8),
+    Settle(u8),
+    Release {
+        job: u8,
+        slice: u8,
+        lender: u8,
+    },
+    Contest {
+        job: u8,
+        slice: u8,
+        lender: u8,
+    },
+    Reconcile,
+    Duplicate(u16),
+    Concurrent {
+        job: u8,
+        pair: u8,
+    },
+    /// Fait avancer le job sur son chemin nominal (une étape « sensée »),
+    /// pour que les traces atteignent les états profonds.
+    Drive {
+        job: u8,
+        sel: u8,
+    },
+    /// Le bon prêteur, sur la bonne plage, réclame des sorties d'une AUTRE
+    /// tentative (rejeu de rapport entre tentatives).
+    CrossAttemptClaim {
+        job: u8,
+        slice: u8,
+        stage: u8,
+        pos: u8,
+    },
+    /// Renouvellement d'autorisation (JOB-R31).
+    Heartbeat(u8),
+    /// Attestation de livraison ; `forged` = signée par un prêteur (JOB-R26).
+    Deliver {
+        job: u8,
+        wt: u8,
+        n: u8,
+        forged: bool,
+    },
+    /// Déclaration du client à la reprise ou après la fin : honnête (tout
+    /// reçu), « rien reçu au-delà du validé », ou au-delà du livré (mensonge).
+    Confirm {
+        job: u8,
+        wt: u8,
+        sel: u8,
+    },
+    /// Le témoin perd son tampon de rejeu (tentative courante ou précédente).
+    WitnessLost {
+        job: u8,
+        prev: bool,
+    },
+    /// Pannes simultanées : client silencieux ET autorisation expirée, ou
+    /// perte du nœud ET du témoin dans la même seconde.
+    DoubleFault {
+        job: u8,
+        kind: u8,
+    },
+    /// Le témoin atteste tout le produit, les prêteurs engagent et réclament,
+    /// la tranche est close et évaluée avant toute réponse du client.
+    DeliverAndSettle {
+        job: u8,
+        sel: u8,
+    },
+    /// Rafale de reçus non engagés (plafond anti-collusion, litiges, arbitrage).
+    UncommittedBurst {
+        job: u8,
+        sel: u8,
+    },
+    /// Un arbitre tranche une ligne contestée existante (JOB-S06).
+    ArbitrateDisputed {
+        job: u8,
+        sel: u8,
+    },
+    /// Fin de flux attestée, tampon et nœud perdus, reprise démarrée sans
+    /// attendre le client, puis le client déclare n'avoir rien reçu (JOB-F32).
+    ContestUnderLiveResume {
+        job: u8,
+    },
+    /// Attestation complète arrivée pendant le drainage (JOB-R32), avec ou sans
+    /// engagement antérieur à la révocation.
+    LateDeliver {
+        job: u8,
+        commit_first: bool,
+    },
+    /// Signe de vie du client, sans aucune position (JOB-R33).
+    ClientHeartbeat(u8),
+    /// Le client déclare ne pas avoir reçu la fin de flux attestée d'une
+    /// tentative révoquée (tampon intact) : contestation et rejeu (JOB-R33).
+    ContestReplay {
+        job: u8,
+        sel: u8,
+    },
+    /// Le témoin tente de purger son tampon (JOB-R28).
+    PurgeBuffer {
+        job: u8,
+        prev: bool,
+    },
+    /// Preuve complémentaire avant l'échéance (JOB-R35) ; `honest` = seulement
+    /// si un engagement antérieur existe vraiment.
+    Supplement {
+        job: u8,
+        sel: u8,
+        honest: bool,
+    },
+    /// Contestation une minute avant la fin de la fenêtre de 24 h, puis le
+    /// témoin tente de purger son tampon juste après (JOB-R28, JOB-F39).
+    ContestAtWindowEnd {
+        job: u8,
+    },
+    /// Reçus non engagés juste avant minuit, contestation de la récompense,
+    /// puis nouveaux reçus juste après minuit (JOB-R19, JOB-F40).
+    BoundaryBurst {
+        job: u8,
+        sel: u8,
+    },
+}
+
+pub fn op_strategy() -> impl Strategy<Value = Op> {
+    let b = any::<u8>;
+    prop_oneof![
+        3 => b().prop_map(Op::Tick),
+        3 => b().prop_map(Op::Reserve),
+        4 => (b(), b(), b()).prop_map(|(job, rot, est)| Op::Place { job, rot, est }),
+        1 => b().prop_map(Op::PlacementFailed),
+        4 => (b(), prop::bool::weighted(0.85)).prop_map(|(job, correct)| Op::Ready { job, correct }),
+        8 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Produce { job, wt, n }),
+        8 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Ack { job, wt, n }),
+        4 => (b(), b(), b(), any::<bool>()).prop_map(|(job, stage, wt, partial)| Op::Commit { job, stage, wt, partial }),
+        8 => (b(), b(), b(), b(), b(), b(), prop::bool::weighted(0.7))
+            .prop_map(|(job, slice, stage, wt, pos, ev, honest)| Op::Claim { job, slice, stage, wt, pos, ev, honest }),
+        2 => (b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, amount, ev)| Op::ClaimRecovery { job, slice, stage, amount, ev }),
+        1 => b().prop_map(|job| Op::StaleProduce { job }),
+        4 => (b(), b()).prop_map(|(job, slice)| Op::Close { job, slice }),
+        4 => (b(), b()).prop_map(|(job, slice)| Op::Evaluate { job, slice }),
+        2 => (b(), b(), b(), any::<bool>()).prop_map(|(job, slice, lender, pay)| Op::Arbitrate { job, slice, lender, pay }),
+        2 => b().prop_map(Op::NodeLost),
+        2 => b().prop_map(Op::Pause),
+        2 => (b(), b()).prop_map(|(job, topup)| Op::Resume { job, topup }),
+        1 => b().prop_map(Op::RecoveryTimeout),
+        1 => (b(), b()).prop_map(|(job, amount)| Op::Fund { job, amount }),
+        2 => b().prop_map(Op::Finish),
+        2 => b().prop_map(Op::CompleteSettling),
+        1 => b().prop_map(Op::Cancel),
+        1 => b().prop_map(Op::Fail),
+        2 => b().prop_map(Op::Settle),
+        2 => (b(), b(), b()).prop_map(|(job, slice, lender)| Op::Release { job, slice, lender }),
+        1 => (b(), b(), b()).prop_map(|(job, slice, lender)| Op::Contest { job, slice, lender }),
+        3 => Just(Op::Reconcile),
+        3 => any::<u16>().prop_map(Op::Duplicate),
+        2 => (b(), b()).prop_map(|(job, pair)| Op::Concurrent { job, pair }),
+        20 => (b(), b()).prop_map(|(job, sel)| Op::Drive { job, sel }),
+        2 => (b(), b(), b(), b()).prop_map(|(job, slice, stage, pos)| Op::CrossAttemptClaim { job, slice, stage, pos }),
+        3 => b().prop_map(Op::Heartbeat),
+        4 => (b(), b(), b(), prop::bool::weighted(0.2)).prop_map(|(job, wt, n, forged)| Op::Deliver { job, wt, n, forged }),
+        2 => (b(), b(), b()).prop_map(|(job, wt, sel)| Op::Confirm { job, wt, sel }),
+        1 => (b(), any::<bool>()).prop_map(|(job, prev)| Op::WitnessLost { job, prev }),
+        1 => (b(), b()).prop_map(|(job, kind)| Op::DoubleFault { job, kind }),
+                2 => (b(), b()).prop_map(|(job, sel)| Op::DeliverAndSettle { job, sel }),
+        1 => (b(), b()).prop_map(|(job, sel)| Op::UncommittedBurst { job, sel }),
+        1 => (b(), b()).prop_map(|(job, sel)| Op::ArbitrateDisputed { job, sel }),
+        1 => (b(), any::<bool>()).prop_map(|(job, commit_first)| Op::LateDeliver { job, commit_first }),
+        1 => b().prop_map(Op::ClientHeartbeat),
+        1 => (b(), any::<bool>()).prop_map(|(job, prev)| Op::PurgeBuffer { job, prev }),
+        1 => (b(), b(), any::<bool>()).prop_map(|(job, sel, honest)| Op::Supplement { job, sel, honest }),
+    ]
+}
+
+fn pick<T: Copy>(xs: &[T], sel: u8) -> T {
+    xs[sel as usize % xs.len()]
+}
+
+fn wt_of(sel: u8) -> WorkType {
+    pick(&WorkType::ALL, sel)
+}
+
+/// Simulation : état du coordinateur, historique, violations relevées.
+pub struct Sim {
+    pub coord: Coordinator,
+    pub history: Vec<Command>,
+    pub violations: Vec<Violation>,
+    pub applied: usize,
+    pub refused: usize,
+    /// Contributions réclamées par le bon prêteur, sur une sortie liée à la
+    /// tentative de la tranche (TEST-P23) : (tranche, prêteur, contribution).
+    pub structural_claims: Vec<(SliceId, AccountId, ContributionId)>,
+    /// Refus par type d'erreur (mesure de couverture).
+    pub refusal_counts: std::collections::BTreeMap<String, u64>,
+}
+
+/// Configuration de simulation : valeurs de la spec, sauf le plafond
+/// anti-collusion, abaissé (4 crédits sur 24 h glissantes) pour que les prix du monde simulé l'atteignent
+/// (sinon le chemin des litiges ne serait jamais exercé).
+pub fn sim_config() -> Config {
+    Config {
+        uncommitted_cap: 4,
+        ..Config::default()
+    }
+}
+
+impl Default for Sim {
+    fn default() -> Self {
+        Self::new(sim_config())
+    }
+}
+
+impl Sim {
+    pub fn new(cfg: Config) -> Self {
+        let mut sim = Sim {
+            coord: Coordinator::new(cfg),
+            history: Vec::new(),
+            violations: Vec::new(),
+            applied: 0,
+            refused: 0,
+            structural_claims: Vec::new(),
+            refusal_counts: Default::default(),
+        };
+        for c in setup_commands() {
+            sim.exec(c).expect("setup must succeed");
+        }
+        sim
+    }
+
+    /// Applique une commande concrète et vérifie toutes les propriétés.
+    pub fn exec(&mut self, cmd: Command) -> Result<Outcome, DomainError> {
+        let before = self.coord.clone();
+        let res = self.coord.apply(&cmd);
+        if let (
+            Ok(Outcome::Applied),
+            Command::Claim {
+                slice,
+                lender,
+                items,
+            },
+        ) = (&res, &cmd)
+        {
+            self.record_claims(&before, *slice, *lender, items);
+        }
+        let mut vs = check_step(&before, &cmd, &res, &self.coord);
+        vs.extend(check_state(&self.coord));
+        for v in vs {
+            if !self.violations.contains(&v) {
+                self.violations.push(v);
+            }
+        }
+        match &res {
+            Ok(_) => self.applied += 1,
+            Err(e) => {
+                self.refused += 1;
+                let k = format!("{e:?}");
+                let k = k.split(['(', ' ', '{']).next().unwrap_or("").to_string();
+                *self.refusal_counts.entry(k).or_default() += 1;
+            }
+        }
+        self.history.push(cmd);
+        res
+    }
+
+    fn record_claims(
+        &mut self,
+        c: &Coordinator,
+        slice: SliceId,
+        lender: AccountId,
+        items: &[ClaimItem],
+    ) {
+        let j = &c.jobs[&slice.job];
+        let a = &j.attempts[&slice.attempt];
+        for it in items {
+            if let ClaimItem::Contribution { output, stage, .. } = it {
+                let st = *stage as usize;
+                if a.lenders.get(st) != Some(&lender)
+                    || c.outputs.get(output) != Some(&slice.attempt)
+                {
+                    continue;
+                }
+                let (ls, le) = j.layer_range(st).unwrap();
+                self.structural_claims.push((
+                    slice,
+                    lender,
+                    ContributionId {
+                        output: *output,
+                        charge: c.charges[output].gen,
+                        layer_start: ls,
+                        layer_end: le,
+                        role: ContributionRole::Executor,
+                    },
+                ));
+            }
+        }
+    }
+
+    fn job(&self, sel: u8) -> JobId {
+        pick(&JOBS, sel)
+    }
+
+    fn slice_of(&self, job: JobId, sel: u8) -> Option<SliceId> {
+        let ids: Vec<SliceId> = self
+            .coord
+            .slices
+            .keys()
+            .filter(|s| s.job == job)
+            .copied()
+            .collect();
+        if ids.is_empty() {
+            None
+        } else {
+            Some(ids[sel as usize % ids.len()])
+        }
+    }
+
+    pub fn resolve(&self, op: &Op) -> Vec<Command> {
+        let c = &self.coord;
+        match *op {
+            Op::Tick(s) => {
+                // Petits pas le plus souvent, parfois un saut au-delà des échéances.
+                let dt = match s % 8 {
+                    0 => 3 * 24 * 3600,
+                    1 => 700,
+                    2 => 130,
+                    _ => u64::from(s % 40) + 1,
+                };
+                vec![Command::Tick { dt }]
+            }
+            Op::Reserve(j) => vec![Command::Reserve { job: self.job(j) }],
+            Op::Place { job, rot, est } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let lenders = (0..j.layout.len())
+                    .map(|k| LENDERS[(k + rot as usize) % LENDERS.len()])
+                    .collect();
+                let recovery_estimate = if j.intent == Intent::Resume {
+                    u64::from(est % 12)
+                } else {
+                    0
+                };
+                // Parfois un témoin non indépendant (un prêteur) : doit être refusé.
+                let witness = if est % 9 == 0 {
+                    LENDERS[rot as usize % LENDERS.len()]
+                } else {
+                    WITNESS
+                };
+                vec![Command::Place {
+                    job: id,
+                    lenders,
+                    recovery_estimate,
+                    witness,
+                    expected_version: None,
+                }]
+            }
+            Op::PlacementFailed(j) => vec![Command::PlacementFailed { job: self.job(j) }],
+            Op::Ready { job, correct } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let mut restored = j.delivered;
+                if !correct {
+                    restored[1] = restored[1].saturating_add(1);
+                }
+                vec![Command::AttemptReady {
+                    job: id,
+                    attempt: j.attempt,
+                    restored,
+                }]
+            }
+            Op::Produce { job, wt, n } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let wt = wt_of(wt);
+                let Some(a) = j.current() else { return vec![] };
+                let upto = a.produced[wt.idx()] + 1 + u32::from(n % 5);
+                vec![Command::Produce {
+                    job: id,
+                    attempt: j.attempt,
+                    wt,
+                    upto,
+                }]
+            }
+            Op::Ack { job, wt, n } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let wt = wt_of(wt);
+                let Some(a) = j.current() else { return vec![] };
+                let lo = j.validated[wt.idx()];
+                let hi = a.produced[wt.idx()];
+                let upto = if hi > lo {
+                    lo + 1 + u32::from(n) % (hi - lo)
+                } else {
+                    lo + u32::from(n % 2)
+                };
+                vec![Command::Ack {
+                    job: id,
+                    attempt: j.attempt,
+                    wt,
+                    upto,
+                }]
+            }
+            Op::Commit {
+                job,
+                stage,
+                wt,
+                partial,
+            } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                // Engagement sur la tentative courante ou la précédente (engagement tardif).
+                let attempt = if partial && j.attempt > 1 {
+                    j.attempt - 1
+                } else {
+                    j.attempt
+                };
+                let Some(a) = j.attempts.get(&attempt) else {
+                    return vec![];
+                };
+                let lender = pick(&a.lenders, stage);
+                let wt = wt_of(wt);
+                vec![Command::CommitReceipts {
+                    job: id,
+                    attempt,
+                    lender,
+                    wt,
+                    upto: a.produced[wt.idx()],
+                }]
+            }
+            Op::Claim {
+                job,
+                slice,
+                stage,
+                wt,
+                pos,
+                ev,
+                honest,
+            } => {
+                let id = self.job(job);
+                let Some(sid) = self.slice_of(id, slice) else {
+                    return vec![];
+                };
+                let Ok(j) = c.job(id) else { return vec![] };
+                let a = &j.attempts[&sid.attempt];
+                let wt = wt_of(wt);
+                let st = stage as usize % a.lenders.len();
+                // Prêteur honnête : il réclame sa propre plage. Sinon : une plage au hasard.
+                let lender = if honest {
+                    a.lenders[st]
+                } else {
+                    pick(&LENDERS, stage.wrapping_add(pos))
+                };
+                let evidence = match ev % 4 {
+                    0 | 1 => Evidence::Committed,
+                    2 => Evidence::Uncommitted,
+                    _ => Evidence::None,
+                };
+                // Honnête : des sorties réellement validées sur cette tentative.
+                // Sinon : des positions quelconques (autre tentative, non validées).
+                let positions: Vec<u32> = if honest {
+                    let mine: Vec<u32> = c
+                        .outputs
+                        .iter()
+                        .filter(|(o, at)| o.job == id && o.wt == wt && **at == sid.attempt)
+                        .map(|(o, _)| o.pos)
+                        .collect();
+                    if mine.is_empty() {
+                        return vec![];
+                    }
+                    (0..1 + usize::from(pos % 3))
+                        .map(|k| mine[(usize::from(pos) + k) % mine.len()])
+                        .collect()
+                } else {
+                    let max = j.max_outputs[wt.idx()].max(1);
+                    (0..1 + u32::from(pos % 3))
+                        .map(|k| (u32::from(pos) + k) % max)
+                        .collect()
+                };
+                let items = positions
+                    .into_iter()
+                    .map(|p| ClaimItem::Contribution {
+                        output: OutputId {
+                            job: id,
+                            wt,
+                            pos: p,
+                        },
+                        stage: st as u32,
+                        evidence,
+                    })
+                    .collect();
+                vec![Command::Claim {
+                    slice: sid,
+                    lender,
+                    items,
+                }]
+            }
+            Op::ClaimRecovery {
+                job,
+                slice,
+                stage,
+                amount,
+                ev,
+            } => {
+                let id = self.job(job);
+                let Some(sid) = self.slice_of(id, slice) else {
+                    return vec![];
+                };
+                let a = &c.jobs[&id].attempts[&sid.attempt];
+                let lender = pick(&a.lenders, stage);
+                let evidence = if ev % 3 == 0 {
+                    Evidence::Uncommitted
+                } else {
+                    Evidence::Committed
+                };
+                vec![Command::Claim {
+                    slice: sid,
+                    lender,
+                    items: vec![ClaimItem::Recovery {
+                        segment: u32::from(stage % 3),
+                        amount: u64::from(amount % 9),
+                        evidence,
+                    }],
+                }]
+            }
+            Op::StaleProduce { job } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                if j.attempt < 2 {
+                    return vec![];
+                }
+                let old = j.attempt - 1;
+                let p = j.attempts[&old].produced[1];
+                vec![
+                    Command::Produce {
+                        job: id,
+                        attempt: old,
+                        wt: WorkType::Generate,
+                        upto: p + 1,
+                    },
+                    Command::Ack {
+                        job: id,
+                        attempt: old,
+                        wt: WorkType::Generate,
+                        upto: p + 1,
+                    },
+                ]
+            }
+            Op::Close { job, slice } => self
+                .slice_of(self.job(job), slice)
+                .map(|s| vec![Command::CloseSlice { slice: s }])
+                .unwrap_or_default(),
+            Op::Evaluate { job, slice } => self
+                .slice_of(self.job(job), slice)
+                .map(|s| vec![Command::Evaluate { slice: s }])
+                .unwrap_or_default(),
+            Op::Arbitrate {
+                job,
+                slice,
+                lender,
+                pay,
+            } => self
+                .slice_of(self.job(job), slice)
+                .map(|s| {
+                    vec![Command::Arbitrate {
+                        slice: s,
+                        lender: pick(&LENDERS, lender),
+                        pay,
+                    }]
+                })
+                .unwrap_or_default(),
+            Op::NodeLost(j) => vec![Command::NodeLost {
+                job: self.job(j),
+                expected_version: None,
+            }],
+            Op::Pause(j) => vec![Command::Pause {
+                job: self.job(j),
+                reason: PauseReason::Requested,
+                expected_version: None,
+            }],
+            Op::Resume { job, topup } => {
+                let id = self.job(job);
+                let topup = if c.job(id).is_ok_and(|j| j.pool == CREDIT_POOL) {
+                    u64::from(topup % 60)
+                } else {
+                    0
+                };
+                vec![Command::Resume { job: id, topup }]
+            }
+            Op::RecoveryTimeout(j) => vec![Command::RecoveryTimeout { job: self.job(j) }],
+            Op::Fund { job, amount } => vec![Command::FundRecovery {
+                job: self.job(job),
+                amount: u64::from(amount % 20) + 1,
+            }],
+            Op::Finish(j) => vec![Command::Finish {
+                job: self.job(j),
+                expected_version: None,
+            }],
+            Op::CompleteSettling(j) => vec![Command::CompleteSettling { job: self.job(j) }],
+            Op::Cancel(j) => vec![Command::Cancel {
+                job: self.job(j),
+                expected_version: None,
+            }],
+            Op::Fail(j) => vec![Command::Fail { job: self.job(j) }],
+            Op::Settle(j) => vec![Command::Settle { job: self.job(j) }],
+            Op::Release { job, slice, lender } => self
+                .slice_of(self.job(job), slice)
+                .map(|s| {
+                    vec![Command::ReleaseReward {
+                        slice: s,
+                        lender: pick(&LENDERS, lender),
+                    }]
+                })
+                .unwrap_or_default(),
+            Op::Contest { job, slice, lender } => self
+                .slice_of(self.job(job), slice)
+                .map(|s| {
+                    vec![Command::ContestReward {
+                        slice: s,
+                        lender: pick(&LENDERS, lender),
+                    }]
+                })
+                .unwrap_or_default(),
+            Op::Reconcile => vec![Command::Reconcile],
+            Op::Duplicate(i) => {
+                // Livraison en double d'une commande passée (retry, outbox rejouée).
+                let n = self.history.len();
+                if n == 0 {
+                    vec![]
+                } else {
+                    vec![self.history[i as usize % n].clone()]
+                }
+            }
+            Op::Concurrent { job, pair } => {
+                // Deux commandes calculées sur la même version du job (JOB-R03).
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let ver = Some(j.version);
+                let cancel = Command::Cancel {
+                    job: id,
+                    expected_version: ver,
+                };
+                let finish = Command::Finish {
+                    job: id,
+                    expected_version: ver,
+                };
+                let lost = Command::NodeLost {
+                    job: id,
+                    expected_version: ver,
+                };
+                let pause = Command::Pause {
+                    job: id,
+                    reason: PauseReason::Requested,
+                    expected_version: ver,
+                };
+                match pair % 4 {
+                    0 => vec![cancel, finish],
+                    1 => vec![finish, cancel],
+                    2 => vec![lost, pause],
+                    _ => vec![cancel, lost],
+                }
+            }
+            Op::Drive { job, sel } => self.drive(self.job(job), sel),
+            Op::Heartbeat(j) => {
+                let id = self.job(j);
+                let Ok(job) = c.job(id) else { return vec![] };
+                vec![Command::Heartbeat {
+                    job: id,
+                    attempt: job.attempt,
+                }]
+            }
+            Op::Deliver { job, wt, n, forged } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                let wt = wt_of(wt);
+                let t = wt.idx();
+                // Parfois au-delà du produit (refusé), le plus souvent dans la fenêtre.
+                let upto = j.delivered[t] + 1 + u32::from(n % 4);
+                let witness = if forged {
+                    pick(&a.lenders, n)
+                } else {
+                    a.witness
+                };
+                // Trame substituée, ou trame valide d'une autre session (JOB-R34).
+                let digest = match n % 7 {
+                    0 => c.frame_digest(id, wt, upto) ^ 1,
+                    1 => c.frame_digest(pick(&JOBS, n.wrapping_add(1)), wt, upto),
+                    _ => c.frame_digest(id, wt, upto),
+                };
+                vec![Command::Deliver {
+                    job: id,
+                    attempt: j.attempt,
+                    witness,
+                    wt,
+                    upto,
+                    digest,
+                }]
+            }
+            Op::Confirm { job, wt, sel } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let wt = WorkType::ALL
+                    .into_iter()
+                    .find(|w| j.delivered[w.idx()] > j.validated[w.idx()])
+                    .unwrap_or_else(|| wt_of(wt));
+                let t = wt.idx();
+                let (v, d) = (j.validated[t], j.delivered[t]);
+                let confirmed = match sel % 4 {
+                    0 => d,
+                    1 => v,
+                    2 => v + (d - v) / 2,
+                    // Mensonge : le client prétend détenir plus que livré.
+                    _ => d + 1,
+                };
+                // Parfois une déclaration signée dans une autre session (JOB-R34).
+                let digest = if (sel / 4) % 5 == 0 {
+                    c.frame_digest(pick(&JOBS, sel.wrapping_add(1)), wt, confirmed)
+                } else {
+                    c.frame_digest(id, wt, confirmed)
+                };
+                vec![Command::ConfirmDelivery {
+                    job: id,
+                    wt,
+                    confirmed,
+                    digest,
+                }]
+            }
+            Op::WitnessLost { job, prev } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let attempt = if prev && j.attempt > 1 {
+                    j.attempt - 1
+                } else {
+                    j.attempt
+                };
+                if attempt == 0 {
+                    return vec![];
+                }
+                vec![Command::WitnessLost { job: id, attempt }]
+            }
+            Op::DeliverAndSettle { job, sel } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                if j.exec != ExecStatus::Running || a.revoked_at.is_some() {
+                    return vec![];
+                }
+                let wt = WorkType::ALL
+                    .into_iter()
+                    .find(|w| a.produced[w.idx()] > j.delivered[w.idx()])
+                    .unwrap_or(WorkType::Generate);
+                let t = wt.idx();
+                let Some(open) = c
+                    .slices
+                    .values()
+                    .find(|s| {
+                        s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
+                    })
+                    .map(|s| s.id)
+                else {
+                    return vec![];
+                };
+                let mut v = vec![
+                    Command::Heartbeat {
+                        job: id,
+                        attempt: j.attempt,
+                    },
+                    Command::Deliver {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                        wt,
+                        upto: a.produced[t],
+                        digest: c.frame_digest(id, wt, a.produced[t]),
+                    },
+                ];
+                for l in &a.lenders {
+                    v.push(Command::CommitReceipts {
+                        job: id,
+                        attempt: j.attempt,
+                        lender: *l,
+                        wt,
+                        upto: a.produced[t],
+                    });
+                }
+                // Les réclamations sont calculées sur l'état courant : on
+                // anticipe l'attestation en visant toutes les sorties liées.
+                let mut tmp = Sim {
+                    coord: c.clone(),
+                    history: Vec::new(),
+                    violations: Vec::new(),
+                    applied: 0,
+                    refused: 0,
+                    structural_claims: Vec::new(),
+                    refusal_counts: Default::default(),
+                };
+                for cmd in &v {
+                    let _ = tmp.coord.apply(cmd);
+                }
+                for k in 0..a.lenders.len() as u8 {
+                    if let Some(cl) =
+                        tmp.honest_claim_with(open, sel.wrapping_add(k), Evidence::Committed)
+                    {
+                        let _ = tmp.coord.apply(&cl);
+                        v.push(cl);
+                    }
+                }
+                v.push(Command::CloseSlice { slice: open });
+                v.push(Command::Evaluate { slice: open });
+                v
+            }
+            Op::UncommittedBurst { job, sel } => {
+                let id = self.job(job);
+                let live: Vec<SliceId> = c
+                    .slices
+                    .values()
+                    .filter(|s| {
+                        s.id.job == id
+                            && matches!(s.status, SliceStatus::Open | SliceStatus::Draining)
+                    })
+                    .map(|s| s.id)
+                    .collect();
+                if live.is_empty() {
+                    return vec![];
+                }
+                let sid = live[usize::from(sel) % live.len()];
+                let st = c.slices[&sid].status;
+                let mut v: Vec<Command> = self
+                    .honest_claim_with(sid, sel, Evidence::Uncommitted)
+                    .into_iter()
+                    .collect();
+                if st == SliceStatus::Open {
+                    v.push(Command::CloseSlice { slice: sid });
+                    v.push(Command::Evaluate { slice: sid });
+                }
+                v
+            }
+            Op::ContestUnderLiveResume { job } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                if j.exec != ExecStatus::Running || a.revoked_at.is_some() {
+                    return vec![];
+                }
+                let Some(wt) = WorkType::ALL
+                    .into_iter()
+                    .find(|w| a.produced[w.idx()] > j.validated[w.idx()])
+                else {
+                    return vec![];
+                };
+                let t = wt.idx();
+                let mut delivered = j.delivered;
+                delivered[t] = a.produced[t];
+                let lenders: Vec<AccountId> = a.lenders.iter().rev().copied().collect();
+                vec![
+                    Command::Deliver {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                        wt,
+                        upto: a.produced[t],
+                        digest: c.frame_digest(id, wt, a.produced[t]),
+                    },
+                    Command::WitnessLost {
+                        job: id,
+                        attempt: j.attempt,
+                    },
+                    Command::NodeLost {
+                        job: id,
+                        expected_version: None,
+                    },
+                    Command::Place {
+                        job: id,
+                        lenders,
+                        recovery_estimate: 0,
+                        witness: WITNESS,
+                        expected_version: None,
+                    },
+                    Command::AttemptReady {
+                        job: id,
+                        attempt: j.attempt + 1,
+                        restored: delivered,
+                    },
+                    Command::ConfirmDelivery {
+                        job: id,
+                        wt,
+                        confirmed: j.validated[t],
+                        digest: c.frame_digest(id, wt, j.validated[t]),
+                    },
+                ]
+            }
+            Op::LateDeliver { job, commit_first } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                let Some(wt) = WorkType::ALL
+                    .into_iter()
+                    .find(|w| a.produced[w.idx()] > j.delivered[w.idx()])
+                else {
+                    return vec![];
+                };
+                let upto = a.produced[wt.idx()];
+                let deliver = Command::Deliver {
+                    job: id,
+                    attempt: j.attempt,
+                    witness: a.witness,
+                    wt,
+                    upto,
+                    digest: c.frame_digest(id, wt, upto),
+                };
+                if a.revoked_at.is_some() {
+                    // Après révocation : l'engagement éventuel est postérieur, donc sans valeur.
+                    let mut v = Vec::new();
+                    if commit_first {
+                        v.push(Command::WitnessCommit {
+                            job: id,
+                            attempt: j.attempt,
+                            witness: a.witness,
+                            wt,
+                            upto,
+                        });
+                    }
+                    v.push(deliver);
+                    return v;
+                }
+                if j.exec != ExecStatus::Running {
+                    return vec![];
+                }
+                // Engagement (ou non) avant la panne, attestation complète pendant le drainage.
+                let mut v = vec![Command::Heartbeat {
+                    job: id,
+                    attempt: j.attempt,
+                }];
+                if commit_first {
+                    v.push(Command::WitnessCommit {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                        wt,
+                        upto,
+                    });
+                }
+                v.push(Command::NodeLost {
+                    job: id,
+                    expected_version: None,
+                });
+                v.push(deliver);
+                v
+            }
+            Op::ClientHeartbeat(j) => vec![Command::ClientHeartbeat { job: self.job(j) }],
+            Op::ContestAtWindowEnd { job } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let w = c.cfg.delivery_window;
+                // Une sortie provisoire non contestée d'une tentative révoquée, fenêtre ouverte.
+                let target = c.charges.iter().find_map(|(o, ch)| {
+                    let r = j.attempts.get(&ch.attempt)?.revoked_at?;
+                    (o.job == id && !ch.definitive && ch.contest.is_none() && c.now + 60 < r + w)
+                        .then_some((o.wt, ch.attempt, r))
+                });
+                let Some((wt, attempt, r)) = target else {
+                    return vec![];
+                };
+                let t = wt.idx();
+                vec![
+                    Command::Tick {
+                        dt: r + w - 60 - c.now,
+                    },
+                    Command::ConfirmDelivery {
+                        job: id,
+                        wt,
+                        confirmed: j.validated[t],
+                        digest: c.frame_digest(id, wt, j.validated[t]),
+                    },
+                    Command::Tick { dt: 120 },
+                    Command::PurgeBuffer { job: id, attempt },
+                ]
+            }
+            Op::BoundaryBurst { job, sel } => self.boundary_burst(self.job(job), sel),
+            Op::ContestReplay { job, sel } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(wt) = WorkType::ALL
+                    .into_iter()
+                    .find(|w| j.delivered[w.idx()] > j.validated[w.idx()])
+                else {
+                    return vec![];
+                };
+                let t = wt.idx();
+                let (v, d) = (j.validated[t], j.delivered[t]);
+                let confirmed = v + u32::from(sel) % (d - v);
+                vec![Command::ConfirmDelivery {
+                    job: id,
+                    wt,
+                    confirmed,
+                    digest: c.frame_digest(id, wt, confirmed),
+                }]
+            }
+            Op::PurgeBuffer { job, prev } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let attempt = if prev && j.attempt > 1 {
+                    j.attempt - 1
+                } else {
+                    j.attempt
+                };
+                if attempt == 0 {
+                    return vec![];
+                }
+                vec![Command::PurgeBuffer { job: id, attempt }]
+            }
+            Op::Supplement { job, sel, honest } => {
+                let id = self.job(job);
+                let mut cands = Vec::new();
+                for s in c.slices.values().filter(|s| s.id.job == id) {
+                    for (l, line) in &s.lines {
+                        for it in &line.items {
+                            if let ItemKind::Contribution(cid) = it.kind {
+                                let undecided = it.status == ItemStatus::PendingEvaluation
+                                    || it.awaiting_delivery;
+                                if undecided && it.evidence != Evidence::Committed {
+                                    let proven =
+                                        c.committed_before(s.id, *l, cid.output.wt, cid.output.pos);
+                                    if proven || !honest {
+                                        cands.push((s.id, *l, cid.output));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if cands.is_empty() {
+                    // Aucun candidat : le prêteur réclame sans preuve (la sienne n'est pas
+                    // encore revenue), la tranche est close, puis il complète (JOB-R35).
+                    return self.late_proof(id, sel, honest);
+                }
+                let (slice, lender, output) = cands[usize::from(sel) % cands.len()];
+                vec![Command::SupplementEvidence {
+                    slice,
+                    lender,
+                    output,
+                    evidence: Evidence::Committed,
+                }]
+            }
+            Op::ArbitrateDisputed { job, sel } => {
+                let id = self.job(job);
+                let cands: Vec<(SliceId, AccountId)> = c
+                    .slices
+                    .values()
+                    .filter(|s| {
+                        s.id.job == id
+                            && matches!(s.status, SliceStatus::Disputed | SliceStatus::Closed)
+                    })
+                    .flat_map(|s| {
+                        s.lines
+                            .iter()
+                            .filter(|(_, l)| {
+                                l.items.iter().any(|i| {
+                                    i.status == ItemStatus::Disputed && !i.awaiting_delivery
+                                })
+                            })
+                            .map(move |(l, _)| (s.id, *l))
+                    })
+                    .collect();
+                if cands.is_empty() {
+                    return vec![];
+                }
+                let (slice, lender) = cands[usize::from(sel) % cands.len()];
+                let mut v = Vec::new();
+                // L'arbitre attend la fin de l'évaluation (échéance JOB-R35).
+                if c.slices[&slice].status == SliceStatus::Closed {
+                    v.push(Command::Tick {
+                        dt: c.cfg.evaluation_deadline,
+                    });
+                    v.push(Command::Reconcile);
+                }
+                v.push(Command::Arbitrate {
+                    slice,
+                    lender,
+                    pay: sel.is_multiple_of(2),
+                });
+                v
+            }
+            Op::DoubleFault { job, kind } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                if kind.is_multiple_of(2) {
+                    // Client silencieux et autorisation expirée à la même échéance.
+                    vec![
+                        Command::Tick {
+                            dt: c.cfg.client_silence.max(c.cfg.lease_ttl),
+                        },
+                        Command::Reconcile,
+                    ]
+                } else {
+                    vec![
+                        Command::WitnessLost {
+                            job: id,
+                            attempt: j.attempt.max(1),
+                        },
+                        Command::NodeLost {
+                            job: id,
+                            expected_version: None,
+                        },
+                    ]
+                }
+            }
+            Op::CrossAttemptClaim {
+                job,
+                slice,
+                stage,
+                pos,
+            } => {
+                let id = self.job(job);
+                let Some(sid) = self.slice_of(id, slice) else {
+                    return vec![];
+                };
+                let a = &c.jobs[&id].attempts[&sid.attempt];
+                let st = usize::from(stage) % a.lenders.len();
+                let foreign: Vec<OutputId> = c
+                    .outputs
+                    .iter()
+                    .filter(|(o, at)| o.job == id && **at != sid.attempt)
+                    .map(|(o, _)| *o)
+                    .collect();
+                if foreign.is_empty() {
+                    return vec![];
+                }
+                let o = foreign[usize::from(pos) % foreign.len()];
+                vec![Command::Claim {
+                    slice: sid,
+                    lender: a.lenders[st],
+                    items: vec![ClaimItem::Contribution {
+                        output: o,
+                        stage: st as u32,
+                        evidence: Evidence::Committed,
+                    }],
+                }]
+            }
+        }
+    }
+
+    /// Étape nominale suivante pour un job, selon son état.
+    fn drive(&self, id: JobId, sel: u8) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        // Les tranches à faire avancer d'abord, quel que soit l'état du job.
+        let mut slice_work = Vec::new();
+        for s in c.slices.values().filter(|s| s.id.job == id) {
+            match s.status {
+                SliceStatus::Closed => slice_work.push(Command::Evaluate { slice: s.id }),
+                SliceStatus::Disputed => {
+                    let arbitrable = s.lines.iter().find(|(_, l)| {
+                        l.items
+                            .iter()
+                            .any(|i| i.status == ItemStatus::Disputed && !i.awaiting_delivery)
+                    });
+                    if let Some((l, _)) = arbitrable {
+                        // Un arbitre humain tranche avant l'échéance (JOB-S06).
+                        return vec![Command::Arbitrate {
+                            slice: s.id,
+                            lender: *l,
+                            pay: sel.is_multiple_of(2),
+                        }];
+                    }
+                }
+                SliceStatus::Final => {
+                    if let Some((l, _)) = s.lines.iter().find(|(_, l)| l.held > 0) {
+                        let open = s.final_at.is_some_and(|f| c.now < f + c.cfg.reward_window);
+                        if !open {
+                            slice_work.push(Command::ReleaseReward {
+                                slice: s.id,
+                                lender: *l,
+                            });
+                        } else if sel.is_multiple_of(4) {
+                            // Fraude découverte pendant la fenêtre (JOB-R22).
+                            slice_work.push(Command::ContestReward {
+                                slice: s.id,
+                                lender: *l,
+                            });
+                        }
+                    }
+                }
+                SliceStatus::Draining => {
+                    // Le prêteur resté en ligne présente ses reçus (JOB-F16).
+                    if let Some(cmd) = self.honest_claim(s.id, sel) {
+                        slice_work.push(cmd);
+                    }
+                    if c.now >= s.receipt_deadline.unwrap_or(0) {
+                        slice_work.push(Command::CloseSlice { slice: s.id });
+                    }
+                }
+                SliceStatus::Open => {}
+            }
+        }
+        if !slice_work.is_empty() && sel.is_multiple_of(3) {
+            return vec![slice_work[usize::from(sel) % slice_work.len()].clone()];
+        }
+        match j.exec {
+            ExecStatus::Queued => vec![Command::Reserve { job: id }],
+            ExecStatus::Reserved | ExecStatus::Recovering => {
+                let lenders = (0..j.layout.len())
+                    .map(|k| LENDERS[(k + usize::from(sel)) % LENDERS.len()])
+                    .collect();
+                let est = if j.intent == Intent::Resume {
+                    u64::from(sel % 6)
+                } else {
+                    0
+                };
+                let mut v = self.client_confirm(id, sel);
+                v.push(Command::Place {
+                    job: id,
+                    lenders,
+                    recovery_estimate: est,
+                    witness: WITNESS,
+                    expected_version: None,
+                });
+                v
+            }
+            ExecStatus::Placing => vec![
+                Command::Heartbeat {
+                    job: id,
+                    attempt: j.attempt,
+                },
+                Command::AttemptReady {
+                    job: id,
+                    attempt: j.attempt,
+                    restored: j.delivered,
+                },
+            ],
+            ExecStatus::Paused => {
+                let mut v = self.client_confirm(id, sel);
+                v.push(Command::Resume {
+                    job: id,
+                    topup: if j.pool == CREDIT_POOL { 30 } else { 0 },
+                });
+                v
+            }
+            ExecStatus::Settling => {
+                let mut v = self.client_confirm(id, sel);
+                v.extend([
+                    Command::Tick {
+                        dt: c.cfg.drain_window + 1,
+                    },
+                    Command::Reconcile,
+                ]);
+                v
+            }
+            ExecStatus::Running => {
+                let a = j.current().expect("running has an attempt");
+                let wt = pick(&WorkType::ALL, sel / 7);
+                let t = wt.idx();
+                let open = c
+                    .slices
+                    .values()
+                    .find(|s| {
+                        s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
+                    })
+                    .map(|s| s.id);
+                // Grappe saine : elle renouvelle son autorisation à chaque étape.
+                let hb = Command::Heartbeat {
+                    job: id,
+                    attempt: j.attempt,
+                };
+                let step: Vec<Command> = match sel % 10 {
+                    0 | 1 => vec![Command::Produce {
+                        job: id,
+                        attempt: j.attempt,
+                        wt,
+                        upto: (a.produced[t] + 1 + u32::from(sel % 3)).min(j.max_outputs[t]),
+                    }],
+                    2 => vec![Command::Ack {
+                        job: id,
+                        attempt: j.attempt,
+                        wt,
+                        upto: a.produced[t],
+                    }],
+                    // Le témoin atteste ; le client n'acquitte pas tout de suite.
+                    3 => vec![Command::Deliver {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                        wt,
+                        upto: a.produced[t],
+                        digest: c.frame_digest(id, wt, a.produced[t]),
+                    }],
+                    // Le témoin n'envoie que son engagement court (JOB-R32).
+                    9 => vec![Command::WitnessCommit {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                        wt,
+                        upto: a.produced[t],
+                    }],
+                    4 => a
+                        .lenders
+                        .iter()
+                        .map(|l| Command::CommitReceipts {
+                            job: id,
+                            attempt: j.attempt,
+                            lender: *l,
+                            wt,
+                            upto: a.produced[t],
+                        })
+                        .collect(),
+                    5 | 6 => open
+                        .and_then(|s| self.honest_claim(s, sel))
+                        .into_iter()
+                        .collect(),
+                    7 => {
+                        let mut v: Vec<Command> = open
+                            .map(|s| Command::CloseSlice { slice: s })
+                            .into_iter()
+                            .collect();
+                        if j.delivered == a.produced && sel.is_multiple_of(2) {
+                            v.push(Command::Finish {
+                                job: id,
+                                expected_version: None,
+                            });
+                        }
+                        v
+                    }
+                    _ => {
+                        // Récupération déclarée par le remplaçant (JOB-R18).
+                        if a.recovery_earmark > a.recovery_reserved {
+                            open.map(|s| Command::Claim {
+                                slice: s,
+                                lender: a.lenders[0],
+                                items: vec![ClaimItem::Recovery {
+                                    segment: u32::from(sel % 4),
+                                    amount: (a.recovery_earmark - a.recovery_reserved).min(3),
+                                    evidence: Evidence::Committed,
+                                }],
+                            })
+                            .into_iter()
+                            .collect()
+                        } else {
+                            vec![Command::Ack {
+                                job: id,
+                                attempt: j.attempt,
+                                wt,
+                                upto: a.produced[t],
+                            }]
+                        }
+                    }
+                };
+                let mut v = vec![hb];
+                v.extend(step);
+                v
+            }
+            _ => {
+                let mut v = self.client_confirm(id, sel);
+                v.extend(slice_work.into_iter().take(1));
+                v
+            }
+        }
+    }
+
+    /// Réclamation sans preuve, clôture, évaluation (reportée), puis preuve
+    /// complémentaire : engagée si elle existe (honnête), sinon annoncée à tort.
+    fn late_proof(&self, id: JobId, sel: u8, honest: bool) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        if j.exec != ExecStatus::Running {
+            return vec![];
+        }
+        let Some(open) = c
+            .slices
+            .values()
+            .find(|s| s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open)
+            .map(|s| s.id)
+        else {
+            return vec![];
+        };
+        let Some(Command::Claim {
+            slice,
+            lender,
+            items,
+        }) = self.honest_claim_with(open, sel, Evidence::None)
+        else {
+            return vec![];
+        };
+        let mut out = vec![
+            Command::Claim {
+                slice,
+                lender,
+                items: items.clone(),
+            },
+            Command::CloseSlice { slice },
+            Command::Evaluate { slice },
+        ];
+        for it in items {
+            if let ClaimItem::Contribution { output, .. } = it {
+                if !honest || c.committed_before(slice, lender, output.wt, output.pos) {
+                    out.push(Command::SupplementEvidence {
+                        slice,
+                        lender,
+                        output,
+                        evidence: Evidence::Committed,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Deux salves de reçus non engagés autour d'un multiple de 24 h, séparées
+    /// par la contestation de la récompense de la première (JOB-R19).
+    fn boundary_burst(&self, id: JobId, sel: u8) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        if j.exec != ExecStatus::Running {
+            return vec![];
+        }
+        let mut tmp = Sim {
+            coord: c.clone(),
+            history: Vec::new(),
+            violations: Vec::new(),
+            applied: 0,
+            refused: 0,
+            structural_claims: Vec::new(),
+            refusal_counts: Default::default(),
+        };
+        let mut out = Vec::new();
+        let mut step = |tmp: &mut Sim, cmd: Command| {
+            let _ = tmp.coord.apply(&cmd);
+            out.push(cmd);
+        };
+        let w = c.cfg.uncommitted_window;
+        // Entre 10 et 59 s avant le prochain multiple de 24 h.
+        let dt = (w - c.now % w)
+            .saturating_sub(10 + u64::from(sel % 50))
+            .max(1);
+        step(&mut tmp, Command::Tick { dt });
+        for round in 0..2 {
+            let attempt = tmp.coord.jobs[&id].attempt;
+            let Some(open) = tmp
+                .coord
+                .slices
+                .values()
+                .find(|s| {
+                    s.id.job == id && s.id.attempt == attempt && s.status == SliceStatus::Open
+                })
+                .map(|s| s.id)
+            else {
+                break;
+            };
+            // Le prêteur de la plus petite part : celui qui peut atteindre le plafond.
+            let last = (tmp.coord.jobs[&id].layout.len() - 1) as u8;
+            let Some(Command::Claim {
+                slice,
+                lender,
+                mut items,
+            }) = tmp.honest_claim_with(open, last, Evidence::Uncommitted)
+            else {
+                break;
+            };
+            // Un seul reçu avant minuit, deux après : il reste des sorties à réclamer.
+            items.truncate(if round == 0 { 1 } else { 2 });
+            step(
+                &mut tmp,
+                Command::Claim {
+                    slice,
+                    lender,
+                    items,
+                },
+            );
+            step(&mut tmp, Command::CloseSlice { slice });
+            step(&mut tmp, Command::Evaluate { slice });
+            if round == 0 {
+                step(&mut tmp, Command::ContestReward { slice, lender });
+                step(&mut tmp, Command::Tick { dt: 60 });
+            }
+        }
+        out
+    }
+
+    /// Déclaration du client sur ses sorties provisoires (JOB-R28) : le plus
+    /// souvent « tout reçu », parfois « rien reçu au-delà du validé ».
+    fn client_confirm(&self, id: JobId, sel: u8) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        // Le client parle du type qui a des sorties provisoires, s'il y en a.
+        let Some(wt) = WorkType::ALL
+            .into_iter()
+            .find(|w| j.delivered[w.idx()] > j.validated[w.idx()])
+        else {
+            return vec![];
+        };
+        let t = wt.idx();
+        if sel % 4 == 3 {
+            return vec![];
+        }
+        let confirmed = if sel.is_multiple_of(3) {
+            j.validated[t]
+        } else {
+            j.delivered[t]
+        };
+        vec![Command::ConfirmDelivery {
+            job: id,
+            wt,
+            confirmed,
+            digest: c.frame_digest(id, wt, confirmed),
+        }]
+    }
+
+    /// Réclamation honnête : un prêteur de la tentative réclame sa plage pour
+    /// des sorties validées sur cette tentative, non encore réclamées.
+    fn honest_claim(&self, slice: SliceId, sel: u8) -> Option<Command> {
+        // Un prêteur honnête envoie parfois sa réclamation avant que sa preuve
+        // ne revienne : il la complétera avant l'échéance (JOB-R35).
+        let evidence = match sel % 7 {
+            0 => Evidence::Uncommitted,
+            1 => Evidence::None,
+            _ => Evidence::Committed,
+        };
+        self.honest_claim_with(slice, sel, evidence)
+    }
+
+    fn honest_claim_with(&self, slice: SliceId, sel: u8, evidence: Evidence) -> Option<Command> {
+        let c = &self.coord;
+        let j = c.job(slice.job).ok()?;
+        let a = j.attempts.get(&slice.attempt)?;
+        let stage = usize::from(sel) % a.lenders.len();
+        let lender = a.lenders[stage];
+        let (ls, le) = j.layer_range(stage)?;
+        let staged: Vec<OutputId> = c.slices[&slice]
+            .staged
+            .iter()
+            .filter(|s| s.lender == lender)
+            .filter_map(|s| match s.item {
+                ClaimItem::Contribution { output, .. } => Some(output),
+                _ => None,
+            })
+            .collect();
+        let todo: Vec<OutputId> = c
+            .outputs
+            .iter()
+            .filter(|(o, at)| o.job == slice.job && **at == slice.attempt)
+            .map(|(o, _)| *o)
+            .filter(|o| {
+                !c.contributions.contains_key(&ContributionId {
+                    output: *o,
+                    charge: c.charges[o].gen,
+                    layer_start: ls,
+                    layer_end: le,
+                    role: ContributionRole::Executor,
+                })
+            })
+            .filter(|o| !staged.contains(o))
+            .take(3)
+            .collect();
+        if todo.is_empty() {
+            return None;
+        }
+        Some(Command::Claim {
+            slice,
+            lender,
+            items: todo
+                .into_iter()
+                .map(|o| ClaimItem::Contribution {
+                    output: o,
+                    stage: stage as u32,
+                    evidence,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn run_op(&mut self, op: &Op) {
+        for cmd in self.resolve(op) {
+            let _ = self.exec(cmd);
+        }
+    }
+
+    /// Vivacité (TEST-P06, TEST-P13) : on arrête toute activité, on laisse
+    /// passer les échéances et on réconcilie. Tout job doit finir clos, escrow
+    /// à zéro, sans intervention humaine.
+    pub fn drain(&mut self) {
+        let jobs: Vec<JobId> = self.coord.jobs.keys().copied().collect();
+        for id in &jobs {
+            let exec = self.coord.jobs[id].exec;
+            if !exec.is_terminal() && exec != ExecStatus::Settling {
+                let _ = self.exec(Command::Cancel {
+                    job: *id,
+                    expected_version: None,
+                });
+            }
+        }
+        for _ in 0..12 {
+            let _ = self.exec(Command::Tick { dt: 3 * 24 * 3600 });
+            let _ = self.exec(Command::Reconcile);
+        }
+        for j in self.coord.jobs.values() {
+            if !j.exec.is_terminal() || j.settle != SettleStatus::Closed {
+                self.violations.push(Violation {
+                    property: "TEST-P06",
+                    detail: format!("{:?} stuck: exec {:?}, settle {:?}", j.id, j.exec, j.settle),
+                });
+            }
+        }
+        for s in self.coord.slices.values() {
+            if s.status != SliceStatus::Final {
+                self.violations.push(Violation {
+                    property: "TEST-P06",
+                    detail: format!("slice {:?} stuck in {:?}", s.id, s.status),
+                });
+            }
+            // JOB-R22 : toute récompense retenue finit libérée ou contestée.
+            for (l, line) in &s.lines {
+                if line.held != 0 {
+                    self.violations.push(Violation {
+                        property: "TEST-P06",
+                        detail: format!("{:?}/{l:?}: reward still held after drain", s.id),
+                    });
+                }
+            }
+        }
+        // JOB-R29 : aucune livraison ne reste provisoire.
+        for (o, ch) in &self.coord.charges {
+            if !ch.definitive {
+                self.violations.push(Violation {
+                    property: "TEST-P06",
+                    detail: format!("{o:?} still provisional after drain"),
+                });
+            }
+        }
+        let fairness = crate::invariants::check_fairness(&self.coord, &self.structural_claims);
+        self.violations.extend(fairness);
+    }
+}
