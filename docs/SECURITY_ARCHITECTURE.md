@@ -49,7 +49,7 @@ Section 7 lists both, boundary by boundary.
 | Principal | How it is authenticated now | Target |
 | --- | --- | --- |
 | User account (borrower, lender, witness, pool admin) | Ed25519 signature on every protocol envelope, verified against the key registered in Identity (`gpu-protocol`, `more-identity`) | Same, over QUIC with mutual authentication of the transport |
-| Service (Orchestrator, Reconciler, Scheduler, Treasury, Clock, Platform admin, Auditor, Delivery) | `ServiceCredential`: a value only `more-identity` can mint, carrying a service id and a role, tagged by the authority. Each service has its own credential; there is no shared global secret. Revocation is checked on each ledger call | Separate processes, mTLS client certificates per service, short-lived tokens |
+| Service (Orchestrator, Reconciler, Scheduler, Treasury, Clock, Platform admin, Auditor, Delivery) | `ServiceCredential`: a value only `more-identity` can mint, carrying a service id and a role, tagged by the authority. Each service has its own credential; there is no shared global secret. Tag and revocation are checked on every ledger call and every coordinator command | Separate processes, mTLS client certificates per service, short-lived tokens |
 
 A user role is never a property of the account alone. It comes from the resource: a borrower is the borrower **of this job**, a lender is a lender **of this attempt**, a witness is the witness **assigned to this attempt**, and pool rights (borrow, lend, witness, admin) are granted per pool by its admin.
 
@@ -149,7 +149,7 @@ What each boundary is made of today. "In-process" means it holds against bugs an
 | Boundary | Mechanism | Status |
 | --- | --- | --- |
 | Only the Ledger writes balances | `Ledger::transfer` is private to the ledger crate; the public API is `LedgerService::execute` with typed operations; a doc test proves the generic transfer does not compile from outside | Enforced now (compiler + tests) |
-| Caller authentication on the Ledger API | `ServiceCredential` cannot be built outside `more-identity`; the Ledger checks role and revocation on each call | Enforced now (in-process); mTLS between processes is the target |
+| Caller authentication on the Ledger API and the coordinator | `ServiceCredential` cannot be built outside `more-identity`; the Ledger and the coordinator check its tag and revocation on each call | Enforced now (in-process); mTLS between processes is the target |
 | Issuance only by Treasury | Ledger permission matrix | Enforced now |
 | Borrower consent to spending | Ed25519 mandate verified by the Ledger | Enforced now |
 | Per-resource authorization of commands | `authorize` runs before any mutation; TEST-P29 checks every accepted command against an independent restatement of the matrix, on traces where any principal sends any command | Enforced now |

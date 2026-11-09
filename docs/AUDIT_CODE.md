@@ -83,8 +83,8 @@ Severity scale: **critical** (credits or another user's job at the mercy of any 
 - **Where**: `ReplayGuard::admit` rejected only `signature == 0` (l. 222).
 - **Impact**: anyone could send any message as anyone.
 - **Reproduction**: `sec006_signature_is_not_checked` → `Ok(Applied)`.
-- **Fix**: Ed25519 (`ed25519-dalek`) over a fixed binary encoding of the envelope (`Envelope::signing_bytes`, PROTO-003); keys registered in `KeyDirectory`; a key is never replaced silently. Service credentials are HMAC-SHA256 tags minted by `IdentityAuthority`, checked and revocable. A `VerifiedAccount` can only come out of a successful verification.
-- **Tests**: `unsigned_or_altered_messages_are_refused`, `lender_cannot_act_as_witness`, identity unit tests; mutation M60.
+- **Fix**: Ed25519 (`ed25519-dalek`) over a fixed binary encoding of the envelope (`Envelope::signing_bytes`, PROTO-003); keys registered in `KeyDirectory`; a key is never replaced silently. Service credentials are HMAC-SHA256 tags minted by `IdentityAuthority`; the ledger and the coordinator check the tag and the revocation list on every call. A `VerifiedAccount` can only come out of a successful verification.
+- **Tests**: `unsigned_or_altered_messages_are_refused`, `lender_cannot_act_as_witness`, `revoked_service_credential_is_refused_by_the_coordinator`, identity unit tests; mutations M60, M61.
 - **Still symbolic**: frame digests (JOB-R34), receipt digests and the ledger chain use FNV-1a. Delivery is not proven on a network. Nothing in this repository claims otherwise.
 
 ### SAFE-001: arithmetic

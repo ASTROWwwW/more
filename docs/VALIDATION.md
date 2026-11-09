@@ -27,8 +27,8 @@ GitHub Actions on `b8e790b`: format and lints, minimum Rust version, debug tests
 | `tests/properties` | 5 | 5 | TEST-P29 and impersonation in every generator |
 | `tests/scenarios` | 46 | 46 | JOB-F41 strengthened (M50) |
 | `tests/regressions` | 7 | 8 | CE-07 |
-| `tests/security` | — | 18 | the ten attacks of the audit, three simulated compromises, unsigned or altered messages, distinct lenders, and the three protocol tests kept by name |
-| **Total** | **67** | **100** | |
+| `tests/security` | — | 19 | the ten attacks of the audit, three simulated compromises, unsigned or altered messages, a revoked service credential, distinct lenders, and the three protocol tests kept by name |
+| **Total** | **67** | **101** | |
 
 No test was deleted. The two counterexample seeds found during this work are in `tests/properties/proptest-regressions.txt` (11 seeds in total).
 
