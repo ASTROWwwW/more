@@ -9,3 +9,6 @@ publish = false
 
 [dependencies]
 more-identity.workspace = true
+
+[lints]
+workspace = true

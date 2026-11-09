@@ -1,6 +1,9 @@
 //! Ledger API seen from outside the crate: who may request what, and what a compromised service
 //! can still do.
 
+// Test code: a failed unwrap is a failed test.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use gpu_ledger::*;
 use more_identity::{mandate_message, IdentityAuthority, KeyDirectory, ServiceRole, UserKey};
 

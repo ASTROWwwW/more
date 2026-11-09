@@ -10,3 +10,6 @@ publish = false
 [dependencies]
 more-identity.workspace = true
 gpu-ledger.workspace = true
+
+[lints]
+workspace = true

@@ -22,6 +22,19 @@ gpu-protocol = { path = "crates/protocol" }
 gpu-simulation = { path = "crates/simulation" }
 proptest = "1"
 
+# Production crates (identity, ledger, domain, protocol) opt in with `[lints] workspace = true`.
+# The simulation and the conformance tests are test code and keep the default lints.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
 # Root package: only carries the conformance tests (tests/properties, tests/scenarios,
 # tests/regressions).
 [package]

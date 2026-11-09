@@ -1,0 +1,4 @@
+# Tests may unwrap: a failed unwrap is a failed test.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
