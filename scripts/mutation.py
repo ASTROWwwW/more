@@ -158,10 +158,11 @@ EXTRA = {
 def run_suite():
     env = dict(os.environ, PROPTEST_CASES="300")
     p = subprocess.run(
-        ["cargo", "test", "--release", "-q", "--workspace"],
+        ["cargo", "test", "--release", "-q", "--workspace", "--no-fail-fast"],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
     out = p.stdout + p.stderr
-    failed = sorted(set(re.findall(r"^    (\w+)$", out, re.M)))
+    # Test names may carry a module path (`lifecycle::f09_...`).
+    failed = sorted(set(re.findall(r"^    ([\w:]+)$", out, re.M)))
     # The coverage check does not count as a detection: a mutation can fail it just by changing
     # which paths are reached.
     real = [f for f in failed if f != "generator_reaches_interesting_paths"]
