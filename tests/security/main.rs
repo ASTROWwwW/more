@@ -371,20 +371,40 @@ fn extreme_values_are_refused_without_panic() {
             .map_err(|x| x.code()),
         Err("ARITHMETIC_OVERFLOW")
     );
-    let huge = ModelSpec {
-        layers: u32::MAX,
-        price: [u64::MAX; 3],
-        max_outputs: [u32::MAX; 3],
+    // Each bound on its own, so that removing any one of them is noticed.
+    let ok = ModelSpec {
+        layers: 4,
+        price: [1, 1, 1],
+        max_outputs: [1, 1, 1],
     };
-    e.refused(
-        POOL_ADMIN,
-        Message::RegisterModel {
-            pool: CREDIT_POOL,
-            model: ModelId(9),
-            spec: huge,
+    for spec in [
+        ModelSpec {
+            layers: u32::MAX,
+            ..ok
         },
-        "INVALID_INPUT",
-    );
+        ModelSpec {
+            price: [0, u64::MAX, 0],
+            ..ok
+        },
+        ModelSpec {
+            price: [0, 1_000_000_001, 0],
+            ..ok
+        },
+        ModelSpec {
+            max_outputs: [0, u32::MAX, 0],
+            ..ok
+        },
+    ] {
+        e.refused(
+            POOL_ADMIN,
+            Message::RegisterModel {
+                pool: CREDIT_POOL,
+                model: ModelId(9),
+                spec,
+            },
+            "INVALID_INPUT",
+        );
+    }
     let m = Message::SubmitJob {
         job: JobId(7),
         pool: CREDIT_POOL,
