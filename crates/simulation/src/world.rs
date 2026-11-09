@@ -603,8 +603,8 @@ impl Sim {
         let c = &self.coord;
         let svc = |r| self.as_service(r);
         let acct = |a: AccountId| assume_account(a.0);
-        let borrower = |job: &JobId| c.jobs.get(job).map(|j| j.borrower);
-        let attempt = |job: &JobId, n: u32| c.jobs.get(job).and_then(|j| j.attempts.get(&n));
+        let borrower = |job: &JobId| c.jobs().get(job).map(|j| j.borrower);
+        let attempt = |job: &JobId, n: u32| c.jobs().get(job).and_then(|j| j.attempts.get(&n));
         match cmd {
             Tick { .. } => svc(ServiceRole::Clock),
             Issue { .. } => svc(ServiceRole::Treasury),
@@ -724,12 +724,12 @@ impl Sim {
         lender: AccountId,
         items: &[ClaimItem],
     ) {
-        let a = &c.jobs[&slice.job].attempts[&slice.attempt];
+        let a = &c.jobs()[&slice.job].attempts[&slice.attempt];
         for it in items {
             if let ClaimItem::Contribution { output, stage, .. } = it {
                 let st = *stage as usize;
                 if a.lenders.get(st) != Some(&lender)
-                    || c.outputs.get(output) != Some(&slice.attempt)
+                    || c.delivery().outputs().get(output) != Some(&slice.attempt)
                 {
                     continue;
                 }
@@ -741,7 +741,7 @@ impl Sim {
                     lender,
                     ContributionId {
                         output: *output,
-                        charge: c.charges[output].gen,
+                        charge: c.delivery().charges()[output].gen,
                         layer_start: ls,
                         layer_end: le,
                         role: ContributionRole::Executor,
@@ -758,7 +758,7 @@ impl Sim {
     fn slice_of(&self, job: JobId, sel: u8) -> Option<SliceId> {
         let ids: Vec<SliceId> = self
             .coord
-            .slices
+            .slices()
             .keys()
             .filter(|s| s.job == job)
             .copied()
@@ -917,7 +917,8 @@ impl Sim {
                 // Honest: outputs actually validated on this attempt. Otherwise any position.
                 let positions: Vec<u32> = if honest {
                     let mine: Vec<u32> = c
-                        .outputs
+                        .delivery()
+                        .outputs()
                         .iter()
                         .filter(|(o, at)| o.job == id && o.wt == wt && **at == sid.attempt)
                         .map(|(o, _)| o.pos)
@@ -963,7 +964,7 @@ impl Sim {
                 let Some(sid) = self.slice_of(id, slice) else {
                     return vec![];
                 };
-                let a = &c.jobs[&id].attempts[&sid.attempt];
+                let a = &c.jobs()[&id].attempts[&sid.attempt];
                 let lender = pick(&a.lenders, stage);
                 let evidence = if ev % 3 == 0 {
                     Evidence::Uncommitted
@@ -1209,7 +1210,7 @@ impl Sim {
                     .unwrap_or(WorkType::Generate);
                 let t = wt.idx();
                 let Some(open) = c
-                    .slices
+                    .slices()
                     .values()
                     .find(|s| {
                         s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
@@ -1263,7 +1264,7 @@ impl Sim {
             Op::UncommittedBurst { job, sel } => {
                 let id = self.job(job);
                 let live: Vec<SliceId> = c
-                    .slices
+                    .slices()
                     .values()
                     .filter(|s| {
                         s.id.job == id
@@ -1275,7 +1276,7 @@ impl Sim {
                     return vec![];
                 }
                 let sid = live[usize::from(sel) % live.len()];
-                let st = c.slices[&sid].status;
+                let st = c.slices()[&sid].status;
                 let mut v: Vec<Command> = self
                     .honest_claim_with(sid, sel, Evidence::Uncommitted)
                     .into_iter()
@@ -1403,11 +1404,11 @@ impl Sim {
             Op::ContestAtWindowEnd { job } => {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };
-                let w = c.cfg.delivery_window;
+                let w = c.config().delivery_window;
                 // An uncontested provisional output of a revoked attempt, window still open.
-                let target = c.charges.iter().find_map(|(o, ch)| {
+                let target = c.delivery().charges().iter().find_map(|(o, ch)| {
                     let r = j.attempts.get(&ch.attempt)?.revoked_at?;
-                    (o.job == id && !ch.definitive && ch.contest.is_none() && c.now + 60 < r + w)
+                    (o.job == id && !ch.definitive && ch.contest.is_none() && c.now() + 60 < r + w)
                         .then_some((o.wt, ch.attempt, r))
                 });
                 let Some((wt, attempt, r)) = target else {
@@ -1416,7 +1417,7 @@ impl Sim {
                 let t = wt.idx();
                 vec![
                     Command::Tick {
-                        dt: r + w - 60 - c.now,
+                        dt: r + w - 60 - c.now(),
                     },
                     Command::ConfirmDelivery {
                         job: id,
@@ -1464,7 +1465,7 @@ impl Sim {
             Op::Supplement { job, sel, honest } => {
                 let id = self.job(job);
                 let mut cands = Vec::new();
-                for s in c.slices.values().filter(|s| s.id.job == id) {
+                for s in c.slices().values().filter(|s| s.id.job == id) {
                     for (l, line) in &s.lines {
                         for it in &line.items {
                             if let ItemKind::Contribution(cid) = it.kind {
@@ -1497,7 +1498,7 @@ impl Sim {
             Op::ArbitrateDisputed { job, sel } => {
                 let id = self.job(job);
                 let cands: Vec<(SliceId, AccountId)> = c
-                    .slices
+                    .slices()
                     .values()
                     .filter(|s| {
                         s.id.job == id
@@ -1520,9 +1521,9 @@ impl Sim {
                 let (slice, lender) = cands[usize::from(sel) % cands.len()];
                 let mut v = Vec::new();
                 // The arbiter waits for the end of evaluation (JOB-R35 deadline).
-                if c.slices[&slice].status == SliceStatus::Closed {
+                if c.slices()[&slice].status == SliceStatus::Closed {
                     v.push(Command::Tick {
-                        dt: c.cfg.evaluation_deadline,
+                        dt: c.config().evaluation_deadline,
                     });
                     v.push(Command::Reconcile);
                 }
@@ -1540,7 +1541,7 @@ impl Sim {
                     // Silent client and expired lease at the same deadline.
                     vec![
                         Command::Tick {
-                            dt: c.cfg.client_silence.max(c.cfg.lease_ttl),
+                            dt: c.config().client_silence.max(c.config().lease_ttl),
                         },
                         Command::Reconcile,
                     ]
@@ -1567,10 +1568,11 @@ impl Sim {
                 let Some(sid) = self.slice_of(id, slice) else {
                     return vec![];
                 };
-                let a = &c.jobs[&id].attempts[&sid.attempt];
+                let a = &c.jobs()[&id].attempts[&sid.attempt];
                 let st = usize::from(stage) % a.lenders.len();
                 let foreign: Vec<OutputId> = c
-                    .outputs
+                    .delivery()
+                    .outputs()
                     .iter()
                     .filter(|(o, at)| o.job == id && **at != sid.attempt)
                     .map(|(o, _)| *o)
@@ -1598,7 +1600,7 @@ impl Sim {
         let Ok(j) = c.job(id) else { return vec![] };
         // Advance slices first, whatever the job state.
         let mut slice_work = Vec::new();
-        for s in c.slices.values().filter(|s| s.id.job == id) {
+        for s in c.slices().values().filter(|s| s.id.job == id) {
             match s.status {
                 SliceStatus::Closed => slice_work.push(Command::Evaluate { slice: s.id }),
                 SliceStatus::Disputed => {
@@ -1618,7 +1620,9 @@ impl Sim {
                 }
                 SliceStatus::Final => {
                     if let Some((l, _)) = s.lines.iter().find(|(_, l)| l.held > 0) {
-                        let open = s.final_at.is_some_and(|f| c.now < f + c.cfg.reward_window);
+                        let open = s
+                            .final_at
+                            .is_some_and(|f| c.now() < f + c.config().reward_window);
                         if !open {
                             slice_work.push(Command::ReleaseReward {
                                 slice: s.id,
@@ -1638,7 +1642,7 @@ impl Sim {
                     if let Some(cmd) = self.honest_claim(s.id, sel) {
                         slice_work.push(cmd);
                     }
-                    if c.now >= s.receipt_deadline.unwrap_or(0) {
+                    if c.now() >= s.receipt_deadline.unwrap_or(0) {
                         slice_work.push(Command::CloseSlice { slice: s.id });
                     }
                 }
@@ -1693,7 +1697,7 @@ impl Sim {
                 let mut v = self.client_confirm(id, sel);
                 v.extend([
                     Command::Tick {
-                        dt: c.cfg.drain_window + 1,
+                        dt: c.config().drain_window + 1,
                     },
                     Command::Reconcile,
                 ]);
@@ -1704,7 +1708,7 @@ impl Sim {
                 let wt = pick(&WorkType::ALL, sel / 7);
                 let t = wt.idx();
                 let open = c
-                    .slices
+                    .slices()
                     .values()
                     .find(|s| {
                         s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
@@ -1819,7 +1823,7 @@ impl Sim {
             return vec![];
         }
         let Some(open) = c
-            .slices
+            .slices()
             .values()
             .find(|s| s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open)
             .map(|s| s.id)
@@ -1872,17 +1876,17 @@ impl Sim {
             tmp.quiet(&cmd);
             out.push(cmd);
         };
-        let w = c.cfg.uncommitted_window;
+        let w = c.config().uncommitted_window;
         // Between 10 and 59 s before the next multiple of 24 h.
-        let dt = (w - c.now % w)
+        let dt = (w - c.now() % w)
             .saturating_sub(10 + u64::from(sel % 50))
             .max(1);
         step(&mut tmp, Command::Tick { dt });
         for round in 0..2 {
-            let attempt = tmp.coord.jobs[&id].attempt;
+            let attempt = tmp.coord.jobs()[&id].attempt;
             let Some(open) = tmp
                 .coord
-                .slices
+                .slices()
                 .values()
                 .find(|s| {
                     s.id.job == id && s.id.attempt == attempt && s.status == SliceStatus::Open
@@ -1970,7 +1974,7 @@ impl Sim {
         let stage = usize::from(sel) % a.lenders.len();
         let lender = a.lenders[stage];
         let (ls, le) = a.layer_range(stage)?;
-        let staged: Vec<OutputId> = c.slices[&slice]
+        let staged: Vec<OutputId> = c.slices()[&slice]
             .staged
             .iter()
             .filter(|s| s.lender == lender)
@@ -1980,14 +1984,15 @@ impl Sim {
             })
             .collect();
         let todo: Vec<OutputId> = c
-            .outputs
+            .delivery()
+            .outputs()
             .iter()
             .filter(|(o, at)| o.job == slice.job && **at == slice.attempt)
             .map(|(o, _)| *o)
             .filter(|o| {
-                !c.contributions.contains_key(&ContributionId {
+                !c.contributions().contains_key(&ContributionId {
                     output: *o,
-                    charge: c.charges[o].gen,
+                    charge: c.delivery().charges()[o].gen,
                     layer_start: ls,
                     layer_end: le,
                     role: ContributionRole::Executor,
@@ -2090,9 +2095,9 @@ impl Sim {
     /// Liveness (TEST-P06, TEST-P13): stop all activity, let deadlines pass and reconcile. Every
     /// job must end closed with zero escrow, without human action.
     pub fn drain(&mut self) {
-        let jobs: Vec<JobId> = self.coord.jobs.keys().copied().collect();
+        let jobs: Vec<JobId> = self.coord.jobs().keys().copied().collect();
         for id in &jobs {
-            let exec = self.coord.jobs[id].exec;
+            let exec = self.coord.jobs()[id].exec;
             if !exec.is_terminal() && exec != ExecStatus::Settling {
                 let _ = self.exec(Command::Cancel {
                     job: *id,
@@ -2104,7 +2109,7 @@ impl Sim {
             let _ = self.exec(Command::Tick { dt: 3 * 24 * 3600 });
             let _ = self.exec(Command::Reconcile);
         }
-        for j in self.coord.jobs.values() {
+        for j in self.coord.jobs().values() {
             if !j.exec.is_terminal() || j.settle != SettleStatus::Closed {
                 self.violations.push(Violation {
                     property: "TEST-P06",
@@ -2112,7 +2117,7 @@ impl Sim {
                 });
             }
         }
-        for s in self.coord.slices.values() {
+        for s in self.coord.slices().values() {
             if s.status != SliceStatus::Final {
                 self.violations.push(Violation {
                     property: "TEST-P06",
@@ -2130,7 +2135,7 @@ impl Sim {
             }
         }
         // JOB-R29: no delivery stays provisional.
-        for (o, ch) in &self.coord.charges {
+        for (o, ch) in self.coord.delivery().charges() {
             if !ch.definitive {
                 self.violations.push(Violation {
                     property: "TEST-P06",

@@ -1,7 +1,8 @@
 //! Commands applied by the coordinator. Each maps to one or more transitions of the spec.
 
 use crate::ids::*;
-use crate::model::{ClaimItem, ModelSpec, PauseReason, PoolAccess, PoolMode, Rights};
+use crate::model::{ClaimItem, PauseReason};
+use crate::registry::{ModelSpec, PoolAccess, PoolMode, Rights};
 use gpu_ledger::Amount;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

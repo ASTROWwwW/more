@@ -254,7 +254,7 @@ fn expired_or_revoked_attempt_cannot_send_work() {
 #[test]
 fn the_client_never_sets_the_price() {
     let mut e = Edge::running();
-    let j = &e.sim.coord.jobs[&J1];
+    let j = &e.sim.coord.jobs()[&J1];
     assert_eq!(j.price, catalog()[0].2.price, "price comes from the tariff");
     // The message has no price field. A budget below the tariff's cost is refused.
     let budget = 10;
@@ -343,7 +343,7 @@ fn non_member_cannot_use_a_private_pool() {
         e.send(STRANGER, Message::JoinPool { pool: PoolId(5) }),
         Ok(Outcome::Applied)
     );
-    let r = e.sim.coord.pools[&PoolId(5)].rights(STRANGER);
+    let r = e.sim.coord.registry().pools()[&PoolId(5)].rights(STRANGER);
     assert!(r.borrow && r.lend && !r.witness);
 }
 
@@ -419,7 +419,7 @@ fn extreme_values_are_refused_without_panic() {
     };
     assert_eq!(e.send(LENDERS[0], claim), Ok(Outcome::Applied));
     e.sim.exec(Command::CloseSlice { slice }).unwrap();
-    let s = &e.sim.coord.slices[&slice];
+    let s = &e.sim.coord.slices()[&slice];
     assert_eq!(s.rejected_items, 1);
     assert!(s.lines.is_empty());
     assert!(e.sim.violations.is_empty(), "{:#?}", e.sim.violations);
@@ -631,7 +631,7 @@ fn unsigned_or_altered_messages_are_refused() {
         e.send_env(&env).map_err(|x| x.code()),
         Err("UNKNOWN_ACCOUNT")
     );
-    assert_eq!(e.sim.coord.jobs[&J1].exec, ExecStatus::Running);
+    assert_eq!(e.sim.coord.jobs()[&J1].exec, ExecStatus::Running);
 }
 
 /// SAFE-002: one account cannot hold two ranges of the same attempt (it would commit its own

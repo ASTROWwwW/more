@@ -91,7 +91,7 @@ fn witness_of(c: Caller, job: &Job, attempt: u32) -> R {
 }
 
 fn pool_admin(c: &Coordinator, who: Caller, pool: PoolId) -> R {
-    let p = c.pools.get(&pool).ok_or(DomainError::UnknownPool)?;
+    let p = c.registry().pool(pool)?;
     match who {
         Caller::Service(ServiceRole::PlatformAdmin) => Ok(()),
         Caller::Account(a) if p.is_admin(a) => Ok(()),
@@ -121,7 +121,7 @@ pub(crate) fn authorize(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> R 
             if account(who) != Some(*borrower) {
                 return Err(deny("a job is submitted by its borrower"));
             }
-            let p = c.pools.get(pool).ok_or(DomainError::UnknownPool)?;
+            let p = c.registry().pool(*pool)?;
             if !p.rights(*borrower).borrow {
                 return Err(deny("no borrow right in this pool"));
             }

@@ -70,7 +70,10 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     let j1 = JobId(1);
     let lenders = vec![AccountId(10), AccountId(11), AccountId(12)];
     let ready = |sim: &mut Sim| {
-        let (a, v) = (sim.coord.jobs[&j1].attempt, sim.coord.jobs[&j1].validated);
+        let (a, v) = (
+            sim.coord.jobs()[&j1].attempt,
+            sim.coord.jobs()[&j1].validated,
+        );
         sim.exec(Command::AttemptReady {
             job: j1,
             attempt: a,
@@ -124,7 +127,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     })
     .unwrap();
     ready(&mut sim);
-    let s = *sim.coord.slices.keys().rfind(|s| s.attempt == 2).unwrap();
+    let s = *sim.coord.slices().keys().rfind(|s| s.attempt == 2).unwrap();
     sim.exec(Command::Claim {
         slice: s,
         lender: lenders[0],
@@ -139,8 +142,8 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     sim.exec(Command::Evaluate { slice: s }).unwrap();
     assert_eq!(
         (
-            sim.coord.jobs[&j1].recovery_paid_borrower,
-            sim.coord.jobs[&j1].recovery_paid_pool
+            sim.coord.jobs()[&j1].recovery_paid_borrower,
+            sim.coord.jobs()[&j1].recovery_paid_pool
         ),
         (17, 3)
     );
@@ -234,7 +237,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
     })
     .unwrap();
     sim.exec(Command::Evaluate { slice: s }).unwrap();
-    let line = &sim.coord.slices[&s].lines[&l];
+    let line = &sim.coord.slices()[&s].lines[&l];
     assert_eq!(
         (line.paid, line.pending),
         (0, 6),
@@ -243,7 +246,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
     // JOB-R35: the refund for missing proof only becomes final at the evaluation deadline.
     sim.exec(Command::Tick { dt: 600 }).unwrap();
     sim.exec(Command::Reconcile).unwrap();
-    let line = &sim.coord.slices[&s].lines[&l];
+    let line = &sim.coord.slices()[&s].lines[&l];
     assert_eq!(
         (line.paid, line.refunded),
         (0, 6),
@@ -320,7 +323,7 @@ fn ce03_commitment_before_closure_still_counts() {
     .unwrap();
     sim.exec(Command::CloseSlice { slice: s }).unwrap();
     sim.exec(Command::Evaluate { slice: s }).unwrap();
-    assert_eq!(sim.coord.slices[&s].lines[&l].paid, 6);
+    assert_eq!(sim.coord.slices()[&s].lines[&l].paid, 6);
     sim.drain();
     assert_clean(&sim);
 }
@@ -412,7 +415,7 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
     .unwrap();
     sim.exec(Command::Tick { dt: 121 }).unwrap();
     sim.exec(Command::Reconcile).unwrap(); // closure: both contributions reserved
-    assert_eq!(sim.coord.slices[&s].status, SliceStatus::Closed);
+    assert_eq!(sim.coord.slices()[&s].status, SliceStatus::Closed);
     // The client never got position 1, and the witness can no longer replay it.
     sim.exec(Command::ConfirmDelivery {
         job: j,
@@ -421,15 +424,15 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
         digest: sim.coord.frame_digest(j, gen, 1),
     })
     .unwrap();
-    assert!(!sim.coord.outputs.contains_key(&OutputId {
+    assert!(!sim.coord.delivery().outputs().contains_key(&OutputId {
         job: j,
         wt: gen,
         pos: 1
     }));
     sim.exec(Command::Tick { dt: 601 }).unwrap();
     sim.exec(Command::Reconcile).unwrap(); // evaluation must not fail anymore
-    assert_eq!(sim.coord.slices[&s].status, SliceStatus::Final);
-    let line = &sim.coord.slices[&s].lines[&AccountId(10)];
+    assert_eq!(sim.coord.slices()[&s].status, SliceStatus::Final);
+    let line = &sim.coord.slices()[&s].lines[&AccountId(10)];
     assert_eq!((line.paid, line.refunded), (6, 6));
     sim.drain();
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
@@ -503,7 +506,7 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
     .unwrap();
     sim.exec(Command::CloseSlice { slice: s }).unwrap();
     sim.exec(Command::Evaluate { slice: s }).unwrap();
-    let it = &sim.coord.slices[&s].lines[&AccountId(11)].items[0];
+    let it = &sim.coord.slices()[&s].lines[&AccountId(11)].items[0];
     assert_eq!((it.status, it.amount), (ItemStatus::Paid, 0));
     assert!(it.reward_done, "a zero reward has nothing to hold");
     sim.drain();
@@ -582,7 +585,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
     sim.exec(Command::CloseSlice { slice: s }).unwrap();
     sim.exec(Command::Evaluate { slice: s }).unwrap(); // provisional output: pending
     assert_eq!(
-        sim.coord.slices[&s].status,
+        sim.coord.slices()[&s].status,
         SliceStatus::Closed,
         "not finished before deadline"
     );
@@ -594,7 +597,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
         upto: 2,
     })
     .unwrap();
-    let line = &sim.coord.slices[&s].lines[&AccountId(10)];
+    let line = &sim.coord.slices()[&s].lines[&AccountId(10)];
     assert_eq!(
         line.pending, 6,
         "back to pending evaluation, slice still open"
@@ -602,7 +605,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
     sim.exec(Command::Tick { dt: 600 }).unwrap();
     sim.exec(Command::Reconcile).unwrap();
-    assert_eq!(sim.coord.slices[&s].status, SliceStatus::Final);
+    assert_eq!(sim.coord.slices()[&s].status, SliceStatus::Final);
     sim.drain();
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
 }
@@ -618,7 +621,11 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
 fn ce07_only_the_reconciler_reconciles() {
     let mut sim = Sim::default();
     sim.exec(Command::Reserve { job: JobId(1) }).unwrap();
-    for role in [ServiceRole::Scheduler, ServiceRole::Auditor, ServiceRole::Clock] {
+    for role in [
+        ServiceRole::Scheduler,
+        ServiceRole::Auditor,
+        ServiceRole::Clock,
+    ] {
         let ctx = sim.as_service(role);
         let before = sim.coord.clone();
         assert!(matches!(

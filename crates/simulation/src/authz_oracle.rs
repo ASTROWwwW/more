@@ -16,10 +16,11 @@ fn acct(ctx: &AuthContext) -> Option<AccountId> {
 
 fn admin(c: &Coordinator, ctx: &AuthContext, pool: PoolId) -> bool {
     is(ctx, &[ServiceRole::PlatformAdmin])
-        || c.pools
+        || c.registry()
+            .pools()
             .get(&pool)
             .zip(acct(ctx))
-            .is_some_and(|(p, a)| p.admins.contains(&a))
+            .is_some_and(|(p, a)| p.admins().contains(&a))
 }
 
 /// True when the matrix allows `ctx` to send `cmd` in state `c`. When the resource does not exist,
@@ -28,7 +29,7 @@ pub fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool {
     use Command::*;
     use ServiceRole as S;
     let me = acct(ctx);
-    let job = |id: &JobId| c.jobs.get(id);
+    let job = |id: &JobId| c.jobs().get(id);
     let borrower = |id: &JobId| job(id).is_some_and(|j| Some(j.borrower) == me);
     let att = |id: &JobId, n: u32| job(id).and_then(|j| j.attempts.get(&n));
     let drivers = [S::Scheduler, S::Reconciler];
@@ -42,9 +43,10 @@ pub fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool {
             borrower: b, pool, ..
         } => {
             me == Some(*b)
-                && c.pools
+                && c.registry()
+                    .pools()
                     .get(pool)
-                    .and_then(|p| p.members.get(b))
+                    .and_then(|p| p.members().get(b))
                     .is_some_and(|r| r.borrow)
         }
         Reserve { .. }

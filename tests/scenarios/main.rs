@@ -30,7 +30,7 @@ impl T {
     }
 
     fn job(&self, j: JobId) -> &Job {
-        &self.c().jobs[&j]
+        &self.c().jobs()[&j]
     }
 
     fn assert_clean(&self) {
@@ -128,9 +128,9 @@ impl T {
     fn open_slice(&self, j: JobId) -> SliceId {
         *self
             .c()
-            .slices
+            .slices()
             .keys()
-            .rfind(|s| s.job == j && self.c().slices[s].status == SliceStatus::Open)
+            .rfind(|s| s.job == j && self.c().slices()[s].status == SliceStatus::Open)
             .expect("open slice")
     }
 
@@ -138,7 +138,8 @@ impl T {
     fn claim_all(&mut self, s: SliceId, ev: Evidence) {
         let outs: Vec<OutputId> = self
             .c()
-            .outputs
+            .delivery()
+            .outputs()
             .iter()
             .filter(|(o, a)| o.job == s.job && **a == s.attempt)
             .map(|(o, _)| *o)
@@ -169,7 +170,7 @@ impl T {
             let step = left.min(15);
             let live: Vec<(JobId, u32)> = self
                 .c()
-                .jobs
+                .jobs()
                 .values()
                 .filter(|j| matches!(j.exec, ExecStatus::Running | ExecStatus::Placing))
                 .filter(|j| j.current().is_some_and(|a| a.revoked_at.is_none()))
@@ -219,7 +220,8 @@ impl T {
 
     fn charge(&self, j: JobId, pos: u32) -> Option<OutputCharge> {
         self.c()
-            .charges
+            .delivery()
+            .charges()
             .get(&OutputId {
                 job: j,
                 wt: GEN,
@@ -236,7 +238,7 @@ impl T {
             pos,
         };
         self.c()
-            .audit
+            .audit_log()
             .iter()
             .map(|e| match e {
                 AuditEvent::OutputCharged { output, .. } if *output == o => 1,
@@ -252,7 +254,7 @@ impl T {
     }
 
     fn line(&self, s: SliceId, l: AccountId) -> Line {
-        self.c().slices[&s]
+        self.c().slices()[&s]
             .lines
             .get(&l)
             .cloned()
@@ -262,7 +264,7 @@ impl T {
     fn finish(mut self) {
         self.sim.drain();
         self.assert_clean();
-        for j in self.c().jobs.values() {
+        for j in self.c().jobs().values() {
             assert_eq!(j.settle, SettleStatus::Closed, "{:?}", j.id);
         }
     }
@@ -404,7 +406,7 @@ fn f04_duplicate_report_after_settlement_pays_once() {
         }],
     });
     t.close_eval(s2);
-    assert_eq!(t.c().slices[&s2].rejected_items, 1);
+    assert_eq!(t.c().slices()[&s2].rejected_items, 1);
     assert_eq!(
         t.bal(Account::PendingReward {
             job: 1,
@@ -552,7 +554,7 @@ fn f08_lost_contact_revocation_stops_payment() {
         wt: GEN,
         upto: 2,
     });
-    assert!(!t.c().outputs.contains_key(&OutputId {
+    assert!(!t.c().delivery().outputs().contains_key(&OutputId {
         job: J1,
         wt: GEN,
         pos: 1
@@ -648,7 +650,7 @@ fn f11_identical_reports_counted_once() {
     });
     t.close_eval(s);
     assert_eq!(t.line(s, L[0]).paid, 6);
-    assert_eq!(t.c().slices[&s].rejected_items, 1);
+    assert_eq!(t.c().slices()[&s].rejected_items, 1);
     t.finish();
 }
 
@@ -695,7 +697,7 @@ fn f14_preemption_settles_slice_then_resumes() {
         reason: PauseReason::Preempted,
         expected_version: None,
     });
-    assert_eq!(t.c().slices[&s].status, SliceStatus::Draining);
+    assert_eq!(t.c().slices()[&s].status, SliceStatus::Draining);
     t.ok(Command::Tick { dt: 121 });
     t.close_eval(s);
     assert_eq!(t.line(s, L[1]).paid, 2 * 4);
@@ -744,7 +746,7 @@ fn f15_withheld_acks_bound_loss_to_k() {
     t.ok(Command::Reconcile); // evaluation deadline
     assert_eq!(t.line(s, L[0]).paid, 6, "only the validated output is paid");
     assert_eq!(
-        t.c().slices[&s].rejected_items,
+        t.c().slices()[&s].rejected_items,
         4,
         "loss bounded by K = 4 unacknowledged outputs"
     );
@@ -857,7 +859,7 @@ fn f17_receipts_fabricated_after_revocation() {
     // 4 x 4 = 16 > cap 8: 2 paid, 2 disputed.
     assert_eq!(t.line(s, L[1]).paid, 8);
     assert_eq!(t.line(s, L[1]).disputed, 8);
-    assert_eq!(t.c().slices[&s].status, SliceStatus::Disputed);
+    assert_eq!(t.c().slices()[&s].status, SliceStatus::Disputed);
     t.finish();
 }
 
@@ -876,7 +878,7 @@ fn f18_new_attempt_runs_while_old_slice_drains() {
     t.gen(J1, 2);
     t.commit_all(J1);
     let s2 = t.open_slice(J1);
-    assert_eq!(t.c().slices[&s1].status, SliceStatus::Draining);
+    assert_eq!(t.c().slices()[&s1].status, SliceStatus::Draining);
     t.claim_all(s1, Evidence::Committed);
     t.claim_all(s2, Evidence::Committed);
     t.close_eval(s2);
@@ -1014,7 +1016,7 @@ fn f20_unvalidated_positions_are_wasted_not_billed() {
             wt: GEN,
             pos: p,
         };
-        assert_eq!(t.c().outputs[&o], if p < 2 { 1 } else { 2 });
+        assert_eq!(t.c().delivery().outputs()[&o], if p < 2 { 1 } else { 2 });
     }
     t.finish();
 }
@@ -1056,7 +1058,7 @@ fn f21_dispute_isolated_to_one_lender_line() {
         items: (0..3).map(|p| item(p, 2, Evidence::Uncommitted)).collect(),
     });
     t.close_eval(s);
-    assert_eq!(t.c().slices[&s].status, SliceStatus::Final);
+    assert_eq!(t.c().slices()[&s].status, SliceStatus::Final);
     // Second slice: lender 12 goes over the cap, only its line is disputed.
     t.gen(J1, 3);
     t.commit_all(J1);
@@ -1072,7 +1074,7 @@ fn f21_dispute_isolated_to_one_lender_line() {
         items: (3..6).map(|p| item(p, 2, Evidence::Uncommitted)).collect(),
     });
     t.close_eval(s2);
-    assert_eq!(t.c().slices[&s2].status, SliceStatus::Disputed);
+    assert_eq!(t.c().slices()[&s2].status, SliceStatus::Disputed);
     assert_eq!(t.line(s2, L[0]).paid, 18);
     assert_eq!(t.line(s2, L[0]).disputed, 0);
     assert_eq!(t.line(s2, L[2]).paid, 2);
@@ -1082,7 +1084,7 @@ fn f21_dispute_isolated_to_one_lender_line() {
         lender: L[2],
         pay: true,
     });
-    assert_eq!(t.c().slices[&s2].status, SliceStatus::Final);
+    assert_eq!(t.c().slices()[&s2].status, SliceStatus::Final);
     t.finish();
 }
 
@@ -1203,7 +1205,7 @@ fn r21_every_stage_paid_once_and_sum_le_price() {
         }],
     });
     t.close_eval(s2);
-    assert_eq!(t.c().slices[&s2].rejected_items, 1);
+    assert_eq!(t.c().slices()[&s2].rejected_items, 1);
     t.finish();
 }
 
@@ -1413,7 +1415,7 @@ fn f25_lender_cannot_attest_its_own_delivery() {
         }),
         DomainError::InadmissibleProof
     );
-    assert!(t.c().charges.is_empty());
+    assert!(t.c().delivery().charges().is_empty());
     t.wait(60);
     t.ok(Command::Reconcile);
     assert_eq!(
@@ -1476,7 +1478,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
         assert_eq!(t.net_charges(J1, pos), 1, "position {pos} billed once");
     }
     assert_eq!(
-        t.c().outputs[&OutputId {
+        t.c().delivery().outputs()[&OutputId {
             job: J1,
             wt: GEN,
             pos: 5
@@ -1485,7 +1487,7 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
         "replayed, not regenerated"
     );
     assert_eq!(
-        t.c().outputs[&OutputId {
+        t.c().delivery().outputs()[&OutputId {
             job: J1,
             wt: GEN,
             pos: 6
@@ -1508,7 +1510,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
     t.close_eval(s);
     // Contributions to provisional outputs: reserved and waiting (JOB-R30); the slice stays closed
     // until the deadline (CE-06).
-    assert_eq!(t.c().slices[&s].status, SliceStatus::Closed);
+    assert_eq!(t.c().slices()[&s].status, SliceStatus::Closed);
     assert_eq!(t.line(s, L[0]).paid, 6);
     assert_eq!(t.line(s, L[0]).disputed, 4 * 6);
     assert!(
@@ -1569,7 +1571,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
     assert_eq!(t.net_charges(J1, 3), 1);
     assert_eq!(t.charge(J1, 3).unwrap().gen, 1);
     assert_eq!(
-        t.c().outputs[&OutputId {
+        t.c().delivery().outputs()[&OutputId {
             job: J1,
             wt: GEN,
             pos: 3
@@ -1595,7 +1597,7 @@ fn f28_simultaneous_client_silence_and_lease_expiry() {
     );
     let revocations = t
         .c()
-        .audit
+        .audit_log()
         .iter()
         .filter(|e| {
             matches!(
@@ -1923,7 +1925,7 @@ fn f37_commitment_before_revocation_makes_late_attestation_admissible() {
     t.deliver(J1, 4);
     assert!(t
         .c()
-        .audit
+        .audit_log()
         .iter()
         .any(|e| matches!(e, AuditEvent::LateDelivery { to: 4, .. })));
     assert!(!t.charge(J1, 3).unwrap().definitive, "billed provisionally");
@@ -2121,7 +2123,7 @@ fn f41_supplementary_proof_before_deadline_is_paid_after_is_refused() {
     let s = t.open_slice(J1);
     t.claim_all(s, Evidence::None); // claims sent before the proof came back
     t.close_eval(s);
-    assert_eq!(t.c().slices[&s].status, SliceStatus::Closed);
+    assert_eq!(t.c().slices()[&s].status, SliceStatus::Closed);
     assert_eq!(
         t.line(s, L[0]).pending,
         2 * 6,

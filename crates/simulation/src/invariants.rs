@@ -45,12 +45,12 @@ fn committed_before_independent(
     wt: WorkType,
     pos: u32,
 ) -> bool {
-    let job = &c.jobs[&slice.job];
+    let job = &c.jobs()[&slice.job];
     let attempt = &job.attempts[&slice.attempt];
     // No receipt is accepted after closure, so the bound is the earlier of revocation and closure.
-    let closed = c.slices[&slice].closed_seq.unwrap_or(c.seq);
+    let closed = c.slices()[&slice].closed_seq.unwrap_or(c.seq());
     let cutoff = attempt.revoked_seq.map_or(closed, |r| r.min(closed));
-    c.commit_log
+    c.commit_log()
         .get(&(slice.job, slice.attempt, lender, wt))
         .is_some_and(|log| {
             log.iter()
@@ -72,7 +72,9 @@ fn fnv_words(words: &[u64]) -> u64 {
 
 /// Expected digest of frames `0..upto` (JOB-R34), recomputed independently.
 fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u64 {
-    let Some(j) = c.jobs.get(&job) else { return 0 };
+    let Some(j) = c.jobs().get(&job) else {
+        return 0;
+    };
     let mut h = fnv_words(&[
         u64::from(job.0),
         j.stream,
@@ -81,9 +83,9 @@ fn digest_independent(c: &Coordinator, job: JobId, wt: WorkType, upto: u32) -> u
     ]);
     for pos in 0..upto {
         let o = OutputId { job, wt, pos };
-        let gen = match c.charges.get(&o) {
+        let gen = match c.delivery().charges().get(&o) {
             Some(ch) => ch.gen,
-            None => c.charge_gens.get(&o).copied().unwrap_or(0),
+            None => c.delivery().charge_gens().get(&o).copied().unwrap_or(0),
         };
         h = fnv_words(&[h, u64::from(pos), u64::from(gen)]);
     }
@@ -102,7 +104,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
 
     // TEST-P01: only transitions from the table were applied.
-    for e in &c.audit {
+    for e in c.audit_log() {
         match e {
             AuditEvent::Exec {
                 from: Some(f),
@@ -135,7 +137,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     // TEST-P03, TEST-P19: an output's net charge is 0 or 1, and 1 exactly for registered outputs
     // (JOB-R17, JOB-R29).
     let mut net: BTreeMap<OutputId, i64> = BTreeMap::new();
-    for e in &c.audit {
+    for e in c.audit_log() {
         match e {
             AuditEvent::OutputCharged { output, .. } => *net.entry(*output).or_default() += 1,
             AuditEvent::OutputVoided { output, .. } => *net.entry(*output).or_default() -= 1,
@@ -146,26 +148,27 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
         if !(0..=1).contains(n) {
             out.push(v("TEST-P03", format!("output {o:?} net charge {n}")));
         }
-        if (*n == 1) != c.outputs.contains_key(o) {
+        if (*n == 1) != c.delivery().outputs().contains_key(o) {
             out.push(v(
                 "TEST-P19",
                 format!(
                     "output {o:?}: net charge {n} but registry says {}",
-                    c.outputs.contains_key(o)
+                    c.delivery().outputs().contains_key(o)
                 ),
             ));
         }
     }
-    if c.outputs.len() != c.charges.len()
-        || c.charges
+    if c.delivery().outputs().len() != c.delivery().charges().len()
+        || c.delivery()
+            .charges()
             .iter()
-            .any(|(o, ch)| c.outputs.get(o) != Some(&ch.attempt))
+            .any(|(o, ch)| c.delivery().outputs().get(o) != Some(&ch.attempt))
     {
         out.push(v("TEST-P19", "outputs and charges disagree"));
     }
     // TEST-P05, TEST-P19: charged positions are exactly [0, delivered); validated <= delivered;
     // definitive prefix then provisional suffix; every validated position is definitive.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         for wt in WorkType::ALL {
             let t = wt.idx();
             let (val, del) = (j.validated[t], j.delivered[t]);
@@ -176,7 +179,8 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                 ));
             }
             let n = c
-                .outputs
+                .delivery()
+                .outputs()
                 .keys()
                 .filter(|o| o.job == j.id && o.wt == wt)
                 .count() as u32;
@@ -189,7 +193,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
             let mut seen_provisional = false;
             for pos in 0..del {
                 let o = OutputId { job: j.id, wt, pos };
-                match c.charges.get(&o) {
+                match c.delivery().charges().get(&o) {
                     None => out.push(v(
                         "TEST-P05",
                         format!("delivered position {pos} of {:?} {wt:?} not charged", j.id),
@@ -210,7 +214,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
             }
             // TEST-P21: bounded exposure, at most K outputs delivered without client signature for
             // the whole job (JOB-R13, JOB-R27).
-            if del.saturating_sub(val) > c.cfg.flow_budget[t] {
+            if del.saturating_sub(val) > c.config().flow_budget[t] {
                 out.push(v(
                     "TEST-P21",
                     format!(
@@ -230,7 +234,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     let mut paid_by_output: BTreeMap<(OutputId, u32), Amount> = BTreeMap::new();
     let mut uncommitted_by_lender: BTreeMap<AccountId, Vec<(Time, Amount)>> = BTreeMap::new();
     let mut recovery_paid_by_job: BTreeMap<JobId, Amount> = BTreeMap::new();
-    for e in &c.audit {
+    for e in c.audit_log() {
         match e {
             AuditEvent::ItemReserved {
                 kind: ItemKind::Contribution(cid),
@@ -260,7 +264,8 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                         *paid_by_cid.entry(*cid).or_default() += 1;
                         *paid_by_output.entry((cid.output, cid.charge)).or_default() += amount;
                         let in_force = c
-                            .charges
+                            .delivery()
+                            .charges()
                             .get(&cid.output)
                             .is_some_and(|ch| ch.gen == cid.charge);
                         if !in_force {
@@ -268,13 +273,13 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                                 "TEST-P22",
                                 format!("{cid:?} paid but its charge is no longer in force"),
                             ));
-                        } else if c.outputs.get(&cid.output) != Some(&slice.attempt) {
+                        } else if c.delivery().outputs().get(&cid.output) != Some(&slice.attempt) {
                             out.push(v(
                                 "TEST-P04",
                                 format!(
                                     "{cid:?} paid on attempt {} but output bound to {:?}",
                                     slice.attempt,
-                                    c.outputs.get(&cid.output)
+                                    c.delivery().outputs().get(&cid.output)
                                 ),
                             ));
                         }
@@ -311,7 +316,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
         }
     }
     for ((o, _), amt) in &paid_by_output {
-        let price = c.jobs.get(&o.job).map_or(0, |j| j.price[o.wt.idx()]);
+        let price = c.jobs().get(&o.job).map_or(0, |j| j.price[o.wt.idx()]);
         if *amt > price {
             out.push(v(
                 "TEST-P15",
@@ -321,7 +326,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
     // TEST-P08: sliding cap recomputed from the payment log; gross amounts within any 24 h window
     // stay under the cap.
-    let w = c.cfg.uncommitted_window;
+    let w = c.config().uncommitted_window;
     for (l, pays) in &uncommitted_by_lender {
         for (ti, _) in pays {
             let sum: Amount = pays
@@ -329,7 +334,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                 .filter(|(tj, _)| tj + w > *ti && tj <= ti)
                 .map(|(_, a)| a)
                 .sum();
-            if sum > c.cfg.uncommitted_cap {
+            if sum > c.config().uncommitted_cap {
                 out.push(v(
                     "TEST-P08",
                     format!(
@@ -341,7 +346,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
 
     // TEST-P12: line invariants and consistency with the ledger.
-    for s in c.slices.values() {
+    for s in c.slices().values() {
         for (lender, l) in &s.lines {
             if l.claimed != l.pending + l.paid + l.refunded + l.disputed {
                 out.push(v("TEST-P12", format!("{:?}/{lender:?}: claimed {} != pending {} + paid {} + refunded {} + disputed {}", s.id, l.claimed, l.pending, l.paid, l.refunded, l.disputed)));
@@ -403,7 +408,11 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                     ));
                 }
                 if let ItemKind::Contribution(cid) = it.kind {
-                    let ch = c.charges.get(&cid.output).filter(|ch| ch.gen == cid.charge);
+                    let ch = c
+                        .delivery()
+                        .charges()
+                        .get(&cid.output)
+                        .filter(|ch| ch.gen == cid.charge);
                     match ch {
                         None if it.status != ItemStatus::Refunded => out.push(v(
                             "TEST-P22",
@@ -428,7 +437,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
 
     // TEST-P13: a closed settlement leaves escrow at zero.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         if j.settle == SettleStatus::Closed {
             for acct in [
                 Account::EscrowWork(j.id.0),
@@ -442,7 +451,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                     ));
                 }
             }
-            for s in c.slices.values().filter(|s| s.id.job == j.id) {
+            for s in c.slices().values().filter(|s| s.id.job == j.id) {
                 if s.status != SliceStatus::Final {
                     out.push(v(
                         "TEST-P13",
@@ -461,7 +470,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 
     // TEST-P14: recovery paid stays within the earmarks and the credits that entered recovery
     // escrow.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         for a in j.attempts.values() {
             if a.recovery_reserved > a.recovery_earmark {
                 out.push(v(
@@ -493,7 +502,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 
     // TEST-P17 (CE-02): pool credits never benefit the borrower. Borrower budget first; unspent
     // pool share goes back to the pool.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         let sum_entries =
             |pred: &dyn Fn(&gpu_domain::Account, &gpu_domain::Account) -> bool| -> Amount {
                 ledger
@@ -569,7 +578,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 
     // TEST-P18: the live attempt's unbilled window is covered by work escrow (JOB-R25), so a charge
     // never lacks funds.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         if let Some(a) = j.current() {
             if a.revoked_at.is_none() {
                 let window: Amount = (0..3)
@@ -589,7 +598,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
 
     // TEST-P09: flow budget for the live attempt.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         if let Some(a) = j.current() {
             for wt in WorkType::ALL {
                 let t = wt.idx();
@@ -607,7 +616,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
                         ),
                     ));
                 } else if a.revoked_at.is_none()
-                    && a.produced[t] - j.validated[t] > c.cfg.flow_budget[t]
+                    && a.produced[t] - j.validated[t] > c.config().flow_budget[t]
                 {
                     out.push(v(
                         "TEST-P09",
@@ -624,12 +633,12 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 
     // TEST-P25: a live attempt is built on outputs that exist; its start never exceeds delivered
     // positions (a rewind below it must revoke it, JOB-R29).
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         let Some(a) = j.current() else { continue };
         if a.revoked_at.is_some() {
             continue;
         }
-        let start = c.audit.iter().rev().find_map(|e| match e {
+        let start = c.audit_log().iter().rev().find_map(|e| match e {
             AuditEvent::AttemptStarted {
                 job,
                 attempt,
@@ -652,9 +661,9 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     }
 
     // TEST-P24: a lease is never extended beyond one TTL.
-    for j in c.jobs.values() {
+    for j in c.jobs().values() {
         if let Some(a) = j.current() {
-            if a.revoked_at.is_none() && a.lease_expires_at > c.now + c.cfg.lease_ttl {
+            if a.revoked_at.is_none() && a.lease_expires_at > c.now() + c.config().lease_ttl {
                 out.push(v(
                     "TEST-P24",
                     format!("{:?} attempt {}: lease beyond now + ttl", j.id, a.no),
@@ -665,7 +674,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 
     // TEST-P07, TEST-P25: every (re)start begins exactly at the last delivered position; delivered
     // output is replayed, never regenerated.
-    for e in &c.audit {
+    for e in c.audit_log() {
         if let AuditEvent::AttemptStarted {
             job,
             attempt,
@@ -692,7 +701,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
 /// Admissible basis for each billing event of a step (TEST-P20).
 fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) -> Vec<Violation> {
     let mut out = Vec::new();
-    let new = &after.audit[before.audit.len().min(after.audit.len())..];
+    let new = &after.audit_log()[before.audit_log().len().min(after.audit_log().len())..];
     let from_reconcile = matches!(
         cmd,
         Command::Reconcile | Command::ExpireDeliveryWindow { .. }
@@ -713,7 +722,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                         wt,
                         upto,
                         digest,
-                    } => before.jobs.get(job).is_some_and(|j| {
+                    } => before.jobs().get(job).is_some_and(|j| {
                         j.attempts.get(attempt).is_some_and(|a| {
                             let independent = a.witness == *witness
                                 && !a.witness_lost
@@ -728,9 +737,10 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                                 (None, _) => true,
                                 (Some(r), Some(rs)) => {
                                     j.attempt == *attempt
-                                        && before.now <= r + before.cfg.drain_window
+                                        && before.now() <= r + before.config().drain_window
                                         && before
-                                            .witness_commits
+                                            .delivery()
+                                            .witness_commits()
                                             .get(&(*job, *attempt, *wt))
                                             .is_some_and(|l| {
                                                 l.iter().any(|(u, sq)| *u >= *upto && *sq < rs)
@@ -766,7 +776,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             }
             AuditEvent::OutputConfirmed { output, basis } => {
                 let contested = before
-                    .charges
+                    .delivery()
+                    .charges()
                     .get(output)
                     .is_some_and(|ch| ch.contest.is_some());
                 let ok = match basis {
@@ -791,10 +802,12 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                         // window, and never a contested output.
                         from_reconcile
                             && !contested
-                            && after.charges.get(output).is_some_and(|ch| {
-                                after.jobs[&output.job].attempts[&ch.attempt]
+                            && after.delivery().charges().get(output).is_some_and(|ch| {
+                                after.jobs()[&output.job].attempts[&ch.attempt]
                                     .revoked_at
-                                    .is_some_and(|r| after.now >= r + after.cfg.delivery_window)
+                                    .is_some_and(|r| {
+                                        after.now() >= r + after.config().delivery_window
+                                    })
                             })
                     }
                     ChargeBasis::Witnessed => false,
@@ -813,17 +826,21 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 }
             }
             AuditEvent::OutputVoided { output, .. } => {
-                let was_provisional = before.charges.get(output).is_some_and(|ch| !ch.definitive);
+                let was_provisional = before
+                    .delivery()
+                    .charges()
+                    .get(output)
+                    .is_some_and(|ch| !ch.definitive);
                 // Voiding: lost buffer on a client statement, or deadline of an uncovered contest
                 // on this position or an earlier one.
                 let by_deadline =
                     matches!(cmd, Command::Reconcile | Command::ResolveContests { .. })
-                        && before.charges.iter().any(|(o, ch)| {
+                        && before.delivery().charges().iter().any(|(o, ch)| {
                             o.job == output.job
                                 && o.wt == output.wt
                                 && o.pos <= output.pos
                                 && !ch.definitive
-                                && ch.contest.is_some_and(|k| after.now >= k.deadline)
+                                && ch.contest.is_some_and(|k| after.now() >= k.deadline)
                         });
                 let by_client = matches!(cmd, Command::ConfirmDelivery { .. });
                 if !(by_client || by_deadline) || !was_provisional {
@@ -842,17 +859,19 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                     Command::ConfirmDelivery { confirmed, wt, .. } => {
                         output.wt == *wt
                             && output.pos >= *confirmed
-                            && before.charges.get(output).is_some_and(|ch| {
+                            && before.delivery().charges().get(output).is_some_and(|ch| {
                                 !ch.definitive
                                     && ch.contest.is_none()
-                                    && before.jobs[&output.job].attempts[&ch.attempt]
+                                    && before.jobs()[&output.job].attempts[&ch.attempt]
                                         .revoked_at
-                                        .is_some_and(|r| after.now < r + after.cfg.delivery_window)
+                                        .is_some_and(|r| {
+                                            after.now() < r + after.config().delivery_window
+                                        })
                             })
                     }
                     _ => false,
                 };
-                if !ok || *deadline != after.now + after.cfg.contest_resolution {
+                if !ok || *deadline != after.now() + after.config().contest_resolution {
                     out.push(v(
                         "TEST-P27",
                         format!("contest on {output:?} opened by {cmd:?}"),
@@ -862,12 +881,13 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             AuditEvent::BufferPurged { job, attempt } => {
                 // TEST-P26: buffer kept during the window and while any output of the attempt is
                 // provisional or contested.
-                let a = &before.jobs[job].attempts[attempt];
+                let a = &before.jobs()[job].attempts[attempt];
                 let retention_over = a
                     .revoked_at
-                    .is_some_and(|r| after.now >= r + after.cfg.delivery_window);
+                    .is_some_and(|r| after.now() >= r + after.config().delivery_window);
                 let pending = before
-                    .charges
+                    .delivery()
+                    .charges()
                     .iter()
                     .any(|(o, ch)| o.job == *job && ch.attempt == *attempt && !ch.definitive);
                 if !retention_over || pending {
@@ -879,8 +899,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             }
             AuditEvent::EvidenceSupplemented { slice, .. } => {
                 // TEST-P28: supplementary proof only before the deadline.
-                let s = &before.slices[slice];
-                if after.now >= s.closed_at.unwrap_or(0) + after.cfg.evaluation_deadline {
+                let s = &before.slices()[slice];
+                if after.now() >= s.closed_at.unwrap_or(0) + after.config().evaluation_deadline {
                     out.push(v(
                         "TEST-P28",
                         format!("{slice:?}: evidence supplemented after deadline"),
@@ -893,8 +913,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
                 ..
             } => {
                 // TEST-P28: refunds for missing proof only at the deadline.
-                let s = &after.slices[slice];
-                if after.now < s.closed_at.unwrap_or(0) + after.cfg.evaluation_deadline {
+                let s = &after.slices()[slice];
+                if after.now() < s.closed_at.unwrap_or(0) + after.config().evaluation_deadline {
                     out.push(v(
                         "TEST-P28",
                         format!("{slice:?}: refunded for missing proof before deadline"),
@@ -907,7 +927,8 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             } => {
                 // TEST-P22: never paid while its output is provisional.
                 let ok = after
-                    .charges
+                    .delivery()
+                    .charges()
                     .get(&cid.output)
                     .is_some_and(|ch| ch.gen == cid.charge && ch.definitive);
                 if !ok {
@@ -922,7 +943,7 @@ fn check_charge_basis(before: &Coordinator, cmd: &Command, after: &Coordinator) 
             } => {
                 // TEST-P25: a charged position is never recomputed.
                 for pos in *from..*to {
-                    if before.outputs.contains_key(&OutputId {
+                    if before.delivery().outputs().contains_key(&OutputId {
                         job: *job,
                         wt: *wt,
                         pos,
@@ -949,12 +970,13 @@ pub fn check_fairness(
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     let in_force = |cid: &ContributionId| {
-        c.charges
+        c.delivery()
+            .charges()
             .get(&cid.output)
             .is_some_and(|ch| ch.gen == cid.charge && ch.definitive)
     };
     for (slice, lender, cid) in claims {
-        if in_force(cid) && !c.contributions.contains_key(cid) {
+        if in_force(cid) && !c.contributions().contains_key(cid) {
             out.push(v(
                 "TEST-P23",
                 format!("{slice:?}/{lender:?}: valid claim for {cid:?} lost at closure"),
@@ -962,7 +984,7 @@ pub fn check_fairness(
         }
     }
     let refund_reason = |slice: SliceId, lender: AccountId, kind: ItemKind| {
-        c.audit.iter().find_map(|e| match e {
+        c.audit_log().iter().find_map(|e| match e {
             AuditEvent::ItemRefunded {
                 slice: s,
                 lender: l,
@@ -973,7 +995,7 @@ pub fn check_fairness(
             _ => None,
         })
     };
-    for s in c.slices.values() {
+    for s in c.slices().values() {
         for (lender, l) in &s.lines {
             for it in &l.items {
                 let ItemKind::Contribution(cid) = it.kind else {
@@ -1086,16 +1108,16 @@ pub fn check_step(
             // Late attestation: governed by JOB-R32 (TEST-P20), not by the lease.
             let late = matches!(cmd, Command::Deliver { .. })
                 && before
-                    .jobs
+                    .jobs()
                     .get(job)
                     .and_then(|j| j.attempts.get(attempt))
                     .is_some_and(|a| a.revoked_at.is_some());
             let expired = !late
                 && before
-                    .jobs
+                    .jobs()
                     .get(job)
                     .and_then(|j| j.attempts.get(attempt))
-                    .is_none_or(|a| before.now >= a.lease_expires_at);
+                    .is_none_or(|a| before.now() >= a.lease_expires_at);
             if expired {
                 out.push(v(
                     "TEST-P24",
@@ -1106,18 +1128,18 @@ pub fn check_step(
     }
     // Only a reconciliation that actually ran (a refused one changes nothing, TEST-P16).
     if matches!(cmd, Command::Reconcile) && result.is_ok() {
-        for (o, ch) in &after.charges {
-            if !ch.definitive && ch.contest.is_some_and(|k| after.now >= k.deadline) {
+        for (o, ch) in after.delivery().charges() {
+            if !ch.definitive && ch.contest.is_some_and(|k| after.now() >= k.deadline) {
                 out.push(v(
                     "TEST-P27",
                     format!("{o:?}: contest past its deadline survived reconciliation"),
                 ));
             }
         }
-        for j in after.jobs.values() {
+        for j in after.jobs().values() {
             if matches!(j.exec, ExecStatus::Running | ExecStatus::Placing) {
                 if let Some(a) = j.current() {
-                    if a.revoked_at.is_none() && after.now >= a.lease_expires_at {
+                    if a.revoked_at.is_none() && after.now() >= a.lease_expires_at {
                         out.push(v(
                             "TEST-P24",
                             format!("{:?}: expired lease survived reconciliation", j.id),
@@ -1144,8 +1166,8 @@ pub fn check_step(
             }
         }
     }
-    for (id, ja) in &after.jobs {
-        if let Some(jb) = before.jobs.get(id) {
+    for (id, ja) in after.jobs() {
+        if let Some(jb) = before.jobs().get(id) {
             // execution_intent is monotonic (JOB-T04, JOB-T12).
             if jb.intent == Intent::Resume && ja.intent == Intent::Initial {
                 out.push(v(
