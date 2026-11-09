@@ -3,8 +3,6 @@
 
 use std::collections::BTreeMap;
 
-use gpu_domain::*;
-
 use super::*;
 
 /// TEST-P03, P05, P19.

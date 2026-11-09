@@ -26,11 +26,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   msrv:
-    name: Minimum Rust version (1.87)
+    name: Minimum Rust version (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87
+      - uses: dtolnay/rust-toolchain@1.88
       - run: cargo check --workspace --all-targets
 
   test-debug:

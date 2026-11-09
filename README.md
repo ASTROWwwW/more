@@ -33,7 +33,7 @@ PROPTEST_CASES=5000 cargo test --release --workspace   # more random traces
 python3 scripts/mutation.py                            # about an hour
 ```
 
-Requires Rust 1.87 or newer.
+Requires Rust 1.88 or newer.
 
 ## License
 

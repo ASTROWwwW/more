@@ -1,8 +1,6 @@
 //! Accounting properties: ledger, lines, settlement, escrow coverage (TEST-P02, P12, P13,
 //! P18).
 
-use gpu_domain::*;
-
 use super::*;
 
 /// TEST-P02, P12, P13, P18.

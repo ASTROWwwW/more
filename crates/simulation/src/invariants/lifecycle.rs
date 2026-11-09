@@ -1,8 +1,6 @@
 //! Lifecycle properties: allowed transitions, live attempts, leases, restarts (TEST-P01, P07, P09,
 //! P24, P25).
 
-use gpu_domain::*;
-
 use super::*;
 
 /// TEST-P01.

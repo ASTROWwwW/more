@@ -1,7 +1,5 @@
 //! Fairness at the end of the drain (TEST-P23).
 
-use gpu_domain::*;
-
 use super::*;
 
 /// TEST-P23, fairness, checked after draining: every honest, proven, funded contribution ends paid
