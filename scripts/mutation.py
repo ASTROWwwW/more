@@ -140,7 +140,7 @@ MUTATIONS = [
     ("M56", "Exact retransmission runs the command again", COORD,
      [("if let Admission::Retransmission(answer) = guard.admit(env)? {\n        return answer;\n    }", "guard.admit(env)?;")]),
     ("M57", "One lender may hold several ranges of an attempt", COORD,
-     [("if !lenders.iter().all(|l| seen.insert(*l)) {", "if false {")]),
+     [("if !lenders.iter().all(|l| seen.insert(*l)) {", "if false && !lenders.iter().all(|l| seen.insert(*l)) {")]),
     ("M58", "Tariff above MAX_PRICE accepted", COORD,
      [("if spec.price.iter().any(|x| *x > MAX_PRICE) {", "if false {")]),
     ("M59", "Clock allowed beyond MAX_TIME", COORD,
@@ -221,7 +221,7 @@ def main():
         finally:
             for f, content in backups.items():
                 open(os.path.join(ROOT, f), "w").write(content)
-        status = "MISSED" if ok else ("COMPILE ERROR" if cerr else "caught")
+        status = "COMPILE ERROR" if cerr else ("MISSED" if ok else "caught")
         results.append((mid, desc, status, failed, props))
         print(f"{mid} {status:22} {desc}\n      tests: {', '.join(failed) or '-'}\n      properties: {', '.join(props) or '-'}", flush=True)
     caught = sum(1 for r in results if r[2] == "caught")

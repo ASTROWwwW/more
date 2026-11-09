@@ -1,0 +1,14 @@
+Ledger direct write: Ok(()) Ok(()), user 99 balance 1000100
+SAFE-001 price u64::MAX/2 x 4 outputs: Err(Any { .. })
+SAFE-001 tick overflow: Err("panic")
+SAFE-002 same lender on all stages: Ok(Applied)
+SEC-001 ack by an unrelated lender: Ok(Applied), validated [0, 2, 0]
+SEC-001 cancel by non-owner: Ok(Applied), exec now Cancelled
+SEC-001 heartbeat by a borrower of another job: Ok(AlreadyApplied); produce: Ok(Applied)
+SEC-002/003 zero price, non-member account 55 in pool 7: Ok(Applied), est_cost 0
+SEC-004 self commitment: Ok(Applied)
+SEC-005 refused: Err(Rejected("STALE_ATTEMPT")); same seq again: Err(Replay); restarted sender (seq 1): Err(Replay)
+SEC-006 arbitrary non-zero signature: Ok(Applied)
+--- release
+SAFE-001 price u64::MAX/2 x 4 outputs: Ok(Ok(18446744073709551612))
+SAFE-001 tick overflow: Ok(Ok(Applied))

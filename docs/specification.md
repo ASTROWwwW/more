@@ -8,6 +8,21 @@ This specification describes **how** the system works, based on the decisions of
 
 **Status of v2.5**: checked against the executable model More 0.3.0 (Rust, `proptest`). Last documentation iteration before the network prototype of the witness (QUIC), unless the tests reveal a critical inconsistency. Sections 2, 3 and 4 are implemented in the `gpu-domain` crate and covered by the tests of section 9. Sections 5 to 8 are still to be completed. Any significant change to the state machine or the accounting MUST come with a model test showing that it preserves the invariants. The delivery protocol (section 2.4) went through the model before entering this specification; its guarantees still have to be confirmed on real network exchanges.
 
+**Security amendment (November 2026)**: the requirements marked *(security amendment)* close the gaps found by the code audit (`docs/AUDIT_CODE.md`): who may send which command, who sets prices, who may write balances, and how messages are authenticated. Trust domains and the permission matrix are in `docs/SECURITY_ARCHITECTURE.md`. No existing identifier changed meaning.
+
+## Changelog: security amendment
+
+| Requirement | Change | Tests |
+| --- | --- | --- |
+| JOB-R36 *(new)* | Every command is authorized for its sender and the resource it names before anything changes | TEST-P29, `tests/security/` |
+| JOB-R37 *(new)* | Prices come from the pool's tariff; the borrower signs the most it agrees to lock, and the ledger checks that signature | `the_client_never_sets_the_price`, `escrow_needs_the_owners_signed_mandate` |
+| JOB-T01, JOB-T04 | Submission names a model of the pool's catalog; the scheduler chooses the layout; lenders are distinct and hold the right to lend, the witness the right to witness | `one_lender_holds_one_range`, `non_member_cannot_use_a_private_pool` |
+| JOB-R15 | Receipts are committed by the recipient of the producer's output, never by the producer, with a digest binding them | `receipt_commitments_come_from_the_recipient_only` |
+| JOB-R20 | Only the reconciler reconciles; a refusal inside reconciliation is an internal error (CE-07) | `ce07_only_the_reconciler_reconciles` |
+| PROTO-001, PROTO-005, PROTO-009 | Ed25519 envelope signatures; sessions; exact retransmissions get their first answer; the actor of a command is always the authenticated sender | `retransmission_gets_the_first_answer_and_runs_nothing`, protocol unit tests |
+| LEDGER-011, LEDGER-012 | Only the ledger writes balances, through typed operations requested with a service credential; reservations stay under the signed mandate; amounts and issuance are bounded | `crates/ledger/tests/service.rs` |
+| SAFE-001 | Bounded clock, durations, prices, outputs and layers; checked arithmetic; no panic on any input | `extreme_values_are_refused_without_panic` |
+
 ## Changelog v2.4 → v2.5
 
 ### Decisions taken after the v2.4 audit
@@ -206,10 +221,10 @@ The nominal path goes from `queued` to `completed`. A failure goes through `reco
 
 | ID | Transition | Trigger | Preconditions | Atomic effects | Events | Recovery |
 | --- | --- | --- | --- | --- | --- | --- |
-| JOB-T01 | ∅ → `queued` | `SubmitJob` | Active account; pool allowed; model allowed; budget ≤ trust-level cap; recovery budget accepted; unknown idempotency key | Job created (`attempt = 0`, `execution_intent = initial`, `settlement_status = none`) | `JobQueued` | Same key and same parameters: the existing job is returned; same key, other parameters: rejected |
+| JOB-T01 | ∅ → `queued` | `SubmitJob` | Authenticated borrower with the borrow right in the pool *(security amendment)*; model in the pool's catalog, outputs within its limits; price taken from the pool's tariff, never from the request; borrower's signed budget ≥ estimated cost + recovery budget, mandate checked by the ledger (JOB-R37); budget ≤ trust-level cap; recovery budget accepted; unknown idempotency key | Job created (`attempt = 0`, `execution_intent = initial`, `settlement_status = none`) | `JobQueued` | Same key and same parameters: the existing job is returned; same key, other parameters: rejected |
 | JOB-T02 | `queued` → `reserved` | Automatic, as soon as resources allow | Credits mode: balance ≥ initial reserve + recovery budget. Open sharing: quota available. Otherwise, wait in `queued` | Entry balance → work escrow (initial reserve = min(estimated cost, cap)) and balance → recovery escrow, or quota reservation; `settlement_status = active` | `CreditsReserved` | Key `(job, reserve)` |
 | JOB-T03 | `queued` → `cancelled` | Final rejection: wait exceeded, model withdrawn, impossible budget | None | `settlement_status = closed` (JOB-S13), no entry | `JobRejected(reason)` | Idempotent |
-| JOB-T04 | `reserved` → `placing` | The scheduler found an eligible cluster | Eligible cluster (ORCH); one layer range per lender; attempts < maximum; **witness independent** of the lenders and the borrower (JOB-R26). If `execution_intent = resume`: recovery earmark ≤ unallocated budget (JOB-R18) | `attempt += 1`; timed leases (JOB-R31); witness assigned; `placing_from = reserved`; attempt production initialized to the **delivered positions** *(v2.4)*. **`execution_intent` is not changed** | `AssignmentsIssued` | `Assign` resent from the outbox (idempotent per `lease_id`) |
+| JOB-T04 | `reserved` → `placing` | The scheduler found an eligible cluster | Eligible cluster (ORCH); layout chosen by the scheduler, covering the model's layers exactly; one layer range per lender, lenders distinct and holding the lend right in the pool, witness holding the witness right *(security amendment)*; attempts < maximum; **witness independent** of the lenders and the borrower (JOB-R26). If `execution_intent = resume`: recovery earmark ≤ unallocated budget (JOB-R18) | `attempt += 1`; timed leases (JOB-R31); witness assigned; `placing_from = reserved`; attempt production initialized to the **delivered positions** *(v2.4)*. **`execution_intent` is not changed** | `AssignmentsIssued` | `Assign` resent from the outbox (idempotent per `lease_id`) |
 | JOB-T05 | `placing` → `running` | All nodes accepted and loaded their slice | Leases not expired (JOB-R31). State restored **exactly** up to the **delivered** positions *(v2.4)* (0 on first launch); sampler restored. Positions delivered but not received by the client are replayed to it (JOB-R28), never recomputed | `running`; a slice is opened; the attempt is recorded as started (proof of recovery work, JOB-R18) | `JobStarted` or `JobResumed` | A late `AssignAck`, or one from another attempt, is rejected |
 | JOB-T06 | `placing` → `placing_from` (`reserved` or `recovering`) | Placement timeout or a node refused | Failed placements < maximum | Attempt revoked; its recovery earmark is returned | `PlacementFailed` | At the maximum: JOB-T16 |
 | JOB-T07 | `running` → `running` | A slice is closed | `open` slice of the current attempt | Slice → `closed` (JOB-S03); new slice opened | `SliceClosed` | See JOB-S04 |
@@ -344,6 +359,8 @@ An output has its own life, independent of the attempt that produced it:
 - **JOB-R34 — Binding proofs to the stream** *(new in v2.5)*: the output node signs the chained digest of each frame, covering job, client stream identifier, model, type, position and billing generation. An attestation whose digest differs from that of the signed frames (substituted frame, or valid frame from another session) is rejected with `INADMISSIBLE_PROOF`; likewise for a client declaration whose prefix digest is not this stream's. The signature and the digest prove the integrity and origin of a frame, not its receipt: that is why JOB-R33 requires the client ack.
 - **JOB-R35 — Supplementary proofs** *(new in v2.5)*: until a slice's evaluation deadline, a lender can replace the proof of an undecided item with a stronger one (missing < uncommitted receipt < commitment). A refund for missing proof only takes effect at the deadline. At the deadline, final settlement according to the available proofs and the arbitration rules. After closure, the ledger is never modified: any exceptional correction is a new, explicitly funded accounting operation.
 - **JOB-R31 — Timed leases** *(new in v2.4)*: each lease has a deadline (45 s), renewed by heartbeat as long as it has not expired. An expired lease is never renewed. The coordinator immediately rejects, by its own clock (JOB-R09), any unit, attestation, acceptance or ack received under an expired lease, even before revocation; reconciliation then revokes the attempt (JOB-T08, or JOB-T06 while placing). A node MUST stop producing before the deadline by its local clock, with a margin covering drift.
+- **JOB-R36 — Authorization** *(security amendment)*: every command MUST be authorized before any state change, for its sender (an authenticated account or a service credential, never a field of the message) and for the resource it names: the borrower of the job, a lender of the attempt, the output node, the recipient of a producer's output, the witness assigned to the attempt, an admin of the pool, or the service role in charge. Anything not allowed by the matrix of `docs/SECURITY_ARCHITECTURE.md` is refused with `UNAUTHORIZED`, and a refused command changes nothing (TEST-P29, TEST-P16). Only the reconciler runs reconciliation (CE-07).
+- **JOB-R37 — Prices and consent** *(security amendment)*: the price of an output is the tariff of the pool for the model, set by the pool's admins within `MAX_PRICE`; a free-sharing pool has no tariff. The borrower states the outputs it wants and signs the most it agrees to lock for this job; the ledger verifies that signature and never lets the job's escrow exceed it, top-ups included (LEDGER-012).
 
 ### Deadlines and limits (initial values, to be calibrated)
 
@@ -435,7 +452,7 @@ Status: **to be completed**. Messages follow from the transitions of section 2. 
 
 | Message | Direction | Transition | Minimal fields |
 | --- | --- | --- | --- |
-| `SubmitJob` | Client → coordinator | JOB-T01 | idempotency key, pool, model, class, max budget |
+| `SubmitJob` | Client → coordinator | JOB-T01 | job id (idempotency key), pool, model, outputs per type, max budget, mandate signature |
 | `CancelJob` / `ResumeJob` | Client → coordinator | JOB-T15, JOB-T12 | job, idempotency key, top-up |
 | `Assign` | Coordinator → node, witness | JOB-T04, JOB-T09 | job, attempt, lease\_id, role, layer range, neighbors, witness, flow budgets, expiry, `execution_intent`, signature |
 | `AssignAck` / `AssignReject` | Node → coordinator | JOB-T05, JOB-T06 | lease\_id, restored positions per type, reason |
@@ -458,14 +475,15 @@ Status: **to be completed**. Messages follow from the transitions of section 2. 
 
 ### Fixed requirements
 
-- **PROTO-001**: every message MUST carry a protocol version, a sender identifier, a sequence number and a signature. *(implemented: `Envelope`, `ReplayGuard`)*
+- **PROTO-001**: every message MUST carry a protocol version, a sender identifier, a session, a sequence number and an Ed25519 signature over all of them and the body, verified against the sender's registered key before anything else *(security amendment)*. *(implemented: `Envelope`, `ReplayGuard`)*
 - **PROTO-002**: a frame's size MUST be checked before any decoding. *(implemented: `check_frame`)*
 - **PROTO-003**: a dynamic serialization format MUST NOT be used.
-- **PROTO-004**: every rejection MUST have a stable code: `UNKNOWN_JOB`, `INVALID_TRANSITION`, `VERSION_CONFLICT`, `STALE_ATTEMPT`, `JOB_SETTLING`, `FLOW_BUDGET_EXCEEDED`, `WINDOW_NOT_COVERED`, `RECOVERY_BUDGET`, `INADMISSIBLE_PROOF` *(v2.4)*, `LEASE_EXPIRED` *(v2.4)*, `PRECONDITION_FAILED`, `LEDGER_REJECTED`, `FRAME_TOO_LARGE`, `REPLAY`, `MISSING_SIGNATURE`, `UNSUPPORTED_VERSION`. *(implemented: `domain_code`, `ProtoError::code`)*
-- **PROTO-005**: a sequence number MUST be strictly increasing per sender; a replayed message is rejected before reaching the domain.
+- **PROTO-004**: every rejection MUST have a stable code: `UNKNOWN_JOB`, `INVALID_TRANSITION`, `VERSION_CONFLICT`, `STALE_ATTEMPT`, `JOB_SETTLING`, `FLOW_BUDGET_EXCEEDED`, `WINDOW_NOT_COVERED`, `RECOVERY_BUDGET`, `INADMISSIBLE_PROOF` *(v2.4)*, `LEASE_EXPIRED` *(v2.4)*, `PRECONDITION_FAILED`, `LEDGER_REJECTED`, `FRAME_TOO_LARGE`, `REPLAY`, `MISSING_SIGNATURE`, `UNSUPPORTED_VERSION`. *(implemented: `domain_code`, `ProtoError::code`)* *(security amendment: `UNAUTHORIZED`, `INVALID_INPUT`, `ARITHMETIC_OVERFLOW`, `UNAUTHENTICATED`, `FORBIDDEN`, `LIMIT_EXCEEDED`, `BAD_SIGNATURE`, `UNKNOWN_ACCOUNT`, `STALE_SESSION`)*
+- **PROTO-005** *(clarified by the security amendment)*: sequence numbers are strictly increasing per sender and session, consumed when an authenticated message is admitted, whatever the domain answers. An exact retransmission of one of the last 16 messages gets the stored answer and runs nothing; the same number with other content is a replay; a newer session closes the older one. Business idempotency never relies on these numbers.
 - **PROTO-006** *(new in v2.4)*: the attester of a `DeliveryAttestation` is the envelope signer, never a field of the message. *(implemented: `to_command`, test `delivery_attested_by_a_lender_is_inadmissible`)*
 - **PROTO-007** *(v2.4)*: the stream to the client is end-to-end encrypted; the witness sees encrypted frames, not tokens. A replay resends the original frames: the client checks their digest against the attestation. *(not modeled: symbolic cryptography)*
 - **PROTO-008** *(new in v2.5)*: the frame digest covers job, client stream identifier, model, type, position and billing generation; it is signed by the output node. A valid frame or declaration cannot be reused in another stream. *(modeled by an FNV-1a digest, checked by the domain and recomputed independently by the checker)*
+- **PROTO-009** *(security amendment)*: every actor field of a command (borrower, lender, witness, committer) is the authenticated sender of the envelope; a message cannot speak for another account. *(implemented: `to_command`)*
 
 **To decide**: Protobuf or a custom binary format; final size limits; tensor encoding.
 
@@ -514,6 +532,8 @@ Status: **implemented in the model** (`gpu-ledger`); PostgreSQL persistence is s
 | `PendingReward(job, attempt, slice, lender)` | Held reward (`held`) |
 | `Commission` | Commissions |
 
+The ledger also records, per job, the escrow's owner, its pool and the budget the owner signed (JOB-R37).
+
 ### Requirements
 
 - **LEDGER-001**: every entry has a source account, a destination account, an amount, a unique idempotency key and a reason.
@@ -526,6 +546,8 @@ Status: **implemented in the model** (`gpu-ledger`); PostgreSQL persistence is s
 - **LEDGER-008** *(new)*: the commission is taken when a reward is released, never before.
 - **LEDGER-009**: amounts are integers in the smallest unit; never floats.
 - **LEDGER-010** *(new in v2.4)*: voiding a provisional output is a reverse entry (billed outputs → work escrow), never a deletion. Billing and void keys include the generation: `charge/{job}/{type}/{position}/{generation}`, `void/…/{generation}`.
+- **LEDGER-011** *(security amendment)*: only the ledger writes balances. Callers present their own service credential and request typed operations with fixed account flows (escrow ↔ output hold ↔ lines ↔ held rewards, within one job, to its owner, its pool or its lenders); there is no generic transfer and no transfer between users. Only the Treasury role issues. A multi-entry operation is written entirely or not at all. Every refusal is logged.
+- **LEDGER-012** *(security amendment)*: a job's escrow is opened only with the owner's signed mandate, and the credits taken from the owner for that job never exceed it. Every entry is bounded (`max_amount`), every issuance too (`max_issue`, `supply_cap`).
 
 ## 8. Orchestration
 
@@ -567,10 +589,13 @@ Checked after **every** command on random sequences of commands, failures, dupli
 | TEST-P26 *(v2.5)* | Replay buffer never purged before 24 h after the revocation, nor while an output of the attempt is provisional or contested | JOB-R28 |
 | TEST-P27 *(v2.5)* | A contest opens once, on a signed declaration, during the window; a contested output becomes definitive only through a client signature covering its position; the window never confirms a contested output; no due contest survives reconciliation | JOB-R33 |
 | TEST-P28 *(v2.5)* | No refund for missing proof before the evaluation deadline; no supplementary proof after it | JOB-R35 |
+| TEST-P29 *(security amendment)* | Hypothesis: the sender is authenticated. A command is accepted only if the permission matrix, restated independently in the checker, allows its sender for the resource it names; an allowed sender is never refused as unauthorized. With TEST-P16, an unauthorized command never changes state, credits, positions, leases or the audit log. Exercised by impersonation in every generator | JOB-R36 |
 
 **Results**: see `TEST_REPORT.md` for the reference run, the counterexample search and the full mutation campaign.
 
 ### 9.2 Deterministic scenarios
+
+Security scenarios (`tests/security/`) cover the ten attacks of the code audit and simulated compromises of a GPU agent, the scheduler and the delivery service; the ledger's own API is tested from outside its crate (`crates/ledger/tests/service.rs`).
 
 JOB-F01 to JOB-F41: one test each (table in section 4; JOB-F18 has two), plus the targeted tests of the v2.3 fixes (`r21_*`, `r22_*`, `r24_*`). Each scenario goes through the full checker and ends with the drain phase, which also checks fairness (TEST-P23).
 

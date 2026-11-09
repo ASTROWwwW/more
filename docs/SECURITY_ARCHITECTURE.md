@@ -62,10 +62,12 @@ Commands of the coordinator (`gpu-domain::Command`). A cell lists who may send t
 | `Tick` | Clock service | — |
 | `Issue` | Treasury service | Credential forwarded to the Ledger, which checks the Treasury role itself |
 | `CreatePool` | Platform admin | — |
-| `GrantMembership`, `RevokeMembership` | Pool admin, Platform admin | Admin of that pool |
+| `SetRights` (grant or remove rights) | Pool admin, Platform admin | Admin of that pool |
+| `JoinPool` | The joining account itself | Open pools only; grants borrow and lend, never witness |
 | `RegisterModel` (catalog, tariff) | Pool admin | Admin of that pool |
 | `Submit` | User | `borrower` = caller; caller has the borrow right in the pool; model in the pool's catalog; price taken from the tariff, never from the request; estimated cost ≤ the budget the borrower signed |
-| `Reserve`, `RejectQueued`, `CloseSlice`, `Evaluate`, `NodeLost`, `RecoveryTimeout`, `CompleteSettling`, `Settle`, `ExpirePause`, `ExpireDeliveryWindow`, `ResolveContests`, `Reconcile`, `Fail` | Scheduler or Reconciler service | — |
+| `Reserve`, `RejectQueued`, `CloseSlice`, `Evaluate`, `NodeLost`, `RecoveryTimeout`, `CompleteSettling`, `Settle`, `ExpirePause`, `ExpireDeliveryWindow`, `ResolveContests`, `Fail` | Scheduler or Reconciler service | — |
+| `Reconcile` | Reconciler service only | A due transition refused inside reconciliation is an internal error, not skipped (CE-07) |
 | `Place` | Scheduler service | Lenders distinct, each with the lend right in the job's pool; witness with the witness right, independent of lenders and borrower; layout covers exactly the model's layers |
 | `Heartbeat`, `AttemptReady` | User | Caller is a lender of that attempt |
 | `PlacementFailed` | Lender of the attempt, Scheduler, Reconciler | — |
@@ -119,11 +121,11 @@ There is no edge from a user account to another user account, from one job to an
 
 | Compromised component | What it can still do | What stops the rest | Test |
 | --- | --- | --- | --- |
-| Delivery service or witness | Attest outputs that were produced but not received: provisional billing, at most `K` per type per job (JOB-R27) | No ledger credential with any write right; issuance needs the Treasury role; contests and rewinds refund unproven outputs | `compromise_delivery_cannot_issue_or_move_credits` |
+| Delivery service or witness | Attest outputs that were produced but not received: provisional billing, at most `K` per type per job (JOB-R27) | Its credential has no ledger right and no coordinator command; issuance needs the Treasury role; contests and rewinds refund unproven outputs | `compromise_delivery_cannot_issue_or_move_credits` (ledger), `compromise_delivery_service_has_no_command` |
 | GPU agent | Lie about its own work, stop, produce garbage | Every command is authorized per resource: it cannot cancel, ack or confirm someone else's job, renew another node's lease, or commit receipts for itself; it has no ledger access | `compromise_gpu_agent_cannot_cancel_other_jobs`, security scenarios |
-| Scheduler / Orchestrator | Make bad placements; route a job's escrow to lenders it picked | The Ledger only accepts typed operations within one job; a reservation needs the borrower's signed mandate and stays under it; no transfer between users; cannot issue | `compromise_scheduler_cannot_move_arbitrary_balances` |
-| Treasury | Issue credits | Per-issuance limit and supply cap in the Ledger; every issuance logged | `ledger_issue_limits` |
-| A user account | Act as itself | Per-resource checks; a signature for one session or job cannot be reused (JOB-R34, replay guard) | security scenarios 1 to 10 |
+| Scheduler / Orchestrator | Make bad placements; route a job's escrow to lenders it picked | The Ledger only accepts typed operations within one job; a reservation needs the borrower's signed mandate and stays under it; no transfer between users; cannot issue. The Scheduler credential cannot issue, pay a dispute, fund from a pool, contest for a borrower or submit for one | `compromise_scheduler_cannot_move_arbitrary_balances` (ledger), `compromise_scheduler_cannot_move_balances` |
+| Treasury | Issue credits | Per-issuance limit and supply cap in the Ledger; every issuance is a journal entry | `issuance_limits_hold_near_u64_max`, `extreme_values_are_refused_without_panic` |
+| A user account | Act as itself | Per-resource checks; a signature for one session or job cannot be reused (JOB-R34, replay guard); the generators send every kind of command from every principal (TEST-P29) | `tests/security/`, TEST-P29 |
 
 Residual risk, stated plainly: a compromised orchestrator can still pay a lender it chose with credits a borrower committed to that job, up to the signed mandate. Removing that would require lenders' signed lease acceptance to be checked by the Ledger too (listed in section 8).
 
@@ -135,11 +137,14 @@ Residual risk, stated plainly: a compromised orchestrator can still pay a lender
 | Mandates, escrow owners | Ledger | Ledger only |
 | User public keys | Identity | Identity, Ledger (mandate verification) |
 | Service credentials | Identity mints, each service keeps its own | The service it was minted for |
-| Jobs, attempts, slices, outputs | Orchestrator | Read accessors; no public mutable field |
-| Pools, members, catalog | Model Registry | Read accessors |
+| Jobs, attempts, slices | Orchestrator | Read accessors on `Coordinator`; every field private |
+| Charges, contests, witness commitments | Delivery (`DeliveryBook`) | Read accessors; written only through `DeliveryBook` methods, which have no ledger access |
+| Pools, members, catalog | Model Registry (`Registry`) | Read accessors; written only through `Registry` methods, which validate every input |
 | Encrypted frames, replay buffer | Witness | Witness only (never decrypted by More) |
 
 ## 7. Boundary status
+
+What each boundary is made of today. "In-process" means it holds against bugs and against misuse of the API by other code, not against an attacker who controls the process's memory.
 
 | Boundary | Mechanism | Status |
 | --- | --- | --- |
@@ -147,7 +152,8 @@ Residual risk, stated plainly: a compromised orchestrator can still pay a lender
 | Caller authentication on the Ledger API | `ServiceCredential` cannot be built outside `more-identity`; the Ledger checks role and revocation on each call | Enforced now (in-process); mTLS between processes is the target |
 | Issuance only by Treasury | Ledger permission matrix | Enforced now |
 | Borrower consent to spending | Ed25519 mandate verified by the Ledger | Enforced now |
-| Per-resource authorization of commands | `authorize` runs before any mutation; TEST-P29 checks that an unauthorized command never changes state | Enforced now |
+| Per-resource authorization of commands | `authorize` runs before any mutation; TEST-P29 checks every accepted command against an independent restatement of the matrix, on traces where any principal sends any command | Enforced now |
+| Delivery and registry data owned by their module | Private fields in `DeliveryBook` and `Registry`, sibling modules of the coordinator; the delivery module never sees the ledger | Enforced now (compiler) |
 | Pricing by the pool, not the client | Catalog and tariff in the Model Registry | Enforced now |
 | User authentication | Ed25519 envelope signatures; replay guard per sender and session | Enforced now in `gpu-protocol`; transport security is the target |
 | Separate processes per domain | — | Target. Today all domains run in one process: a memory-level compromise of that process bypasses every logical boundary above |
@@ -160,6 +166,9 @@ Residual risk, stated plainly: a compromised orchestrator can still pay a lender
 - Aggregated exposure cap per account and per pool across concurrent jobs.
 - Real digests (SHA-256 or BLAKE3) for frames and the ledger chain; the model uses FNV-1a.
 - Rate limiting per principal at the network edge; the model only bounds amounts and request sizes.
+- Logging of refused commands at the coordinator edge. A refused command leaves no trace in the coordinator state by design (JOB-R01); the ledger logs its own refusals.
+- Frame and receipt digests are recomputed over all positions on each call (O(n), n ≤ `MAX_OUTPUTS`): a sender can make each message cost up to a million hash steps. A stored chained digest removes this before the network prototype.
+- The `test-support` feature of `more-identity` builds an account context without a signature, for the simulation only. A production build must not enable it; a CI check for that is still to add.
 
 ## 9. GPU agent sandbox (target)
 
