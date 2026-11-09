@@ -1,6 +1,6 @@
 # Validation
 
-How the changes of branch `hardening/security-architecture` were checked, with the real results. Environment: Linux, Rust 1.97.0, one machine, November 9, 2026. Baseline: `8e020bd`. Code validated: `752b864`.
+How the changes of branch `hardening/security-architecture` were checked, with the real results. Environment: Linux, Rust 1.97.0, one machine, November 9, 2026. Baseline: `8e020bd`. Domain code validated at `752b864`; later commits only add tests, remove redundant imports and fix the campaign script (`ac03abf`).
 
 ## Commands and results
 
@@ -13,7 +13,7 @@ How the changes of branch `hardening/security-architecture` were checked, with t
 | `cargo clean && PROPTEST_CASES=5000 cargo test --release --workspace` | 97 passed, 0 failed, on `752b864` (before the three tests kept by name were added); 69 s including build, property tests 27.9 s |
 | `python3 scripts/mutation.py` | {{MUTATION_SUMMARY}} |
 
-Not run here: the CI workflow itself (it runs on the first push), and the build with the declared minimum Rust version 1.87 (only 1.97 is installed; the `msrv` CI job checks it).
+GitHub Actions on `b8e790b`: format and lints, minimum Rust version, debug tests and release tests all passed. The first CI run had failed twice: newer clippy flagged redundant glob imports that 1.97 accepts, and `proptest` 1.12 needs Rust 1.88, not the 1.87 first declared. Both fixed; the minimum is now 1.88 and CI checks it.
 
 ### Tests, before and after
 
@@ -67,6 +67,7 @@ Impersonation operations send a realistic command from a random account or servi
 
 - A mutant that does not compile used to be reported as "missed" (its test list was empty). Compile errors are now reported as such. Earlier campaigns were not inflated by this: a compile error could only lower their score.
 - M57 did not compile as first written (type inference on an unused set); rewritten.
+- Failing tests inside modules (`lifecycle::f09_...`, after the scenarios were split into files) were not recognized, so a mutant caught only by such a test was reported missed (M06 in a first, interrupted run). The script now reads module paths and runs every test binary (`--no-fail-fast`). The campaign was restarted from scratch after this fix.
 - M58 survived its first run: the security test checked all catalog bounds with one input that broke all of them, so removing one bound was invisible. The test now checks each bound separately; M58 is caught.
 
 ## Benchmark

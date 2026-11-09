@@ -23,6 +23,8 @@ Severity scale: **critical** (credits or another user's job at the mercy of any 
 | A-03 | Digest recomputation is linear in the number of positions | Low | Open |
 | A-04 | `test-support` feature could be enabled in a production build | Low | Open |
 | A-05 | All trust domains run in one process | Medium | Open, by design of the model |
+| A-06 to A-08, A-10 | See open issues below | Low to medium | Open |
+| A-09 | Declared minimum Rust version wrong (1.75, while the code needed 1.87 and `proptest` 1.88) | Low | Fixed: 1.88, checked by CI |
 
 ## Findings
 
@@ -124,7 +126,6 @@ Found by `proptest` once impersonation entered the generators (seed `59d2ec9c…
 | A-06 | A compromised orchestrator can still pay lenders of its choice from a job's escrow, up to the borrower's mandate | Medium | Ledger checks lenders' signed lease acceptance |
 | A-07 | Exposure is bounded per job and type (`K`), not per account or pool across jobs | Medium | Aggregated exposure cap before opening to the public |
 | A-08 | Refused commands are not logged at the coordinator edge (the ledger logs its own refusals) | Low | Security log at the network edge |
-| A-09 | Rust 1.87 is the declared minimum; it is checked by CI, not locally (only 1.97 available here) | Low | First CI run |
 | A-10 | `Coordinator::execute` clones the whole state per command, so cost grows with history | Low (model) | Not a concern for the model; the real coordinator uses database transactions |
 
 ## Rejected hypotheses
