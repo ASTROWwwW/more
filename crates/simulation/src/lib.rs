@@ -1,7 +1,6 @@
 //! Simulation: controlled clock, random and adversarial operations, invariant checker. No network,
 //! no database.
 
-mod authz_oracle;
 pub mod invariants;
 pub mod stats;
 pub mod world;

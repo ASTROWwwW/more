@@ -25,7 +25,7 @@ fn admin(c: &Coordinator, ctx: &AuthContext, pool: PoolId) -> bool {
 
 /// True when the matrix allows `ctx` to send `cmd` in state `c`. When the resource does not exist,
 /// the answer does not matter: the command cannot succeed.
-pub fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool {
+pub(super) fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool {
     use Command::*;
     use ServiceRole as S;
     let me = acct(ctx);
