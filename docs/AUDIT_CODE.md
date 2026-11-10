@@ -153,8 +153,9 @@ The review's common thread is right: after part 1, the Ledger checked who called
 | R2-06 | Ledger, coordinator and the other domains share one process | Architecture | Correct, and already stated in `SECURITY_ARCHITECTURE.md` section 7 | Not done in this branch; plan in section 11 |
 | R2-07 | The orchestrator could relay any amount of a pool's treasury into a job | Not reported | Found by TEST-P30 while testing R2-01 | Fixed |
 | R2-08 | Uncommitted receipts were a label on the claim: nothing checked that the recipient had signed anything | Not reported | Found while designing R2-03 | Fixed |
-| R2-09 | Recovery can be paid to a colluding lender of a started attempt, within the agreed budget | Not reported | Found by TEST-P30 | **Open**, needs a decision |
-| R2-10 | Orchestrator colluding with every recipient of a stage | Not reported | By construction of receipts | **Open**, bounded by contests and JOB-R19 |
+| R2-09 | Recovery can be paid to a colluding lender of a started attempt, within the agreed budget | Not reported | Found by TEST-P30 | Fixed by decision (JOB-R18): the recipient must corroborate the restoration |
+| R2-10 | Orchestrator colluding with every recipient of a stage | Not reported | By construction of receipts and corroborations | **Open**, bounded by contests and JOB-R19 |
+| R2-12 | Reconciliation skipped, without a word, a transition the ledger failed to write (CE-08) | Not reported | Found by the fault-and-restart test asked before the merge | Fixed |
 
 The review's table also lists "symbolic frame proofs": unchanged, already open as SEC-006, due with the QUIC prototype.
 
@@ -209,6 +210,22 @@ Correct, and not fixed here. The order of priorities in the review puts it after
 
 Found by TEST-P30: `FundRecovery` only needed the Orchestrator credential, so a compromised orchestrator could move a pool's whole treasury into the recovery escrow of a job, then try to pay it out. Fix (LEDGER-017): the platform admin registers each pool's admin at the Ledger with its own credential; a relay carries that admin's signature over the new running total for the job. Tests: `r2_pool_relay_needs_the_admins_consent`, `r2_pool_relay_needs_its_admins_signature`; mutations M74, M86.
 
+### R2-09: recovery on the lender's word (decision of November 10, 2026)
+
+TEST-P30 showed that an orchestrator and one lender account could collect recovery: the lender signs ready, the honest lenders of the cluster sign ready for themselves, and JOB-R18 took the start of the attempt as proof. The decision: keep the three steps apart.
+
+- **Reservation.** The earmark is registered with the attempt, at the Ledger, before any work; a claim is reserved within it on a started attempt.
+- **Execution.** The lender signs its restored positions. The account that receives its output signs that it received that restored state (`CorroborateRestore`, `restore_message`). The producer cannot send it for itself (authorization), and a corroboration signed by anyone else is refused by the Ledger. No new output is required.
+- **Settlement.** The Ledger pays a recovery item only if the corroboration is on file. Without it, the coordinator waits until the evaluation deadline, then holds the amount as disputed; a ruling cannot pay it (`INADMISSIBLE_PROOF`) unless the corroboration arrived; the default ruling refunds it.
+
+What it guarantees and what it does not is written in JOB-R18 and in `SECURITY_ARCHITECTURE.md` section 5: a third account must sign; a colluding recipient still can (R2-10).
+
+Tests: `r2_recovery_is_settled_only_on_a_corroborated_restoration` (ledger), `r2_an_accomplice_cannot_collect_recovery_without_corroboration`, `r2_an_honest_restoration_is_paid_even_if_no_output_follows`, `r2_a_late_corroboration_lets_a_ruling_pay`; TEST-P30 again asserts that the attacker's account never receives a credit; TEST-P32; mutations M72, M88 to M93.
+
+### R2-12: reconciliation and ledger failures (CE-08)
+
+The test "a fault in the middle of a settlement, then a restart and a reconciliation" injects a journal failure after N entries (`fault-injection` feature, tests only). The command that hit the fault was rolled back correctly. Reconciliation was not: it propagated internal and authorization errors of the transitions it runs, but dropped ledger errors, so a due evaluation whose payment failed was skipped and the reconciliation reported success. Fix: a ledger error inside reconciliation is reported as internal and the whole reconciliation rolled back (JOB-R20). Tests: `ce08_reconciliation_reports_a_ledger_failure`, `r2_a_fault_during_a_partial_settlement_then_restart_and_reconciliation`; mutation M87.
+
 ### R2-08: uncommitted receipts were not checked
 
 `Evidence::Uncommitted` meant "I hold a receipt countersigned by the recipient", and nothing looked at it. With the Ledger now requiring a receipt to pay, the claim must be backed: the producer presents the receipt (`PresentReceipt`), the Ledger verifies the recipient's signature, and an uncommitted item with no receipt on file at the evaluation deadline is refunded as unproven (JOB-R12, JOB-R35). The fairness property TEST-P23 was narrowed accordingly: an uncommitted item may be refunded by arbitration or for want of a receipt, and a step check verifies the receipt was really missing. Test: `r2_an_uncommitted_claim_needs_the_recipients_receipt`; mutation M84.
@@ -217,8 +234,8 @@ Found by TEST-P30: `FundRecovery` only needed the Orchestrator credential, so a 
 
 | ID | Issue | Bound today | What would close it |
 | --- | --- | --- | --- |
-| R2-09 | Orchestrator plus one lender account: recovery paid for a recompute that was not done, on an attempt whose other lenders honestly signed ready | The recovery budget the borrower signed (10 % of the estimated cost) plus what the pool's admin signed for that job | Pay recovery only with a recipient's receipt for an output produced after the resume. This changes when recovery is payable (JOB-R18), so it was not done without a decision |
-| R2-10 | Orchestrator plus every recipient of a stage (next lender, or the witness for the last stage) | What was charged to the borrower; contest windows; JOB-R19 for uncommitted receipts | Witness assignment the orchestrator cannot choose alone; delivery proof checked by the Ledger |
+| R2-10 | Orchestrator plus every recipient of a stage (next lender, or the witness for the last stage): receipts and corroborations are attestations between two accounts, not proofs of computation | What was charged to the borrower and the recovery earmark; contest windows; JOB-R19 for uncommitted receipts | Verification of the work itself; witness assignment the orchestrator cannot choose alone |
+| A-04 (extended) | Two test-only features now exist: `more-identity/test-support` and `gpu-ledger/fault-injection` (forwarded by `gpu-domain`). Only the conformance tests enable them | A production build that enabled one would accept unsigned accounts or injected faults | CI check on the features of release binaries, once there is a binary |
 | R2-11 | The Ledger does not check the delivery proof behind a charge | An unproven charge pays nobody without receipts and returns at settlement | Witness attestation or client ack verified by the Ledger; contest filed with the Ledger |
 | R2-06 | One process | — | `SECURITY_ARCHITECTURE.md` section 11 |
 | SEC-006 | Frame and receipt digests are symbolic (FNV-1a) | — | QUIC prototype |
@@ -229,9 +246,20 @@ Found by TEST-P30: `FundRecovery` only needed the Orchestrator credential, so a 
 - "Tests exercise the intended paths, not a hostile orchestrator" (review, section on tests): exact for the Ledger. Part 1 had two compromise tests that tried single forbidden calls; none chained allowed calls. TEST-P30 does, and found R2-07 and R2-09 on its first deep runs.
 - The 101 tests and 64 mutants of part 1 were not contradicted by this review, and did not cover these sequences.
 
+## Tests asked before the merge
+
+| Asked | Test | What it shows |
+| --- | --- | --- |
+| Compromised orchestrator and colluding lender share the recovery budget with no verifiable progress | `r2_recovery_is_settled_only_on_a_corroborated_restoration` (Ledger API), `r2_an_accomplice_cannot_collect_recovery_without_corroboration` (coordinator), TEST-P30 | Reserved, never paid; self-corroboration and corroboration by the wrong account refused; held at the deadline; a pay ruling refused; refunded by the default ruling; accomplice's balance 0 |
+| A node falls after an honest restoration, before any new output | `r2_an_honest_restoration_is_paid_even_if_no_output_follows` | Corroborated restoration paid in full although attempt 2 produced nothing |
+| A lease stays ready while another node of the cluster expires | `r2_a_ready_lease_does_not_outlive_another_nodes_expiry` (while placing), `r2_a_heartbeat_renews_only_its_own_lease` (while running) | The ready lease is valid and changes nothing: placement fails or the attempt is revoked, the silent nodes are named, nothing is paid |
+| A valid receipt replayed for a second payment | `r2_a_replayed_receipt_never_pays_twice` (Ledger API), `r2_a_replayed_receipt_pays_once` (coordinator) | Second presentation is a no-op; the item is unique per output, charge and stage; the signature does not verify on another attempt or job |
+| A fault during a partial settlement, then restart and reconciliation | `r2_a_fault_during_a_partial_settlement_then_restart_and_reconciliation`, `ce08_reconciliation_reports_a_ledger_failure`, `failed_multi_entry_operation_writes_nothing` | State identical before and after each failed transition; reconciliation reports the fault; after the restart it completes; final balances equal those of a run without fault. Found CE-08 |
+
 ## Test changes that need a justification
 
 - `failed_multi_entry_operation_writes_nothing` moved from `crates/ledger/tests/service.rs` to a unit test inside the crate (`service/mod.rs`). It forced a key collision through caller-chosen keys; keys are now derived by the Ledger, so the collision can only be planted from inside. Same property, same name.
 - Regression lists that contained one `AttemptReady` for the cluster now expand it into every lender's three steps (`start_cluster`); `Uncommitted` claims in scenarios JOB-F17 and JOB-F40 are preceded by the receipt they rely on. No assertion was changed.
-- The coverage thresholds of `generator_reaches_interesting_paths` are unchanged; three generator weights were raised to keep reaching them with the new operations, and two thresholds were added (attempts revoked for an expired lease, and for one silent node).
+- The coverage thresholds of `generator_reaches_interesting_paths` are unchanged. Its traces went from 150 to 180 operations, because starting a cluster now takes three steps per lender and a corroboration per stage, and three generator weights were raised. Four thresholds were added (attempts revoked for an expired lease, for one silent node, restorations corroborated, recovery held).
+- Scenario and regression harnesses now have each stage's recipient corroborate the restoration when a cluster starts (a healthy cluster); `r2_recovery_split_and_contest…` and `r2_recovery_needs_readiness…` do it explicitly. No assertion on amounts was changed.
 

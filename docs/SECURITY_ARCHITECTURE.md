@@ -71,6 +71,7 @@ Commands of the coordinator (`gpu-domain::Command`). A cell lists who may send t
 | `Place` | Scheduler service | Lenders distinct, each with the lend right in the job's pool; witness with the witness right, independent of lenders and borrower; layout covers exactly the model's layers |
 | `AcceptLease`, `LeaseLoaded`, `AttemptReady`, `Heartbeat` | User | Caller is the lender the command names, and a lender of that attempt: a node speaks for its own lease only (JOB-R38, JOB-R39) |
 | `WitnessHeartbeat` | User | Caller is the witness the command names, assigned to that attempt |
+| `CorroborateRestore` | User | Caller is the recipient of the producer's stage; the producer never vouches for itself (JOB-R18) |
 | `PresentReceipt` | User | Caller is the producer the receipt is about; the recipient's signature inside is checked by the Ledger |
 | `PlacementFailed` | Lender of the attempt, Scheduler, Reconciler | — |
 | `Produce`, `Finish` | Output node (last-stage lender) of the current attempt; `Finish` also Scheduler | — |
@@ -100,11 +101,12 @@ The Ledger exposes no generic transfer. Each operation has fixed source and dest
 | `RegisterAttempt` | Orchestrator | — | Layout covers the signed model; lenders distinct; witness neither a lender nor the owner; earmark within the recovery budget not yet promised; attempts in increasing order |
 | `AcceptLease` | Orchestrator | Lender of the stage | Signature over the registered assignment |
 | `LeaseReady` | Orchestrator | Lender of the stage | Signature over (job, attempt, lender, restored positions); lease accepted first |
+| `RecordRestore` | Orchestrator | Recipient of the producer | Signature over the positions the producer signed it restored to; lease ready first |
 | `RecordReceipt` | Orchestrator | Recipient of the producer (next stage, or witness) | Signature by the account the assignment names |
 | `ChargeOutput`, `VoidOutput` | Orchestrator | — | Price from the signed terms; position within the signed maximum; one charge in force per output, billing generations in order; no void while a share is reserved or paid |
 | `ReserveContribution` | Orchestrator | — | The lender signed that stage of that attempt; the output is charged to that attempt at that generation; once per output, charge and stage; share computed by the Ledger |
 | `ReserveRecovery` | Orchestrator | — | Every lender of the attempt signed ready; within the attempt's earmark |
-| `PayLine` | Orchestrator | — | Item reserved on that line; for a contribution, charge still in force and a receipt from the recipient covering the output; recovery split borrower first, then pool, computed by the Ledger |
+| `PayLine` | Orchestrator | — | Item reserved on that line; for a contribution, charge still in force and a receipt from the recipient covering the output; for recovery, the restoration corroborated by the lender's recipient; split borrower first, then pool, computed by the Ledger |
 | `RefundLine` | Orchestrator | — | Back to where the Ledger recorded the reserve came from; no destination in the request |
 | `ReleaseReward` | Orchestrator | — | Held reward → its own lender + commission; commission rate set by the Ledger |
 | `ContestReward` | Orchestrator | — | Held reward → the job's owner and pool; the pool's share is what the Ledger recorded |
@@ -135,14 +137,13 @@ There is no edge from a user account to another user account, from one job to an
 | Delivery service or witness | Attest outputs that were produced but not received: provisional billing, at most `K` per type per job (JOB-R27) | Its credential has no ledger right and no coordinator command; issuance needs the Treasury role; contests and rewinds refund unproven outputs | `compromise_delivery_cannot_issue_or_move_credits` (ledger), `compromise_delivery_service_has_no_command` |
 | GPU agent | Lie about its own work, stop, produce garbage | Every command is authorized per resource: it cannot cancel, ack or confirm someone else's job, renew another node's lease, or commit receipts for itself; it has no ledger access | `compromise_gpu_agent_cannot_cancel_other_jobs`, security scenarios |
 | Scheduler | Make bad placements | Its credential cannot issue, pay a dispute, fund from a pool, contest for a borrower, submit for one, or take a lease step for a lender | `compromise_scheduler_cannot_move_balances`, `r2_lease_steps_are_ordered_personal_and_signed` |
-| Orchestrator (holds the credential the Ledger accepts) | Charge outputs at the signed price (returned at settlement unless receipts exist); delay or refuse operations; pay recovery, within the agreed budget, to a lender of an attempt whose lenders all signed ready | The Ledger needs the borrower's signed terms to open and fill an escrow, the lender's signature to give it a line, the recipient's signature to pay a contribution, every lender's readiness to pay recovery, the pool admin's signature to touch the pool's treasury. It computes shares, splits and settlement itself, sends refunds back to their source, and refuses to settle with an open item | `crates/ledger/tests/authority.rs`, TEST-P30 (`crates/ledger/tests/hostile.rs`) |
+| Orchestrator (holds the credential the Ledger accepts) | Charge outputs at the signed price (returned at settlement unless receipts exist); delay or refuse operations | The Ledger needs the borrower's signed terms to open and fill an escrow, the lender's signature to give it a line, the recipient's signature to pay a contribution, every lender's readiness and the recipient's corroboration to pay recovery, the pool admin's signature to touch the pool's treasury. It computes shares, splits and settlement itself, sends refunds back to their source, and refuses to settle with an open item | `crates/ledger/tests/authority.rs`, TEST-P30 (`crates/ledger/tests/hostile.rs`) |
 | Treasury | Issue credits | Per-issuance limit and supply cap in the Ledger; every issuance is a journal entry | `issuance_limits_hold_near_u64_max`, `extreme_values_are_refused_without_panic` |
 | A user account | Act as itself | Per-resource checks; a signature for one session or job cannot be reused (JOB-R34, replay guard); the generators send every kind of command from every principal (TEST-P29) | `tests/security/`, TEST-P29 |
 
 Residual risks, stated plainly:
 
-- **Orchestrator plus one lender account.** Placed in a cluster whose other lenders honestly sign ready, that account can be paid recovery it did not do, up to the recovery budget the borrower signed (10 % of the estimated cost) and what the pool's admin signed for that job. JOB-R18 takes the start of the attempt as proof; tightening it is a decision (section 8).
-- **Orchestrator plus every recipient of a stage.** A receipt proves a transmission to an account. An attacker that also holds the next lender's key, or the witness's for the last stage, can have that stage's contributions paid, within what was charged to the borrower. The borrower's contest and the anti-collusion cap bound it; the Ledger cannot.
+- **Orchestrator plus every recipient of a stage.** A receipt or a corroboration is what one account says it received from another. An attacker that also holds the next lender's key, or the witness's for the last stage, can have that stage's contributions paid, within what was charged to the borrower, and its recovery within the earmark. These signatures raise the number of accounts a fraud needs from one to two per stage; they do not prove that the computation happened. That takes a verification of the work itself, which More does not have yet. The borrower's contest and the anti-collusion cap bound it; the Ledger cannot.
 - **Charges.** The Ledger does not see the delivery proof behind a charge. Without receipts an unproven charge pays nobody and goes back to the borrower at settlement, but it stays locked until then.
 - **Liveness.** A compromised orchestrator can refuse to settle or to release. Nothing here prevents that; it is visible in the audit view.
 
@@ -182,7 +183,7 @@ What each boundary is made of today. "In-process" means it holds against bugs an
 
 ## 8. Open points
 
-- Decision: require a recipient's receipt for an output produced after the resume before paying recovery (closes the first residual risk; changes when recovery is payable, JOB-R18).
+- Verification of the work itself (recomputation by a third party, sampling, or proofs): the only way past "two accounts agree".
 - Delivery proof checked by the Ledger before a charge (witness attestation or client ack), and a contest the borrower can file with the Ledger directly.
 - Witness assignment that the orchestrator cannot choose alone.
 - Aggregated exposure cap per account and per pool across concurrent jobs.
@@ -210,7 +211,7 @@ One PostgreSQL schema per domain, each owned by a role that only that service us
 
 ## 11. Process separation (next step)
 
-Nothing in this section is built. The boundaries above are compiler-level and API-level; the second audit is right that one process is one enclosure. The order below follows what a compromise costs.
+Nothing in this section is built, and it is deliberately kept out of the change that fixed the Ledger's economic invariants: one change for the rules, another for the isolation. The boundaries above are compiler-level and API-level; the second audit is right that one process is one enclosure. The order below follows what a compromise costs.
 
 | Step | What moves out | Interface | Credentials | What it removes |
 | --- | --- | --- | --- | --- |
