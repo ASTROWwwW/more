@@ -24,6 +24,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Mutation anchors still match the code
+        run: python3 scripts/mutation.py --check
 
   msrv:
     name: Minimum Rust version (1.88)
@@ -60,7 +62,7 @@ jobs:
     name: Reference run and mutation campaign
     if: github.event_name == 'workflow_dispatch' && inputs.heavy
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
