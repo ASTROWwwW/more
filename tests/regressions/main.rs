@@ -14,6 +14,33 @@ fn run(ops: &[Op]) -> Sim {
     sim
 }
 
+/// Stands for "every lender of the job's first attempt accepts, loads and reports ready"
+/// (JOB-R38) in the command lists below, which predate per-node leases.
+fn ready(job: JobId) -> Command {
+    Command::AttemptReady {
+        job,
+        attempt: 1,
+        lender: AccountId(0),
+        restored: [0; 3],
+        signature: UNSIGNED,
+    }
+}
+
+#[track_caller]
+fn step(sim: &mut Sim, cmd: &Command) {
+    let r = match cmd {
+        Command::AttemptReady {
+            job,
+            attempt,
+            lender: AccountId(0),
+            restored,
+            ..
+        } => sim.start_cluster(*job, *attempt, *restored),
+        _ => sim.exec(cmd.clone()),
+    };
+    r.unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+}
+
 #[track_caller]
 fn assert_clean(sim: &Sim) {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
@@ -34,6 +61,7 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     let r = sim.exec(Command::FundRecovery {
         job: JobId(1),
         amount: 1,
+        signature: UNSIGNED,
     });
     assert_eq!(
         r,
@@ -43,6 +71,7 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     sim.exec(Command::FundRecovery {
         job: JobId(1),
         amount: 1,
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Cancel {
@@ -74,12 +103,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
             sim.coord.jobs()[&j1].attempt,
             sim.coord.jobs()[&j1].validated,
         );
-        sim.exec(Command::AttemptReady {
-            job: j1,
-            attempt: a,
-            restored: v,
-        })
-        .unwrap();
+        sim.start_cluster(j1, a, v).unwrap();
     };
     sim.exec(Command::Reserve { job: j1 }).unwrap();
     sim.exec(Command::Place {
@@ -115,6 +139,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     sim.exec(Command::FundRecovery {
         job: j1,
         amount: 10,
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Place {
@@ -180,12 +205,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
         expected_version: None,
     })
     .unwrap();
-    sim.exec(Command::AttemptReady {
-        job: j1,
-        attempt: 1,
-        restored: [0; 3],
-    })
-    .unwrap();
+    sim.start_cluster(j1, 1, [0; 3]).unwrap();
     sim.exec(Command::Produce {
         job: j1,
         attempt: 1,
@@ -229,6 +249,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
         wt: WorkType::Generate,
         upto: 1,
         digest: sim.coord.receipt_digest(j1, 1, l, WorkType::Generate, 1),
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Cancel {
@@ -272,12 +293,7 @@ fn ce03_commitment_before_closure_still_counts() {
         expected_version: None,
     })
     .unwrap();
-    sim.exec(Command::AttemptReady {
-        job: j1,
-        attempt: 1,
-        restored: [0; 3],
-    })
-    .unwrap();
+    sim.start_cluster(j1, 1, [0; 3]).unwrap();
     sim.exec(Command::Produce {
         job: j1,
         attempt: 1,
@@ -299,6 +315,7 @@ fn ce03_commitment_before_closure_still_counts() {
         wt: WorkType::Generate,
         upto: 1,
         digest: sim.coord.receipt_digest(j1, 1, l, WorkType::Generate, 1),
+        signature: UNSIGNED,
     })
     .unwrap();
     let s = SliceId {
@@ -348,11 +365,7 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -380,10 +393,10 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
             wt: gen,
             upto: 2,
             digest: sim.coord.receipt_digest(j, 1, AccountId(10), gen, 2),
+            signature: UNSIGNED,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let s = SliceId {
         job: j,
@@ -456,11 +469,7 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -480,10 +489,10 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
             wt: gen,
             upto: 1,
             digest: sim.coord.receipt_digest(j, 1, AccountId(11), gen, 1),
+            signature: UNSIGNED,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let s = SliceId {
         job: j,
@@ -532,11 +541,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -550,8 +555,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
             upto: 1,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let digest = sim.coord.frame_digest(j, gen, 2);
     sim.exec(Command::Deliver {

@@ -53,10 +53,27 @@ impl Sim {
                 if !correct {
                     restored[1] = restored[1].saturating_add(1);
                 }
-                vec![Command::AttemptReady {
-                    job: id,
-                    attempt: j.attempt,
-                    restored,
+                let Some(a) = j.current() else { return vec![] };
+                bring_up(id, j.attempt, &a.lenders, restored)
+            }
+            Op::SilentNode { job, node } => self.silent_node(self.job(job), node),
+            Op::LeaseStep { job, stage, step } => self.lease_step(self.job(job), stage, step),
+            Op::NodeHeartbeat { job, node } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                let k = usize::from(node) % (a.lenders.len() + 1);
+                vec![match a.lenders.get(k) {
+                    Some(l) => Command::Heartbeat {
+                        job: id,
+                        attempt: j.attempt,
+                        lender: *l,
+                    },
+                    None => Command::WitnessHeartbeat {
+                        job: id,
+                        attempt: j.attempt,
+                        witness: a.witness,
+                    },
                 }]
             }
             Op::Produce { job, wt, n } => {
@@ -117,6 +134,7 @@ impl Sim {
                     wt,
                     upto: a.produced[wt.idx()],
                     digest: c.receipt_digest(id, attempt, lender, wt, a.produced[wt.idx()]),
+                    signature: UNSIGNED,
                 }]
             }
             Op::Claim {
@@ -180,11 +198,18 @@ impl Sim {
                         evidence,
                     })
                     .collect();
-                vec![Command::Claim {
+                let claim = Command::Claim {
                     slice: sid,
                     lender,
                     items,
-                }]
+                };
+                // An honest lender has its uncommitted receipts co-signed; a dishonest one claims
+                // without them.
+                if honest {
+                    self.presenting(claim)
+                } else {
+                    vec![claim]
+                }
             }
             Op::ClaimRecovery {
                 job,
@@ -282,6 +307,7 @@ impl Sim {
             Op::Fund { job, amount } => vec![Command::FundRecovery {
                 job: self.job(job),
                 amount: u64::from(amount % 20) + 1,
+                signature: UNSIGNED,
             }],
             Op::Finish(j) => vec![Command::Finish {
                 job: self.job(j),
@@ -352,14 +378,7 @@ impl Sim {
                 }
             }
             Op::Drive { job, sel } => self.drive(self.job(job), sel),
-            Op::Heartbeat(j) => {
-                let id = self.job(j);
-                let Ok(job) = c.job(id) else { return vec![] };
-                vec![Command::Heartbeat {
-                    job: id,
-                    attempt: job.attempt,
-                }]
-            }
+            Op::Heartbeat(j) => self.renew_all(self.job(j)),
             Op::Deliver { job, wt, n, forged } => {
                 let id = self.job(job);
                 let Ok(j) = c.job(id) else { return vec![] };

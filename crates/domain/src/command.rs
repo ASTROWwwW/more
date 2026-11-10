@@ -69,8 +69,34 @@ pub enum Command {
         witness: AccountId,
         expected_version: Option<u64>,
     },
-    /// Renews the lease of the current attempt (JOB-R31).
-    Heartbeat { job: JobId, attempt: u32 },
+    /// JOB-R38: the lender of a stage accepts its lease by signing the attempt's assignment
+    /// (`lease_message`); the ledger checks the signature.
+    AcceptLease {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        signature: [u8; 64],
+    },
+    /// JOB-R38: the lender's layers are loaded; `config` must be the stage's configuration
+    /// digest (`Coordinator::config_digest`).
+    LeaseLoaded {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        config: u64,
+    },
+    /// Renews the sender's own lease (JOB-R31, JOB-R39).
+    Heartbeat {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+    },
+    /// Renews the witness's own lease (JOB-R39).
+    WitnessHeartbeat {
+        job: JobId,
+        attempt: u32,
+        witness: AccountId,
+    },
     /// Witness attestation: positions `< upto` reached the client's transport (JOB-R26, JOB-R27).
     /// `witness` is the signer.
     Deliver {
@@ -118,11 +144,14 @@ pub enum Command {
     ExpireDeliveryWindow { job: JobId },
     /// JOB-T06.
     PlacementFailed { job: JobId },
-    /// JOB-T05: all nodes accepted; `restored` = restored positions per type.
+    /// JOB-T05, JOB-R38: the lender's state is restored to `restored`, signed for the ledger
+    /// (`ready_message`). The attempt starts when every lease is ready.
     AttemptReady {
         job: JobId,
         attempt: u32,
+        lender: AccountId,
         restored: PerType<u32>,
+        signature: [u8; 64],
     },
     /// Units produced by the cluster (JOB-R11, JOB-R13, JOB-R25).
     Produce {
@@ -139,7 +168,8 @@ pub enum Command {
         upto: u32,
     },
     /// Receipt commitment by the recipient of `lender`'s output (JOB-R15): next stage, or the
-    /// witness for the output node. `digest` binds it to the receipts it covers.
+    /// witness for the output node. `digest` binds it to the receipts it covers; `signature` is
+    /// the recipient's over `receipt_message`, checked by the ledger (LEDGER-016).
     CommitReceipts {
         job: JobId,
         attempt: u32,
@@ -147,6 +177,18 @@ pub enum Command {
         wt: WorkType,
         upto: u32,
         digest: u64,
+        signature: [u8; 64],
+    },
+    /// A receipt co-signed by the recipient of `lender`'s output, presented by `lender` itself:
+    /// the proof behind an uncommitted claim (JOB-R12, LEDGER-016).
+    PresentReceipt {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        wt: WorkType,
+        upto: u32,
+        digest: u64,
+        signature: [u8; 64],
     },
     /// Lender claim on an open or draining slice.
     Claim {
@@ -179,8 +221,13 @@ pub enum Command {
     Resume { job: JobId, topup: Amount },
     /// JOB-T10.
     RecoveryTimeout { job: JobId },
-    /// The pool locks credits for recovery (JOB-R18).
-    FundRecovery { job: JobId, amount: Amount },
+    /// The pool locks credits for recovery (JOB-R18). `signature` is the pool admin's over
+    /// `relay_message` for the new running total, checked by the ledger.
+    FundRecovery {
+        job: JobId,
+        amount: Amount,
+        signature: [u8; 64],
+    },
     /// JOB-T13.
     Finish {
         job: JobId,

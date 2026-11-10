@@ -65,6 +65,19 @@ impl Coordinator {
                     Decision::Refund(RefundReason::AttemptNotStarted)
                 }
             }
+            (ItemKind::Contribution(cid), Evidence::Uncommitted)
+                if !self.receipt_covers(
+                    slice.job,
+                    slice.attempt,
+                    lender,
+                    cid.output.wt,
+                    cid.output.pos,
+                ) =>
+            {
+                // JOB-R12, LEDGER-016: an uncommitted receipt must be presented, signed by the
+                // recipient; claimed but missing, it is no proof.
+                refund(RefundReason::EvidenceNotFound)
+            }
             (_, Evidence::Uncommitted) => {
                 // JOB-R19: sliding cap on gross admitted amounts.
                 let now = self.now;
@@ -238,10 +251,10 @@ impl Coordinator {
                 l.items[idx].evidence,
             )
         };
-        self.ledger_op(LedgerOp::PayLine {
+        let item = self.item_id(slice, kind)?;
+        let paid = self.ledger_op(LedgerOp::PayLine {
             line: line_ref(slice, lender),
-            key: format!("pay/{:?}/{}/{:?}", slice, lender.0, kind),
-            amount,
+            item,
         })?;
         // CE-02, JOB-R18: borrower budget first, then pool relay.
         let mut pool_part = 0;
@@ -262,6 +275,12 @@ impl Coordinator {
             }
             j.recovery_paid_borrower = add(j.recovery_paid_borrower, from_borrower, "paid")?;
             j.recovery_paid_pool = pool_paid;
+        }
+        // The ledger splits recovery from its own records (LEDGER-013); it must agree.
+        if paid != (LedgerOutcome::Paid { amount, pool_part }) {
+            return Err(DomainError::Internal(format!(
+                "payment of {kind:?}: ledger {paid:?}, coordinator {amount}/{pool_part}"
+            )));
         }
         let l = self.line_mut(slice, lender)?;
         l.items[idx].pool_part = pool_part;
@@ -299,15 +318,11 @@ impl Coordinator {
             let l = &self.slices[&slice].lines[&lender];
             (l.items[idx].kind, l.items[idx].amount)
         };
-        let back = match kind {
-            ItemKind::Contribution(_) => LineSource::OutputHold,
-            ItemKind::Recovery(_) => LineSource::Recovery,
-        };
+        // The ledger sends it back where it came from (LEDGER-013).
+        let item = self.item_id(slice, kind)?;
         self.ledger_op(LedgerOp::RefundLine {
             line: line_ref(slice, lender),
-            to: back,
-            key: format!("refund/{:?}/{}/{:?}", slice, lender.0, kind),
-            amount,
+            item,
         })?;
         if let ItemKind::Recovery(_) = kind {
             let a = self.attempt_mut(slice.job, slice.attempt)?;

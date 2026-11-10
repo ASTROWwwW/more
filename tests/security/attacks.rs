@@ -123,6 +123,7 @@ fn receipt_commitments_come_from_the_recipient_only() {
         wt: GEN,
         upto: 2,
         digest: digest.unwrap_or_else(|| e.sim.coord.receipt_digest(J1, 1, producer, GEN, 2)),
+        signature: UNSIGNED,
     };
     // Self-commitment would let a lender skip the anti-collusion cap.
     let m = commit(&e, LENDERS[0], None);
@@ -133,13 +134,34 @@ fn receipt_commitments_come_from_the_recipient_only() {
     // The recipient with a digest that does not bind these receipts.
     let m = commit(&e, LENDERS[0], Some(7));
     e.refused(LENDERS[1], m, "INADMISSIBLE_PROOF");
-    // The recipient, correctly bound.
+    // The recipient, correctly bound but unsigned: the ledger keeps no receipt (LEDGER-016).
     let m = commit(&e, LENDERS[0], None);
+    e.refused(LENDERS[1], m, "INADMISSIBLE_PROOF");
+    // The recipient, correctly bound and signed.
+    let signed = |e: &Edge, producer: AccountId, by: AccountId| {
+        let Message::ReceiptCommit { digest, .. } = commit(e, producer, None) else {
+            unreachable!()
+        };
+        let msg = more_identity::receipt_message(J1.0, 1, producer.0, GEN.idx() as u8, 2, digest);
+        Message::ReceiptCommit {
+            job: J1,
+            attempt: 1,
+            producer,
+            wt: GEN,
+            upto: 2,
+            digest,
+            signature: user_key(by).sign(&msg),
+        }
+    };
+    let m = signed(&e, LENDERS[0], LENDERS[1]);
     assert_eq!(e.send(LENDERS[1], m), Ok(Outcome::Applied));
     // The output node's receipts are committed by the witness.
-    let m = commit(&e, LENDERS[2], None);
+    let m = signed(&e, LENDERS[2], WITNESS);
     e.refused(LENDERS[2], m.clone(), "UNAUTHORIZED");
     assert_eq!(e.send(WITNESS, m), Ok(Outcome::Applied));
+    // A receipt signed by someone other than the recipient proves nothing.
+    let m = signed(&e, LENDERS[1], LENDERS[0]);
+    e.refused(LENDERS[2], m, "INADMISSIBLE_PROOF");
 }
 
 /// 6. An expired or revoked attempt still sends work.
@@ -180,7 +202,14 @@ fn the_client_never_sets_the_price() {
         model: ModelId(1),
         outputs: [0, 12, 0],
         max_budget: budget,
-        mandate: mandate(JobId(7), CREDIT_POOL, BORROWERS[0], budget),
+        mandate: mandate(
+            JobId(7),
+            CREDIT_POOL,
+            BORROWERS[0],
+            ModelId(1),
+            [0, 12, 0],
+            budget,
+        ),
     };
     e.refused(BORROWERS[0], m, "PRECONDITION_FAILED");
     // A free-sharing pool cannot be given a tariff, and a credit pool cannot price above the
@@ -222,7 +251,7 @@ fn non_member_cannot_use_a_private_pool() {
         model: ModelId(1),
         outputs: [0, 1, 0],
         max_budget: 100,
-        mandate: mandate(JobId(job), pool, STRANGER, 100),
+        mandate: mandate(JobId(job), pool, STRANGER, ModelId(1), [0, 1, 0], 100),
     };
     e.refused(STRANGER, submit(7, CREDIT_POOL), "UNAUTHORIZED");
     e.refused(
@@ -327,7 +356,14 @@ fn extreme_values_are_refused_without_panic() {
         model: ModelId(1),
         outputs: [u32::MAX; 3],
         max_budget: u64::MAX,
-        mandate: mandate(JobId(7), CREDIT_POOL, BORROWERS[0], u64::MAX),
+        mandate: mandate(
+            JobId(7),
+            CREDIT_POOL,
+            BORROWERS[0],
+            ModelId(1),
+            [u32::MAX; 3],
+            u64::MAX,
+        ),
     };
     e.refused(BORROWERS[0], m, "INVALID_INPUT");
     e.refused(
@@ -335,6 +371,7 @@ fn extreme_values_are_refused_without_panic() {
         Message::FundRecovery {
             job: J1,
             amount: u64::MAX,
+            signature: UNSIGNED,
         },
         "ARITHMETIC_OVERFLOW",
     );

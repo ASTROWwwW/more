@@ -65,7 +65,6 @@ impl Coordinator {
             commission,
         } = self.ledger_op(LedgerOp::ReleaseReward {
             line: line_ref(slice, lender),
-            key: format!("{:?}/{}", slice, lender.0),
         })?
         else {
             return Err(DomainError::Internal("release outcome".into()));
@@ -108,11 +107,18 @@ impl Coordinator {
             .filter(|i| i.status == ItemStatus::Paid && !i.reward_done)
             .try_fold(0u64, |acc, i| acc.checked_add(i.pool_part))
             .ok_or(DomainError::Overflow("pool part"))?;
-        self.ledger_op(LedgerOp::ContestReward {
+        let out = self.ledger_op(LedgerOp::ContestReward {
             line: line_ref(slice, lender),
-            key: format!("{:?}/{}", slice, lender.0),
-            pool_part: to_pool,
         })?;
+        let expected = LedgerOutcome::Contested {
+            to_pool,
+            to_owner: sub(held, to_pool, "contest")?,
+        };
+        if out != expected {
+            return Err(DomainError::Internal(format!(
+                "contest: ledger {out:?}, coordinator {expected:?}"
+            )));
+        }
         let j = self.job_mut(slice.job)?;
         j.recovery_contested_pool = add(j.recovery_contested_pool, to_pool, "contested pool")?;
         let l = self.line_mut(slice, lender)?;
@@ -151,14 +157,17 @@ impl Coordinator {
         // CE-02: unspent pool relay goes back to the pool; everything else to the borrower. The
         // ledger takes both destinations from the escrow record.
         let pool_unspent = sub(j.pool_recovery_funded, j.recovery_paid_pool, "pool relay")?;
-        self.ledger_op(LedgerOp::SettleJob {
-            job: job_acct(job),
-            pool_unspent,
-        })
-        .map_err(|e| match e {
-            DomainError::Ledger(LedgerApiError::Invalid(m)) => DomainError::Internal(m.into()),
-            other => other,
-        })?;
+        let out = self
+            .ledger_op(LedgerOp::SettleJob { job: job_acct(job) })
+            .map_err(|e| match e {
+                DomainError::Ledger(e) => DomainError::Internal(format!("settle: {e:?}")),
+                other => other,
+            })?;
+        if !matches!(out, LedgerOutcome::Settled { to_pool, .. } if to_pool == pool_unspent) {
+            return Err(DomainError::Internal(format!(
+                "settle: ledger {out:?}, coordinator pool share {pool_unspent}"
+            )));
+        }
         self.set_settle(job, SettleStatus::Closed, "JOB-S12")?;
         Ok(Outcome::Applied)
     }

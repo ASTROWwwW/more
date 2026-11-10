@@ -25,7 +25,7 @@ impl Coordinator {
                     }
                     ExecStatus::Placing
                         if since >= c.placing_timeout
-                            || j.current().is_some_and(|a| now >= a.lease_expires_at) =>
+                            || j.current().is_some_and(|a| a.any_expired(now)) =>
                     {
                         todo.push(Command::PlacementFailed { job: j.id })
                     }
@@ -36,8 +36,8 @@ impl Coordinator {
                         todo.push(Command::ExpirePause { job: j.id })
                     }
                     ExecStatus::Running => {
-                        // JOB-R31: expired lease means lost node.
-                        if j.current().is_some_and(|a| now >= a.lease_expires_at) {
+                        // JOB-R31, JOB-R39: any node's expired lease means a lost node.
+                        if j.current().is_some_and(|a| a.any_expired(now)) {
                             todo.push(Command::NodeLost {
                                 job: j.id,
                                 expected_version: None,

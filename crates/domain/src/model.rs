@@ -86,6 +86,24 @@ pub enum PauseReason {
     ClientSilent,
 }
 
+/// Lease of one stage (JOB-R38). Moves forward only: `Assigned` at placement, `Accepted` when the
+/// lender signs the assignment, `Loaded` when its layers match the configuration, `Ready` when its
+/// state is restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeaseState {
+    Assigned,
+    Accepted,
+    Loaded,
+    Ready,
+}
+
+/// One node's lease: its own state and its own expiry (JOB-R39). Only its holder renews it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub state: LeaseState,
+    pub expires_at: Time,
+}
+
 /// An attempt: fixed cluster, leases, production counters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
@@ -98,8 +116,10 @@ pub struct Attempt {
     /// Assigned delivery witness (JOB-R26), independent of lenders and borrower; the only one
     /// allowed to attest delivery.
     pub witness: AccountId,
-    /// Lease expiry (JOB-R31), coordinator time.
-    pub lease_expires_at: Time,
+    /// Lease of each stage, same order as `lenders` (JOB-R38, JOB-R39).
+    pub leases: Vec<Lease>,
+    /// The witness's own lease: renewed by the witness only (JOB-R39).
+    pub witness_expires_at: Time,
     /// The witness lost its buffer: no more attestation or replay (JOB-R28).
     pub witness_lost: bool,
     /// The witness purged its buffer after retention (JOB-R28).
@@ -108,7 +128,7 @@ pub struct Attempt {
     pub revoked_at: Option<Time>,
     /// Position of the revocation in the coordinator log (CE-03).
     pub revoked_seq: Option<u64>,
-    /// The cluster accepted and state is restored (JOB-T05).
+    /// Every lease is `Ready`: the attempt started (JOB-T05).
     pub ready: bool,
     /// Next position to produce, per type.
     pub produced: PerType<u32>,
@@ -223,6 +243,34 @@ impl Attempt {
     /// The output node: last stage.
     pub fn output_node(&self) -> Option<AccountId> {
         self.lenders.last().copied()
+    }
+
+    /// Nodes whose lease has expired at `now`, lenders then witness (JOB-R39).
+    pub fn expired_nodes(&self, now: Time) -> Vec<AccountId> {
+        let mut v: Vec<AccountId> = self
+            .lenders
+            .iter()
+            .zip(&self.leases)
+            .filter(|(_, l)| now >= l.expires_at)
+            .map(|(a, _)| *a)
+            .collect();
+        if now >= self.witness_expires_at {
+            v.push(self.witness);
+        }
+        v
+    }
+
+    /// Some node of the cluster lost its lease: the pipeline cannot run (JOB-R31, JOB-R39).
+    pub fn any_expired(&self, now: Time) -> bool {
+        now >= self.witness_expires_at || self.leases.iter().any(|l| now >= l.expires_at)
+    }
+
+    /// Earliest lease expiry of the cluster.
+    pub fn first_expiry(&self) -> Time {
+        self.leases
+            .iter()
+            .map(|l| l.expires_at)
+            .fold(self.witness_expires_at, Time::min)
     }
 }
 

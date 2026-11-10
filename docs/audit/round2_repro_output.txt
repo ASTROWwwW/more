@@ -1,0 +1,24 @@
+running 6 tests
+test finding1_pool_credits_reach_the_owner ... reserve from recovery Ok(Done), refund to hold Ok(Done), settle Ok(Done)
+pool 950 owner 1050
+ok
+test finding1b_settle_with_a_chosen_pool_share ... settle with pool_unspent = 0: Ok(Done)
+pool 950 owner 1050
+ok
+test finding2_settle_with_an_open_line_then_orphan_funds ... settle with open line Ok(Done); late refund Ok(Done); settle again Err(EscrowSettled(1))
+output hold after closure: 40
+ok
+test finding3_pay_an_account_that_never_worked ... Reserve: Ok(Done)
+ChargeOutput: Ok(Done)
+ReserveLine: Ok(Done)
+PayLine: Ok(Done)
+ReleaseReward: Ok(Released { to_lender: 90, commission: 10 })
+stranger balance 90
+ok
+test finding4_one_lender_starts_the_cluster ... ready from AccountId(10) only (3 lenders): Ok(Applied), exec Running
+ok
+test finding5_one_heartbeat_keeps_every_lease ... after 135s with lenders 2..n silent: exec Running, lease expires at 165, now 130
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

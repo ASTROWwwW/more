@@ -20,7 +20,11 @@ fn compromise_gpu_agent_cannot_cancel_other_jobs() {
             wt: GEN,
             upto: 2,
         },
-        Message::FundRecovery { job: J1, amount: 1 },
+        Message::FundRecovery {
+            job: J1,
+            amount: 1,
+            signature: UNSIGNED,
+        },
         Message::Arbitrate {
             slice: SliceId {
                 job: J1,
@@ -64,7 +68,11 @@ fn compromise_scheduler_cannot_move_balances() {
             to: IssueTarget::User(STRANGER),
             amount: 10,
         },
-        Command::FundRecovery { job: J1, amount: 5 },
+        Command::FundRecovery {
+            job: J1,
+            amount: 5,
+            signature: UNSIGNED,
+        },
         Command::Arbitrate {
             slice,
             lender: LENDERS[0],
@@ -82,7 +90,14 @@ fn compromise_scheduler_cannot_move_balances() {
             model: ModelId(1),
             outputs: [0, 1, 0],
             max_budget: 100,
-            mandate: mandate(JobId(8), CREDIT_POOL, BORROWERS[0], 100),
+            mandate: mandate(
+                JobId(8),
+                CREDIT_POOL,
+                BORROWERS[0],
+                ModelId(1),
+                [0, 1, 0],
+                100,
+            ),
         },
         Command::Reconcile,
     ];

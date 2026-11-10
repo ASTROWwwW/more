@@ -14,6 +14,13 @@ use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+mod statements;
+
+pub use statements::{
+    lease_message, mandate_message, ready_message, receipt_message, relay_message, Assignment,
+    JobTerms,
+};
+
 /// Account number, as used by the ledger and the domain (`AccountId.0`).
 pub type AccountNo = u32;
 
@@ -346,18 +353,6 @@ impl AuthContext {
             Principal::Account(_) => None,
         }
     }
-}
-
-/// Bytes a borrower signs to let the Ledger lock up to `max_budget` credits for one job. Binding
-/// the job, the pool and the borrower keeps a mandate from being reused elsewhere.
-pub fn mandate_message(job: u32, pool: u32, borrower: AccountNo, max_budget: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(36);
-    m.extend_from_slice(b"more/mandate/v1");
-    m.extend_from_slice(&job.to_le_bytes());
-    m.extend_from_slice(&pool.to_le_bytes());
-    m.extend_from_slice(&borrower.to_le_bytes());
-    m.extend_from_slice(&max_budget.to_le_bytes());
-    m
 }
 
 /// Test support: builds an authenticated account context without a signature. Compiled only with

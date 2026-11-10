@@ -103,13 +103,12 @@ impl Sim {
                 PauseReason::ClientSilent => svc(ServiceRole::Reconciler),
                 _ => svc(ServiceRole::Scheduler),
             },
-            Heartbeat { job, attempt: n }
-            | AttemptReady {
-                job, attempt: n, ..
-            } => match attempt(job, *n).and_then(|a| a.lenders.first()) {
-                Some(l) => acct(*l),
-                None => svc(ServiceRole::Scheduler),
-            },
+            AcceptLease { lender, .. }
+            | LeaseLoaded { lender, .. }
+            | AttemptReady { lender, .. }
+            | Heartbeat { lender, .. }
+            | PresentReceipt { lender, .. } => acct(*lender),
+            WitnessHeartbeat { witness, .. } => acct(*witness),
             Produce {
                 job, attempt: n, ..
             } => match attempt(job, *n).and_then(|a| a.output_node()) {
@@ -186,5 +185,116 @@ impl Sim {
             Some(a) => assume_account(a.0),
             None => self.as_service(SERVICES[k - accounts.len()]),
         }
+    }
+}
+
+/// Signature left for the sending client to fill in (see [`Sim::signed`]).
+pub const UNSIGNED: [u8; 64] = [0; 64];
+
+/// Configuration digest left for the loading lender to fill in (see [`Sim::signed`]).
+pub const UNSET_CONFIG: u64 = 0;
+
+impl Sim {
+    /// The simulated clients complete and sign their own statements when they send them: a lender
+    /// its lease, the configuration it loaded and its readiness, a recipient its receipt
+    /// commitments. A producer presenting a receipt
+    /// carries its recipient's co-signature, which an honest recipient gives only for what it
+    /// received. A signature that is not [`UNSIGNED`] is sent as is (forgery tests).
+    pub fn signed(&self, ctx: &AuthContext, mut cmd: Command) -> Command {
+        use Command::*;
+        let Some(me) = ctx.account_no().map(AccountId) else {
+            return cmd;
+        };
+        let c = &self.coord;
+        let att = |job: JobId, n: u32| c.jobs().get(&job).and_then(|j| j.attempts.get(&n));
+        match &mut cmd {
+            AcceptLease {
+                job,
+                attempt,
+                signature,
+                ..
+            } if *signature == UNSIGNED => {
+                if let Some(a) = att(*job, *attempt) {
+                    *signature = user_key(me).sign(&lease_message(&assignment_of(*job, a)));
+                }
+            }
+            FundRecovery {
+                job,
+                amount,
+                signature,
+            } if *signature == UNSIGNED => {
+                if let Some(j) = c.jobs().get(job) {
+                    let total = j.pool_recovery_funded.saturating_add(*amount);
+                    *signature = user_key(me).sign(&relay_message(job.0, j.pool.0, total));
+                }
+            }
+            LeaseLoaded {
+                job,
+                attempt,
+                lender,
+                config,
+            } if *config == UNSET_CONFIG => {
+                let stage = att(*job, *attempt).and_then(|a| a.stage_of(*lender));
+                if let Some(d) = stage.and_then(|s| c.config_digest(*job, *attempt, s)) {
+                    *config = d;
+                }
+            }
+            AttemptReady {
+                job,
+                attempt,
+                lender,
+                restored,
+                signature,
+            } if *signature == UNSIGNED => {
+                *signature =
+                    user_key(me).sign(&ready_message(job.0, *attempt, lender.0, *restored));
+            }
+            CommitReceipts {
+                job,
+                attempt,
+                lender,
+                wt,
+                upto,
+                digest,
+                signature,
+            } if *signature == UNSIGNED => {
+                let m = receipt_message(job.0, *attempt, lender.0, wt.idx() as u8, *upto, *digest);
+                *signature = user_key(me).sign(&m);
+            }
+            PresentReceipt {
+                job,
+                attempt,
+                lender,
+                wt,
+                upto,
+                digest,
+                signature,
+            } if *signature == UNSIGNED => {
+                let recipient = att(*job, *attempt).and_then(|a| {
+                    let received = *upto <= a.produced[wt.idx()];
+                    let r = a.stage_of(*lender).and_then(|s| a.recipient_of(s));
+                    r.filter(|_| received)
+                });
+                if let Some(r) = recipient {
+                    let m =
+                        receipt_message(job.0, *attempt, lender.0, wt.idx() as u8, *upto, *digest);
+                    *signature = user_key(r).sign(&m);
+                }
+            }
+            _ => {}
+        }
+        cmd
+    }
+}
+
+/// The assignment the ledger registered for `a`, rebuilt from the coordinator's view.
+pub fn assignment_of(job: JobId, a: &Attempt) -> Assignment {
+    Assignment {
+        job: job.0,
+        attempt: a.no,
+        lenders: a.lenders.iter().map(|l| l.0).collect(),
+        layout: a.layout.clone(),
+        witness: a.witness.0,
+        recovery_earmark: a.recovery_earmark,
     }
 }

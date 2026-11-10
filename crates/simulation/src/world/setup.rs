@@ -66,9 +66,70 @@ pub fn user_key(a: AccountId) -> UserKey {
     UserKey::from_seed(seed)
 }
 
-/// Mandate signed by `borrower` for `job` (checked by the ledger).
-pub fn mandate(job: JobId, pool: PoolId, borrower: AccountId, max_budget: Amount) -> [u8; 64] {
-    user_key(borrower).sign(&mandate_message(job.0, pool.0, borrower.0, max_budget))
+/// Mandate signed by `borrower` for `job` under the pool's current tariff for `model` (checked by
+/// the ledger, JOB-R37).
+pub fn mandate(
+    job: JobId,
+    pool: PoolId,
+    borrower: AccountId,
+    model: ModelId,
+    outputs: PerType<u32>,
+    max_budget: Amount,
+) -> [u8; 64] {
+    let spec = catalog()
+        .into_iter()
+        .find(|(p, m, _)| *p == pool && *m == model)
+        .map_or(
+            ModelSpec {
+                layers: 0,
+                price: [0; 3],
+                max_outputs: [0; 3],
+            },
+            |(_, _, s)| s,
+        );
+    let terms = JobTerms {
+        model: model.0,
+        layers: spec.layers,
+        price: spec.price,
+        max_outputs: outputs,
+        max_budget,
+    };
+    user_key(borrower).sign(&mandate_message(job.0, pool.0, borrower.0, &terms))
+}
+
+/// JOB-R38: every lender of the attempt accepts its lease, loads its layers and reports its state
+/// restored to `restored`, in that order. Statements are signed by the sending lender.
+pub fn bring_up(
+    job: JobId,
+    attempt: u32,
+    lenders: &[AccountId],
+    restored: PerType<u32>,
+) -> Vec<Command> {
+    let mut v = Vec::new();
+    for l in lenders {
+        v.push(Command::AcceptLease {
+            job,
+            attempt,
+            lender: *l,
+            signature: UNSIGNED,
+        });
+        v.push(Command::LeaseLoaded {
+            job,
+            attempt,
+            lender: *l,
+            config: UNSET_CONFIG,
+        });
+    }
+    for l in lenders {
+        v.push(Command::AttemptReady {
+            job,
+            attempt,
+            lender: *l,
+            restored,
+            signature: UNSIGNED,
+        });
+    }
+    v
 }
 
 /// Setup commands: pools, members, catalog, issuance, job submissions.
@@ -157,7 +218,7 @@ pub fn setup_commands() -> Vec<Command> {
             model,
             outputs,
             max_budget: budget,
-            mandate: mandate(job, pool, borrower, budget),
+            mandate: mandate(job, pool, borrower, model, outputs, budget),
         });
     }
     v

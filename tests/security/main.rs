@@ -8,6 +8,7 @@ use more_identity::UserKey;
 
 mod attacks;
 mod compromise;
+mod leases;
 mod protocol;
 
 const J1: JobId = JobId(1);
@@ -35,20 +36,17 @@ impl Edge {
                 witness: WITNESS,
                 expected_version: None,
             },
-            Command::AttemptReady {
-                job: J1,
-                attempt: 1,
-                restored: [0; 3],
-            },
-            Command::Produce {
-                job: J1,
-                attempt: 1,
-                wt: GEN,
-                upto: 2,
-            },
         ] {
             sim.exec(c).unwrap();
         }
+        sim.start_cluster(J1, 1, [0; 3]).unwrap();
+        sim.exec(Command::Produce {
+            job: J1,
+            attempt: 1,
+            wt: GEN,
+            upto: 2,
+        })
+        .unwrap();
         Edge {
             sim,
             guard: ReplayGuard::default(),

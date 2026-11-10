@@ -88,6 +88,12 @@ impl Stats {
                 AuditEvent::LateDelivery { .. } => self.bump("late attestations admitted"),
                 AuditEvent::BufferPurged { .. } => self.bump("buffers purged after retention"),
                 AuditEvent::EvidenceSupplemented { .. } => self.bump("supplementary proofs"),
+                AuditEvent::LeasesExpired { nodes, .. } => {
+                    self.bump("attempts revoked with an expired lease");
+                    if nodes.len() == 1 {
+                        self.bump("attempts revoked for one silent node");
+                    }
+                }
                 _ => {}
             }
         }

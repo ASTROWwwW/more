@@ -15,6 +15,16 @@ const J3: JobId = JobId(3); // open-sharing pool
 const L: [AccountId; 3] = [AccountId(10), AccountId(11), AccountId(12)];
 const GEN: WorkType = WorkType::Generate;
 
+fn ready_cmd(job: JobId, attempt: u32, lender: AccountId, restored: PerType<u32>) -> Command {
+    Command::AttemptReady {
+        job,
+        attempt,
+        lender,
+        restored,
+        signature: UNSIGNED,
+    }
+}
+
 struct T {
     sim: Sim,
 }
@@ -86,11 +96,32 @@ impl T {
             expected_version: None,
         });
         let (attempt, restored) = (self.attempt(j), self.job(j).delivered);
-        self.ok(Command::AttemptReady {
-            job: j,
-            attempt,
-            restored,
-        });
+        self.ready(j, attempt, restored);
+    }
+
+    /// The lenders of `attempt` accept their leases and load their layers (JOB-R38).
+    fn load(&mut self, j: JobId, attempt: u32) {
+        let lenders = self.job(j).attempts[&attempt].lenders.clone();
+        for cmd in bring_up(j, attempt, &lenders, [0; 3]) {
+            if !matches!(cmd, Command::AttemptReady { .. }) {
+                self.ok(cmd);
+            }
+        }
+    }
+
+    /// Every lender of `attempt` reports its state restored to `restored`.
+    fn ready(&mut self, j: JobId, attempt: u32, restored: PerType<u32>) {
+        self.load(j, attempt);
+        for l in self.job(j).attempts[&attempt].lenders.clone() {
+            self.ok(ready_cmd(j, attempt, l, restored));
+        }
+    }
+
+    /// The first lender reports a state the coordinator refuses.
+    fn ready_err(&mut self, j: JobId, attempt: u32, restored: PerType<u32>) -> DomainError {
+        self.load(j, attempt);
+        let l = self.job(j).attempts[&attempt].lenders[0];
+        self.err(ready_cmd(j, attempt, l, restored))
     }
 
     /// Produces and acks `n` generation tokens, one by one.
@@ -126,6 +157,7 @@ impl T {
                 digest: self
                     .c()
                     .receipt_digest(j, a, *l, GEN, att.produced[GEN.idx()]),
+                signature: UNSIGNED,
             });
         }
     }
@@ -137,6 +169,21 @@ impl T {
             .keys()
             .rfind(|s| s.job == j && self.c().slices()[s].status == SliceStatus::Open)
             .expect("open slice")
+    }
+
+    /// `lender` presents a receipt for its outputs `0..upto`, co-signed by its recipient
+    /// (JOB-R12, LEDGER-016).
+    fn present(&mut self, j: JobId, attempt: u32, lender: AccountId, upto: u32) {
+        let digest = self.c().receipt_digest(j, attempt, lender, GEN, upto);
+        self.ok(Command::PresentReceipt {
+            job: j,
+            attempt,
+            lender,
+            wt: GEN,
+            upto,
+            digest,
+            signature: UNSIGNED,
+        });
     }
 
     /// Each lender claims its range for every output of the slice's attempt.
@@ -173,16 +220,18 @@ impl T {
         let mut left = dt;
         while left > 0 {
             let step = left.min(15);
-            let live: Vec<(JobId, u32)> = self
+            let live: Vec<JobId> = self
                 .c()
                 .jobs()
                 .values()
                 .filter(|j| matches!(j.exec, ExecStatus::Running | ExecStatus::Placing))
                 .filter(|j| j.current().is_some_and(|a| a.revoked_at.is_none()))
-                .map(|j| (j.id, j.attempt))
+                .map(|j| j.id)
                 .collect();
-            for (job, attempt) in live {
-                self.ok(Command::Heartbeat { job, attempt });
+            for job in live {
+                for cmd in self.sim.renew_all(job) {
+                    self.ok(cmd);
+                }
             }
             self.ok(Command::Tick { dt: step });
             left -= step;

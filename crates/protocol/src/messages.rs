@@ -39,10 +39,12 @@ pub enum Message {
         model: ModelId,
         spec: ModelSpec,
     },
+    /// The lender's state is restored; `signature` over `ready_message`, for the ledger.
     AssignAck {
         job: JobId,
         attempt: u32,
         restored: PerType<u32>,
+        signature: [u8; 64],
     },
     AssignReject {
         job: JobId,
@@ -61,6 +63,7 @@ pub enum Message {
         upto: u32,
     },
     /// Sent by the recipient of `producer`'s output; the sender is the committer (SEC-004).
+    /// `signature` is the sender's over `receipt_message`, for the ledger.
     ReceiptCommit {
         job: JobId,
         attempt: u32,
@@ -68,6 +71,7 @@ pub enum Message {
         wt: WorkType,
         upto: u32,
         digest: u64,
+        signature: [u8; 64],
     },
     UsageReport {
         slice: SliceId,
@@ -78,7 +82,7 @@ pub enum Message {
         output: OutputId,
         evidence: Evidence,
     },
-    /// Lease renewal (JOB-R31).
+    /// Renewal of the sender's own lease (JOB-R31, JOB-R39).
     Heartbeat {
         job: JobId,
         attempt: u32,
@@ -124,9 +128,37 @@ pub enum Message {
         lender: AccountId,
         pay: bool,
     },
+    /// `signature`: the sender's over `relay_message` for the new running total.
     FundRecovery {
         job: JobId,
         amount: Amount,
+        signature: [u8; 64],
+    },
+    /// The sender accepts its lease: `signature` over `lease_message` (JOB-R38).
+    AssignAccept {
+        job: JobId,
+        attempt: u32,
+        signature: [u8; 64],
+    },
+    /// The sender's layers are loaded with configuration `config` (JOB-R38).
+    LayersLoaded {
+        job: JobId,
+        attempt: u32,
+        config: u64,
+    },
+    /// Renewal of the witness's own lease (JOB-R39).
+    WitnessHeartbeat {
+        job: JobId,
+        attempt: u32,
+    },
+    /// The sender presents a receipt for its own output, signed by its recipient (JOB-R12).
+    ReceiptPresent {
+        job: JobId,
+        attempt: u32,
+        wt: WorkType,
+        upto: u32,
+        digest: u64,
+        signature: [u8; 64],
     },
 }
 
@@ -156,6 +188,10 @@ pub enum MessageKind {
     ReleaseReward,
     Arbitrate,
     FundRecovery,
+    AssignAccept,
+    LayersLoaded,
+    WitnessHeartbeat,
+    ReceiptPresent,
 }
 
 impl Message {
@@ -187,6 +223,10 @@ impl Message {
             M::ReleaseReward { .. } => K::ReleaseReward,
             M::Arbitrate { .. } => K::Arbitrate,
             M::FundRecovery { .. } => K::FundRecovery,
+            M::AssignAccept { .. } => K::AssignAccept,
+            M::LayersLoaded { .. } => K::LayersLoaded,
+            M::WitnessHeartbeat { .. } => K::WitnessHeartbeat,
+            M::ReceiptPresent { .. } => K::ReceiptPresent,
         }
     }
 
@@ -239,13 +279,34 @@ impl Message {
                 job,
                 attempt,
                 restored,
+                signature,
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
                 restored.iter().for_each(|r| w.u32(*r));
+                w.bytes(signature);
+            }
+            M::AssignAccept {
+                job,
+                attempt,
+                signature,
+            } => {
+                w.u32(job.0);
+                w.u32(*attempt);
+                w.bytes(signature);
+            }
+            M::LayersLoaded {
+                job,
+                attempt,
+                config,
+            } => {
+                w.u32(job.0);
+                w.u32(*attempt);
+                w.u64(*config);
             }
             M::AssignReject { job, attempt }
             | M::Heartbeat { job, attempt }
+            | M::WitnessHeartbeat { job, attempt }
             | M::WitnessLost { job, attempt } => {
                 w.u32(job.0);
                 w.u32(*attempt);
@@ -280,6 +341,7 @@ impl Message {
                 wt,
                 upto,
                 digest,
+                signature,
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
@@ -287,6 +349,22 @@ impl Message {
                 w.u8(wt.idx() as u8);
                 w.u32(*upto);
                 w.u64(*digest);
+                w.bytes(signature);
+            }
+            M::ReceiptPresent {
+                job,
+                attempt,
+                wt,
+                upto,
+                digest,
+                signature,
+            } => {
+                w.u32(job.0);
+                w.u32(*attempt);
+                w.u8(wt.idx() as u8);
+                w.u32(*upto);
+                w.u64(*digest);
+                w.bytes(signature);
             }
             M::UsageReport { slice, items } => {
                 w.slice(*slice);
@@ -359,9 +437,14 @@ impl Message {
                 w.u32(lender.0);
                 w.u8(u8::from(*pay));
             }
-            M::FundRecovery { job, amount } => {
+            M::FundRecovery {
+                job,
+                amount,
+                signature,
+            } => {
                 w.u32(job.0);
                 w.u64(*amount);
+                w.bytes(signature);
             }
         }
     }

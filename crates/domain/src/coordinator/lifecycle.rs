@@ -88,7 +88,12 @@ impl Coordinator {
     }
 
     /// JOB-R18: the pool relays the recovery budget.
-    pub(super) fn fund_recovery(&mut self, job: JobId, amount: Amount) -> R<Outcome> {
+    pub(super) fn fund_recovery(
+        &mut self,
+        job: JobId,
+        amount: Amount,
+        signature: &[u8; 64],
+    ) -> R<Outcome> {
         if !self.is_credits(job)? {
             return Err(DomainError::Precondition(
                 "free pool has no recovery escrow",
@@ -100,18 +105,43 @@ impl Coordinator {
         if j.settle != SettleStatus::Active {
             return Err(DomainError::Precondition("JOB-R18: settlement not active"));
         }
-        let key = format!("fund/{}/{}", job.0, self.audit.len());
         let unearmarked = add(j.recovery_unearmarked, amount, "recovery budget")?;
         let funded = add(j.pool_recovery_funded, amount, "pool relay")?;
-        self.ledger_op(LedgerOp::FundRecovery {
+        // The ledger checks the admin's signature over the new total itself: the orchestrator
+        // cannot move the pool's treasury on its own.
+        self.ledger_proof(LedgerOp::FundRecovery {
             job: job_acct(job),
-            key,
             amount,
+            signature: *signature,
         })?;
         let j = self.job_mut(job)?;
         j.recovery_unearmarked = unearmarked;
         j.pool_recovery_funded = funded;
         Ok(Outcome::Applied)
+    }
+
+    /// The platform admin creates a pool; its own credential tells the ledger who administers
+    /// the pool's treasury, so the orchestrator cannot name an admin of its choice.
+    pub(super) fn create_pool(
+        &mut self,
+        ctx: &AuthContext,
+        pool: PoolId,
+        mode: PoolMode,
+        access: crate::registry::PoolAccess,
+        admin: AccountId,
+    ) -> R<Outcome> {
+        let out = self.registry.create(pool, mode, access, admin)?;
+        if out == Outcome::Applied {
+            let platform = ctx
+                .credential()
+                .ok_or(DomainError::Unauthorized("only the platform admin"))?;
+            let op = LedgerOp::RegisterPool {
+                pool: pool.0,
+                admin: admin.0,
+            };
+            self.ledger.execute(platform, op)?;
+        }
+        Ok(out)
     }
 
     /// JOB-T13: every produced unit is delivered (attested or acked).
@@ -218,13 +248,20 @@ impl Coordinator {
                 "JOB-T01: signed budget below the estimated cost",
             ));
         }
-        // The ledger checks the borrower's signature itself: a compromised orchestrator cannot
-        // open an escrow nobody agreed to.
+        // The ledger checks the borrower's signature over the job's terms itself: a compromised
+        // orchestrator cannot open an escrow nobody agreed to, nor change the price or the model's
+        // size that shares are computed from.
         self.ledger_op(LedgerOp::OpenEscrow {
             job: job_acct(job),
             owner: borrower.0,
             pool: pool.0,
-            max_budget,
+            terms: JobTerms {
+                model: model.0,
+                layers: spec.layers,
+                price,
+                max_outputs: outputs,
+                max_budget,
+            },
             signature: *mandate,
         })?;
         self.jobs.insert(

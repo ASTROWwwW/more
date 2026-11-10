@@ -4,7 +4,7 @@ use super::*;
 
 /// TEST-P23, fairness, checked after draining: every honest, proven, funded contribution ends paid
 /// with its reward released or contested; no valid claim is lost at closure; an uncommitted receipt
-/// is only refunded by arbitration.
+/// is only refunded by arbitration or for want of the recipient's signature.
 pub fn check_fairness(
     c: &Coordinator,
     claims: &[(SliceId, AccountId, ContributionId)],
@@ -73,9 +73,15 @@ pub fn check_fairness(
                         ),
                     ));
                 }
+                // An uncommitted item is refunded by arbitration, or for want of a receipt signed
+                // by the recipient (JOB-R12, LEDGER-016); `receipts_step` checks that the receipt
+                // was really missing.
                 if it.evidence == Evidence::Uncommitted && it.status == ItemStatus::Refunded {
                     let r = refund_reason(s.id, *lender, it.kind);
-                    if r != Some(RefundReason::Arbitration) {
+                    if !matches!(
+                        r,
+                        Some(RefundReason::Arbitration | RefundReason::EvidenceNotFound)
+                    ) {
                         out.push(v(
                             "TEST-P23",
                             format!("{:?}/{lender:?}: uncommitted {cid:?} refunded without arbitration ({r:?})", s.id),

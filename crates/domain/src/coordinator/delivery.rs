@@ -29,14 +29,17 @@ impl Coordinator {
             )
         };
         let gen = self.delivery.generation(output);
-        self.ledger_op(LedgerOp::ChargeOutput {
+        let moved = self.ledger_op(LedgerOp::ChargeOutput {
             job: job_acct(output.job),
-            key: format!(
-                "charge/{}/{:?}/{}/{}",
-                output.job.0, output.wt, output.pos, gen
-            ),
-            amount: price,
+            attempt,
+            output: output_ref(output),
+            gen,
         })?;
+        if moved != LedgerOutcome::Moved(price) {
+            return Err(DomainError::Internal(format!(
+                "charge of {output:?}: ledger {moved:?}, price {price}"
+            )));
+        }
         self.delivery
             .record_charge(output, attempt, definitive, basis, replayable)?;
         self.audit.push(AuditEvent::OutputCharged {

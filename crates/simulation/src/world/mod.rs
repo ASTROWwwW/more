@@ -8,7 +8,8 @@ use std::sync::Arc;
 use gpu_domain::*;
 use gpu_ledger::{LedgerLimits, LedgerService};
 use more_identity::{
-    assume_account, mandate_message, IdentityAuthority, KeyDirectory, ServiceRole, UserKey,
+    assume_account, lease_message, mandate_message, ready_message, receipt_message, relay_message,
+    Assignment, IdentityAuthority, JobTerms, KeyDirectory, ServiceRole, UserKey,
 };
 
 use crate::invariants::{check_state, check_step, Violation};
@@ -20,7 +21,7 @@ mod operations;
 mod resolve;
 mod setup;
 
-pub use identity::SimIdentity;
+pub use identity::{assignment_of, SimIdentity, UNSET_CONFIG, UNSIGNED};
 pub use operations::{op_strategy, Op};
 use operations::{pick, wt_of};
 pub use setup::*;
@@ -84,12 +85,14 @@ impl Sim {
     /// Runs a command on a copy, as its honest sender, without checks.
     pub fn try_on_copy(&self, cmd: &Command) -> Result<Outcome, DomainError> {
         let mut c = self.coord.clone();
-        c.execute(&self.actor(cmd), cmd)
+        let ctx = self.actor(cmd);
+        c.execute(&ctx, &self.signed(&ctx, cmd.clone()))
     }
 
     fn quiet(&mut self, cmd: &Command) {
         let ctx = self.actor(cmd);
-        let _ = self.coord.execute(&ctx, cmd);
+        let cmd = self.signed(&ctx, cmd.clone());
+        let _ = self.coord.execute(&ctx, &cmd);
     }
 
     /// Registers the key of an account that is not in the default set.
@@ -114,8 +117,31 @@ impl Sim {
         self.exec_as(&ctx, cmd)
     }
 
+    /// JOB-R38: every lender of `attempt` accepts, loads and reports ready, each as itself, with
+    /// every property checked. Returns the first refusal, or the last outcome.
+    pub fn start_cluster(
+        &mut self,
+        job: JobId,
+        attempt: u32,
+        restored: PerType<u32>,
+    ) -> Result<Outcome, DomainError> {
+        let lenders = self
+            .coord
+            .job(job)?
+            .attempts
+            .get(&attempt)
+            .map(|a| a.lenders.clone())
+            .ok_or(DomainError::StaleAttempt)?;
+        let mut last = Outcome::AlreadyApplied;
+        for cmd in bring_up(job, attempt, &lenders, restored) {
+            last = self.exec(cmd)?;
+        }
+        Ok(last)
+    }
+
     /// Applies a command sent by `ctx` and checks every property, including TEST-P29.
     pub fn exec_as(&mut self, ctx: &AuthContext, cmd: Command) -> Result<Outcome, DomainError> {
+        let cmd = self.signed(ctx, cmd);
         let before = self.coord.clone();
         let res = self.coord.execute(ctx, &cmd);
         if let (

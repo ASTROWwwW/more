@@ -143,10 +143,54 @@ pub(crate) fn authorize(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> R 
         // would be refused some of them and leave them due.
         Reconcile => service(who, &[ServiceRole::Reconciler], "only the reconciler"),
         Place { .. } => service(who, &[ServiceRole::Scheduler], "only the scheduler places"),
-        Heartbeat { job: id, attempt }
+        // JOB-R38, JOB-R39: a lender speaks for its own lease only.
+        AcceptLease {
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
+        | LeaseLoaded {
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
         | AttemptReady {
-            job: id, attempt, ..
-        } => lender_of(who, job(id)?, *attempt),
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
+        | Heartbeat {
+            job: id,
+            attempt,
+            lender,
+        } => {
+            if account(who) != Some(*lender) {
+                return Err(deny("a lender speaks for its own lease only"));
+            }
+            lender_of(who, job(id)?, *attempt)
+        }
+        WitnessHeartbeat {
+            job: id,
+            attempt,
+            witness,
+        } => {
+            if account(who) != Some(*witness) {
+                return Err(deny("the witness renews its own lease only"));
+            }
+            witness_of(who, job(id)?, *attempt)
+        }
+        // The producer presents a receipt about its own output; the recipient's signature inside
+        // is checked by the transition and the ledger.
+        PresentReceipt { lender, .. } => {
+            if account(who) == Some(*lender) {
+                Ok(())
+            } else {
+                Err(deny("a producer presents its own receipts only"))
+            }
+        }
         PlacementFailed { job: id } => {
             if service(who, DRIVERS, "").is_ok() {
                 return Ok(());

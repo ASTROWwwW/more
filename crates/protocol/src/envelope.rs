@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::messages::Message;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
