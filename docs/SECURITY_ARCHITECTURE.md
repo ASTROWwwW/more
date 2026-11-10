@@ -231,10 +231,10 @@ The order follows what a compromise costs. Step 1 is built; the others are not.
 
 ### What step 1 is
 
-- **A process.** `more-ledgerd` owns the ledger's memory. It listens on a Unix socket of mode 0600 and marks itself not dumpable, so another process of the same user cannot open `/proc/PID/mem` or attach to it. It should still run under a user of its own: that is the boundary the operating system enforces best.
+- **A process, under a user of its own.** `more-ledgerd` owns the ledger's memory. It marks itself not dumpable, so another process of the same user cannot open `/proc/PID/mem` or attach to it. The boundary the operating system enforces best is a separate user, and the socket is made for that: see "Two users" below.
 - **Identities with keys.** A service identity used to be a value signed by the authority: in one process the type system kept it from being copied, between processes it would have been a bearer token. It is now a certificate over the service's own public key. Connecting takes a signature over nonces chosen by both sides, so a copied certificate, or a recorded handshake, opens nothing. The service checks the ledger the same way.
 - **No borrowed identity.** In one process the coordinator passed the treasury's, the clock's and the platform admin's credentials on to the ledger. Between processes it cannot: it does not hold their keys. Those services connect to the ledger themselves.
-- **One transaction per command.** The coordinator's all-or-nothing step was a copy of the whole state, ledger included. With the ledger elsewhere it is a transaction there, committed or rolled back with the coordinator's copy. Transactions nest (reconciliation applies its transitions one by one), are bounded, and die with their connection.
+- **One transaction per command.** The coordinator's all-or-nothing step was a copy of the whole state, ledger included. With the ledger elsewhere it is a transaction there, committed or rolled back with the coordinator's copy. Transactions nest (reconciliation applies its transitions one by one), are bounded, and die with their connection. Each has a name and a deadline that binds its owner; what became of it can be asked afterwards.
 - **The same ledger.** Three differential properties hold the split to that: TEST-P35 (hostile calls, in process and over the link), TEST-P36 (transactions against copy-and-restore), TEST-P37 (the whole simulation next to a coordinator behind the link). Each also runs against the real daemon.
 
 ### What a fully compromised orchestrator process can still do
@@ -248,7 +248,9 @@ It holds the orchestrator's key and the socket. Everything below is an operation
 | Refund a line instead of paying it, or void an output with no share left | Reserved items only; a paid item is final | A lender is not paid for that work; the credits go back to the borrower |
 | Contest a held reward | Only within 7 days of the payment and before release; funds go to the job's owner and pool | A lender loses a reward it had earned; nothing is created or kept by the attacker |
 | Revoke an attempt early | Once per attempt | A lender whose restoration was not yet corroborated is not paid for it |
-| Hold the Ledger with a transaction | 5 s, 4,096 operations, 4 levels; rolled back if its connection ends | Others wait at most that long |
+| Hold the Ledger with a transaction | 5 s from its first `Begin`, 4,096 operations, 4 levels; rolled back at the deadline whoever is asking, and if its connection ends | Others wait at most that long, each time. It can open the next one at once: a per-service share of the ledger's time is not built |
+| Open connections | 64 at once for everyone; an unauthenticated one is closed after 2 s | With its own key it can hold all 64: other services cannot connect until it lets go. A cap per service is not built |
+| Ask what became of any transaction | The last 1,024 outcomes | Nothing: names and outcomes of the orchestrator's own transactions |
 | Refuse to pay, release or settle | None on its side | Liveness: credits stay held; visible to the auditor |
 | Read its jobs' escrow, hold and line balances | Job accounts only | Nothing beyond what the orchestrator already knows |
 
@@ -256,10 +258,47 @@ It cannot issue credits, move the Ledger's clock, register a pool's admin or an 
 
 The contest and the refund are the two that hurt honest lenders, and the Ledger cannot tell them from honest ones today: neither carries a statement from the borrower. A contest signed by the borrower, checked by the Ledger, is the next rule to add.
 
+### Two users
+
+`more-ledgerd --allow-uid UID` lists the local users whose connections it accepts; the kernel says who is at the other end of each connection, and the peer cannot change that. `--socket-group GID` opens the socket file to one group (mode 0660) instead of its owner alone (0600). Nothing opens it to every local user.
+
+| | Ledger's user | Orchestrator's user | Any other user |
+| --- | --- | --- | --- |
+| Socket file | Owner | In its group | No access |
+| On the daemon's list | Only if listed | Listed | Not listed: closed before a byte is read, even if it got into the group, even with a valid credential, even root |
+| Ledger's key file (0600) | Reads | Cannot | Cannot |
+| Ledger's memory | Its own | Cannot (another user, and not dumpable) | Cannot |
+
+The test `r5_two_users_…` starts the daemon under one user, an orchestrator under a second and a bystander under a third, checks each cell of this table, and then runs the differential tests as the orchestrator's user. It needs root to change user, so it runs in its own CI job.
+
+In that test every service on the test's side runs under the orchestrator's user. A deployment gives each service its own user and lists them all; the list does not yet tie a user to a role, so a listed user holding another service's key could use it. The credential, not the user, still decides what a connection may do.
+
+The clients do not trust the socket's path: whatever answers there has to prove it is this deployment's ledger (LEDGER-022). A directory others can write to lets them replace the socket, which stops the service and nothing more.
+
+### When the link fails around a commit
+
+A commit that gets no answer may or may not have been applied. The coordinator cannot tell, so it does not guess.
+
+| What the coordinator sees | What it does |
+| --- | --- |
+| The ledger answers "done" | Keeps the command's state |
+| The ledger refuses, or ends the connection itself | Keeps nothing of the command; reports the error |
+| No answer to the commit | Stops. Every command is refused with `LEDGER_OUTCOME_UNKNOWN`. Keeps both states: the one it had, and the one that goes with the commit |
+| Then, asked on a new connection: committed | Takes the state that goes with the commit, goes on |
+| … rolled back | Keeps the state it had, goes on. The sender may send the command again; it runs under a new name |
+| … still open | Stays stopped. The ledger's deadline rolls the transaction back within 5 s |
+| … unknown to the ledger | Stays stopped. More than 1,024 transactions went by, or something is wrong: a person compares the two sides |
+| The ledger at the other end has another incarnation | Stops for good with `LEDGER_STATE_LOST`: that ledger restarted and is empty |
+
+The coordinator never sends a command again by itself. The connection on which an answer was lost is dropped, so a late answer is never read as the answer to something else.
+
+**Recovery by hand, while nothing is persisted.** A coordinator stopped on `LEDGER_STATE_LOST`, or on an outcome the ledger forgot, is not restarted against that ledger: both are started again from nothing. There is no tool that rebuilds one side from the other, because neither side keeps anything on disk.
+
 ### What step 1 is not
 
-- **Persistence.** The daemon keeps everything in memory. A restart loses the ledger. The journal on disk, and job records rebuilt from it or stored with it, come before any deployment.
+- **A ledger for real credits.** The daemon says so on standard error at every start.
+- **Persistence.** The daemon keeps everything in memory. When it stops, the journal, the balances, the held payments, the signed terms, leases and receipts on record, the registered account keys, the revocations it was told of and the outcomes of transactions are lost. The coordinator notices by the incarnation number and stops; the other services do not check it yet. The coordinator's state is in memory too: one that restarts has lost its jobs while the ledger still holds their escrow. The journal on disk, and both sides rebuilt from it, come before any deployment; the transaction names, the outcome log and the incarnation number are there for that.
+- **Atomic commitment across both processes.** What holds: a command is never applied twice, never applied in part at the ledger, and the coordinator never continues on a guess. What does not: if the coordinator's process dies while a commit is in doubt, the state that went with it is gone, and the ledger may hold a commit no coordinator knows of. Closing that takes persistence on both sides.
 - **A network service.** The link has no encryption and no per-message authentication. It relies on the socket being local. Remote peers need a secure channel underneath (mutual TLS, or QUIC with the same certificates).
-- **Exactly-once commits.** If the answer to a `Commit` is lost, the coordinator does not know whether it was applied. It keeps nothing and stops; an operator reconciles it from the ledger. Transaction ids that make a commit repeatable are not built.
 - **Efficient transactions.** `Begin` copies the ledger's state. Fine for a model; a real store uses a write-ahead log.
 - **A second boundary.** The identity authority, the protocol edge and the registry are still in the coordinator's process.

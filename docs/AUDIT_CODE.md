@@ -374,3 +374,34 @@ Two of the remaining operations hurt honest lenders and cannot be told from hone
 - The hostile generator of TEST-P30 moved to a shared test module so that the link tests and the daemon tests replay the same calls. Its code is unchanged.
 - No test was removed.
 
+## Process separation, review of step 1
+
+Review of `isolation/ledger-process` at `4e13c58`, five points: unknown outcomes, timeouts, Unix users, durability, validation. Durability stays out of scope by decision and is documented as such; the rest is fixed below.
+
+### Findings
+
+| Id | Finding | Status |
+| --- | --- | --- |
+| R5-01 | When the answer to a `Commit` was lost, the coordinator kept nothing and had no way to learn whether the ledger had applied it. The documentation said "all or nothing in both processes" without that reserve | **Fixed**: transactions have names, the ledger records their outcome and answers `TxStatus` at any time; the coordinator stops, asks and acts on the answer, and never resends (LEDGER-025). The documentation no longer claims atomic commitment across both processes |
+| R5-02 | A transaction's deadline was checked only when another connection needed the ledger. Its owner was exempt, and an idle transaction with nobody else around stayed open for ever | **Fixed**: the deadline is checked on every request, the owner's included, and by the daemon's timer (LEDGER-023) |
+| R5-03 | Found while fixing R5-02: after a transaction had been rolled back because another connection needed the ledger, its owner did not know. Its next operations were applied one by one outside any transaction, and its `Commit` was then refused: a command applied in part, the very thing the transaction was there to prevent | **Fixed**: the owner's next request is refused with `TransactionExpired`, whatever it is (`r5_a_deadline_binds_the_owner_of_a_transaction_too`, mutants M168, M178) |
+| R5-04 | The socket was 0600 and nothing else: the orchestrator had to run as the ledger's user, so "run it under a user of its own" could not be followed | **Fixed**: one group on the file, a list of admitted users checked with `SO_PEERCRED`, never all users (LEDGER-027). Tested with three system users |
+| R5-05 | A connection that never authenticated was kept for as long as it liked; 64 of them left no room for a real service | **Fixed**: 2 s to authenticate, for the whole handshake |
+| R5-06 | A ledger that restarted came back empty, and a coordinator that reconnected would have gone on against it | **Fixed**: incarnation number, `LEDGER_STATE_LOST` (LEDGER-026) |
+| R5-07 | After an answer that did not come, a client could go on using the connection: the late answer would have been read as the answer to the next request | **Fixed**: such a connection is dead; a client waits 30 s for an answer by default |
+| R5-08 | Persistence | **Out of scope**, by decision. What a restart loses is listed in `SECURITY_ARCHITECTURE.md`, section 11, and in LEDGER-026. The daemon says at every start that it is not for real credits |
+
+### Defects found while fixing them
+
+- **Reconnecting needed an answer the ledger would not give.** The first version of the reconnection asked the ledger for `Info`. While the transaction in doubt was still open, the ledger answered "busy" to everything but `TxStatus`, so the coordinator could not reconnect until the deadline. Found by the first test of a commit lost on the way. The reconnection now asks with `TxStatus`, which carries the incarnation.
+- **A copy of the coordinator kept the failed connection open.** The state kept aside for an unknown commit held the old connection, so the ledger did not see it close and reported the transaction open until its deadline. The reconnection now replaces it there too (mutant M192).
+- **A test that could hang for ever.** `the_socket_and_the_key_file_are_private` waited without limit for a daemon that should refuse to start. Under a mutant that made it start, the test never ended and the pre-check of mutants had to be killed. Commands that must end by themselves now have ten seconds; the mutation runner stops a suite that hangs, with the daemons it started, and counts it as a detection.
+- **A timer nobody could see.** Any request makes the ledger look at its transactions, so a test that polled the daemon could not tell its timer from its own polling: removing the timer changed nothing observable. The timer now says on standard error when it ends a transaction, and the test stays silent for the whole delay (mutant M201).
+
+### Test changes that need a justification (review of step 1)
+
+- `a_transaction_is_all_or_nothing_and_bounded` was rewritten for named transactions and savepoints. Every assertion it made is still made. The part about a transaction "older than its limit rolled back when someone else asks" moved to `r5_a_deadline_binds_the_owner_of_a_transaction_too`, which also covers the owner, the idle case and nesting.
+- `p35_the_daemon_is_the_same_ledger` and `p37_a_coordinator_drives_a_ledger_in_another_process` use an explicit proptest runner instead of the `proptest!` macro, with the same strategies and the same number of cases, so that they can print how many calls and commands they compared.
+- `the_socket_and_the_key_file_are_private` runs its refused starts with a deadline. `a_killed_orchestrator_leaves_nothing_half_done` also asks for the outcome of the dead transaction.
+- `RemoteRig::follow` is split into its sending and checking halves so that a test can send a command to one side only. `follow` itself does what it did.
+- No test was removed.

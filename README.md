@@ -14,7 +14,7 @@ The tests generate random command sequences: nodes going down, duplicated messag
 | --- | --- |
 | `crates/identity` | Signatures, one key and certificate per service, authenticated caller context, signed statements |
 | `crates/ledger` | Append-only double-entry ledger behind a typed, authenticated API; keeps the signed terms, leases and receipts it pays on. Its `link` module is the protocol other processes use to reach it |
-| `crates/ledgerd` | `more-ledgerd`: the ledger as a process of its own, behind a local socket. State in memory only for now |
+| `crates/ledgerd` | `more-ledgerd`: the ledger as a process of its own, under its own user, behind a local socket. Experimental: its state is in memory only and a restart loses it, so it is not for real credits. `more-ledger-ping` checks that a service reaches it |
 | `crates/domain` | Coordinator: authorization, jobs, attempts and per-node leases, pools and catalog, output delivery, settlement |
 | `crates/protocol` | Signed messages, size checks, error codes, replay protection |
 | `crates/simulation` | Invariant checker and random scenario generators |
