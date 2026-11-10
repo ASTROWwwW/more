@@ -335,6 +335,9 @@ pub enum LedgerApiError {
     LimitExceeded(&'static str),
     Invalid(&'static str),
     Ledger(LedgerError),
+    /// The ledger runs in another process and could not be reached, or the link to it failed.
+    /// Nothing is known about the operation: it may or may not have been applied.
+    Unavailable(&'static str),
 }
 
 impl LedgerApiError {
@@ -345,6 +348,7 @@ impl LedgerApiError {
             LedgerApiError::LimitExceeded(_) => "LIMIT_EXCEEDED",
             LedgerApiError::BadProof(_) => "BAD_PROOF",
             LedgerApiError::OutOfWindow(_) => "OUT_OF_WINDOW",
+            LedgerApiError::Unavailable(_) => "LEDGER_UNAVAILABLE",
             _ => "LEDGER_REJECTED",
         }
     }

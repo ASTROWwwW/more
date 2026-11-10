@@ -14,6 +14,7 @@
 mod accounts;
 mod hashing;
 mod journal;
+pub mod link;
 mod service;
 
 pub use accounts::Account;
