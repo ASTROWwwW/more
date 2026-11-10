@@ -78,7 +78,13 @@ impl Stats {
                     ..
                 } => self.bump("contributions voided with their output"),
                 AuditEvent::ItemRefunded { .. } => self.bump("items refunded for missing proof"),
-                AuditEvent::ItemDisputed { .. } => self.bump("items disputed"),
+                AuditEvent::ItemDisputed { kind, .. } => {
+                    self.bump("items disputed");
+                    if matches!(kind, ItemKind::Recovery(_)) {
+                        self.bump("recovery held (cap or no corroboration)");
+                    }
+                }
+                AuditEvent::RestoreCorroborated { .. } => self.bump("restorations corroborated"),
                 AuditEvent::ItemAwaitingDelivery { .. } => {
                     self.bump("contributions awaiting delivery")
                 }
@@ -88,6 +94,12 @@ impl Stats {
                 AuditEvent::LateDelivery { .. } => self.bump("late attestations admitted"),
                 AuditEvent::BufferPurged { .. } => self.bump("buffers purged after retention"),
                 AuditEvent::EvidenceSupplemented { .. } => self.bump("supplementary proofs"),
+                AuditEvent::LeasesExpired { nodes, .. } => {
+                    self.bump("attempts revoked with an expired lease");
+                    if nodes.len() == 1 {
+                        self.bump("attempts revoked for one silent node");
+                    }
+                }
                 _ => {}
             }
         }

@@ -97,14 +97,14 @@ impl Sim {
             };
             // One receipt before midnight, two after, so outputs remain to claim.
             items.truncate(if round == 0 { 1 } else { 2 });
-            step(
-                &mut tmp,
-                Command::Claim {
-                    slice,
-                    lender,
-                    items,
-                },
-            );
+            let claim = Command::Claim {
+                slice,
+                lender,
+                items,
+            };
+            for cmd in tmp.presenting(claim) {
+                step(&mut tmp, cmd);
+            }
             step(&mut tmp, Command::CloseSlice { slice });
             step(&mut tmp, Command::Evaluate { slice });
             if round == 0 {
@@ -136,20 +136,15 @@ impl Sim {
         else {
             return vec![];
         };
-        let mut v = vec![
-            Command::Heartbeat {
-                job: id,
-                attempt: j.attempt,
-            },
-            Command::Deliver {
-                job: id,
-                attempt: j.attempt,
-                witness: a.witness,
-                wt,
-                upto: a.produced[t],
-                digest: c.frame_digest(id, wt, a.produced[t]),
-            },
-        ];
+        let mut v = self.renew_all(id);
+        v.extend([Command::Deliver {
+            job: id,
+            attempt: j.attempt,
+            witness: a.witness,
+            wt,
+            upto: a.produced[t],
+            digest: c.frame_digest(id, wt, a.produced[t]),
+        }]);
         for l in &a.lenders {
             v.push(Command::CommitReceipts {
                 job: id,
@@ -158,6 +153,7 @@ impl Sim {
                 wt,
                 upto: a.produced[t],
                 digest: c.receipt_digest(id, j.attempt, *l, wt, a.produced[t]),
+                signature: UNSIGNED,
             });
         }
         // Claims are computed on the current state, so target every bound output ahead of
@@ -196,8 +192,8 @@ impl Sim {
         let st = c.slices()[&sid].status;
         let mut v: Vec<Command> = self
             .honest_claim_with(sid, sel, Evidence::Uncommitted)
-            .into_iter()
-            .collect();
+            .map(|cl| self.presenting(cl))
+            .unwrap_or_default();
         if st == SliceStatus::Open {
             v.push(Command::CloseSlice { slice: sid });
             v.push(Command::Evaluate { slice: sid });
@@ -223,7 +219,8 @@ impl Sim {
         let mut delivered = j.delivered;
         delivered[t] = a.produced[t];
         let lenders: Vec<AccountId> = a.lenders.iter().rev().copied().collect();
-        vec![
+        let start = bring_up(id, j.attempt + 1, &lenders, delivered);
+        let mut v = vec![
             Command::Deliver {
                 job: id,
                 attempt: j.attempt,
@@ -248,18 +245,16 @@ impl Sim {
                 witness: WITNESS,
                 expected_version: None,
             },
-            Command::AttemptReady {
-                job: id,
-                attempt: j.attempt + 1,
-                restored: delivered,
-            },
-            Command::ConfirmDelivery {
-                job: id,
-                wt,
-                confirmed: j.validated[t],
-                digest: c.frame_digest(id, wt, j.validated[t]),
-            },
-        ]
+        ];
+        v.extend(start);
+        v.extend(corroborate(id, j.attempt + 1, &a.lenders));
+        v.push(Command::ConfirmDelivery {
+            job: id,
+            wt,
+            confirmed: j.validated[t],
+            digest: c.frame_digest(id, wt, j.validated[t]),
+        });
+        v
     }
 
     pub(super) fn late_deliver(&self, job: u8, commit_first: bool) -> Vec<Command> {
@@ -301,10 +296,7 @@ impl Sim {
             return vec![];
         }
         // Commitment (or not) before the fault, full attestation while draining.
-        let mut v = vec![Command::Heartbeat {
-            job: id,
-            attempt: j.attempt,
-        }];
+        let mut v = self.renew_all(id);
         if commit_first {
             v.push(Command::WitnessCommit {
                 job: id,
@@ -523,5 +515,98 @@ impl Sim {
                 evidence: Evidence::Committed,
             }],
         }]
+    }
+
+    /// One lease step of one lender (JOB-R38). Steps 2, 4 and 5 are dishonest: a configuration
+    /// that does not match the stage, a lease accepted or a state reported under another
+    /// account's signature. The ledger or the coordinator must refuse them.
+    pub(super) fn lease_step(&self, id: JobId, stage: u8, step: u8) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        let Some(a) = j.current() else { return vec![] };
+        let k = usize::from(stage) % a.lenders.len();
+        let lender = a.lenders[k];
+        let other = a.lenders[(k + 1) % a.lenders.len()];
+        let attempt = j.attempt;
+        let forged = |m: Vec<u8>| user_key(if other == lender { WITNESS } else { other }).sign(&m);
+        vec![match step % 6 {
+            0 => Command::AcceptLease {
+                job: id,
+                attempt,
+                lender,
+                signature: UNSIGNED,
+            },
+            1 | 2 => Command::LeaseLoaded {
+                job: id,
+                attempt,
+                lender,
+                config: if step % 6 == 1 { UNSET_CONFIG } else { 1 },
+            },
+            3 => Command::AttemptReady {
+                job: id,
+                attempt,
+                lender,
+                restored: j.delivered,
+                state: UNSET_STATE,
+                segments: Vec::new(),
+                signature: UNSIGNED,
+            },
+            4 => Command::AcceptLease {
+                job: id,
+                attempt,
+                lender,
+                signature: forged(lease_message(&sim_domain(), &assignment_of(id, a))),
+            },
+            _ => Command::AttemptReady {
+                job: id,
+                attempt,
+                lender,
+                restored: j.delivered,
+                state: 7,
+                segments: Vec::new(),
+                signature: forged(ready_message(
+                    &sim_domain(),
+                    &Readiness {
+                        job: id.0,
+                        attempt,
+                        lender: lender.0,
+                        restored: j.delivered,
+                        state: 7,
+                        segments: Vec::new(),
+                    },
+                )),
+            },
+        }]
+    }
+
+    /// One node goes silent while the rest of the cluster keeps renewing: its lease alone runs
+    /// out, and reconciliation must revoke the attempt for it (JOB-R39).
+    pub(super) fn silent_node(&self, id: JobId, node: u8) -> Vec<Command> {
+        let c = &self.coord;
+        let Ok(j) = c.job(id) else { return vec![] };
+        let Some(a) = j.current().filter(|a| a.revoked_at.is_none()) else {
+            return vec![];
+        };
+        if !matches!(j.exec, ExecStatus::Running | ExecStatus::Placing) {
+            return vec![];
+        }
+        let silent = match a.lenders.get(usize::from(node) % (a.lenders.len() + 1)) {
+            Some(l) => *l,
+            None => a.witness,
+        };
+        let others: Vec<Command> = self
+            .renew_all(id)
+            .into_iter()
+            .filter(|cmd| {
+                !matches!(cmd, Command::Heartbeat { lender, .. } | Command::WitnessHeartbeat { witness: lender, .. } if *lender == silent)
+            })
+            .collect();
+        let half = c.config().lease_ttl / 2 + 1;
+        let mut v = others.clone();
+        v.push(Command::Tick { dt: half });
+        v.extend(others);
+        v.push(Command::Tick { dt: half });
+        v.push(Command::Reconcile);
+        v
     }
 }

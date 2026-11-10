@@ -258,6 +258,7 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
         stage: 2,
         evidence: Evidence::Uncommitted,
     };
+    t.present(J1, 1, L[2], 3);
     // Two uncommitted receipts of 2 credits before midnight: 4 = cap.
     let mut slices = Vec::new();
     for p in 0..2 {
@@ -306,13 +307,10 @@ fn f40_sliding_cap_holds_across_midnight_and_after_refunds() {
         witness: WITNESS,
         expected_version: None,
     });
-    t.ok(Command::AttemptReady {
-        job: j2,
-        attempt: 1,
-        restored: [0; 3],
-    });
+    t.ready(j2, 1, [0; 3]);
     t.gen(j2, 1);
     let s2 = t.open_slice(j2);
+    t.present(j2, 1, L[2], 1);
     t.ok(Command::Claim {
         slice: s2,
         lender: L[2],

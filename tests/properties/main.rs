@@ -119,8 +119,12 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
         2 => b().prop_map(Op::Reserve),
         3 => (b(), b(), b()).prop_map(|(job, rot, est)| Op::Place { job, rot, est }),
         3 => b().prop_map(|job| Op::Ready { job, correct: true }),
+        2 => (b(), b(), b()).prop_map(|(job, stage, step)| Op::LeaseStep { job, stage, step }),
+        2 => (b(), b()).prop_map(|(job, node)| Op::NodeHeartbeat { job, node }),
+        1 => (b(), b()).prop_map(|(job, node)| Op::SilentNode { job, node }),
+        2 => (b(), b(), prop::bool::weighted(0.2)).prop_map(|(job, stage, forged)| Op::Corroborate { job, stage, forged }),
         6 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Produce { job, wt, n }),
-        6 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Ack { job, wt, n }),
+        12 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Ack { job, wt, n }),
         3 => (b(), b(), b()).prop_map(|(job, stage, wt)| Op::Commit { job, stage, wt, partial: false }),
         6 => (b(), b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, wt, pos, ev)| Op::Claim { job, slice, stage, wt, pos, ev, honest: true }),
         2 => (b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, amount, ev)| Op::ClaimRecovery { job, slice, stage, amount, ev }),
@@ -142,8 +146,8 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
         1 => (b(), b(), b()).prop_map(|(job, wt, sel)| Op::Confirm { job, wt, sel }),
         1 => (b(), b(), b(), b()).prop_map(|(job, slice, lender, pay)| Op::Arbitrate { job, slice, lender, pay: pay % 2 == 0 }),
         2 => (b(), b()).prop_map(|(job, sel)| Op::DeliverAndSettle { job, sel }),
-        4 => (b(), b()).prop_map(|(job, sel)| Op::UncommittedBurst { job, sel }),
-        6 => (b(), b()).prop_map(|(job, sel)| Op::ArbitrateDisputed { job, sel }),
+        9 => (b(), b()).prop_map(|(job, sel)| Op::UncommittedBurst { job, sel }),
+        10 => (b(), b()).prop_map(|(job, sel)| Op::ArbitrateDisputed { job, sel }),
         2 => (b(), any::<bool>()).prop_map(|(job, commit_first)| Op::LateDeliver { job, commit_first }),
         3 => (b(), b(), any::<bool>()).prop_map(|(job, sel, honest)| Op::Supplement { job, sel, honest }),
         2 => (b(), b()).prop_map(|(job, sel)| Op::ContestReplay { job, sel }),
@@ -169,6 +173,9 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
         2 => b().prop_map(Op::Pause),
         2 => b().prop_map(Op::Finish),
         3 => b().prop_map(Op::Heartbeat),
+        2 => (b(), b()).prop_map(|(job, node)| Op::NodeHeartbeat { job, node }),
+        1 => (b(), b()).prop_map(|(job, node)| Op::SilentNode { job, node }),
+        2 => (b(), b(), b()).prop_map(|(job, stage, step)| Op::LeaseStep { job, stage, step }),
         3 => (b(), b(), b()).prop_map(|(job, stage, wt)| Op::Commit { job, stage, wt, partial: false }),
         4 => (b(), b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, wt, pos, ev)| Op::Claim { job, slice, stage, wt, pos, ev, honest: true }),
         2 => b().prop_map(Op::Tick),
@@ -192,22 +199,95 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
 
 /// Coverage check: without it, properties could pass only because interesting paths are never
 /// reached. Each path must be hit a minimum number of times.
+/// Where the time of a checked command goes. Not a correctness test: run it by name to get
+/// the figures of `docs/VALIDATION.md` (`cargo test --release --test properties cost -- --ignored
+/// --nocapture`).
+#[test]
+#[ignore = "measurement, prints figures"]
+fn cost_breakdown() {
+    use proptest::strategy::ValueTree;
+    use std::time::{Duration, Instant};
+
+    let mut runner = TestRunner::deterministic();
+    let (mut time, mut commands, mut checks) = ([Duration::ZERO; 3], 0u64, 0u64);
+    let mut clone_cost = Duration::ZERO;
+    let traces = 400;
+    let start = Instant::now();
+    for _ in 0..traces {
+        let ops = prop::collection::vec(fault_heavy_op(), 220)
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
+        let mut sim = Sim::default();
+        for op in &ops {
+            sim.run_op(op);
+        }
+        sim.drain();
+        assert!(sim.violations.is_empty());
+        for (t, d) in time.iter_mut().zip(sim.time) {
+            *t += d;
+        }
+        commands += (sim.applied + sim.refused) as u64;
+        checks += sim.ids.keys.signature_checks();
+        // The coordinator copies its state once per command (its all-or-nothing step).
+        let t = Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(sim.coord.clone());
+        }
+        clone_cost += t.elapsed() / 20;
+    }
+    let total = start.elapsed();
+    // One Ed25519 check, measured here.
+    let key = user_key(BORROWERS[0]);
+    let dir = more_identity::KeyDirectory::new();
+    dir.register(1, key.public()).unwrap();
+    let sig = key.sign(b"cost");
+    let t = Instant::now();
+    for _ in 0..2_000 {
+        dir.verify(1, b"cost", &sig).unwrap();
+    }
+    let per_check = t.elapsed() / 2_000;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let per_cmd = |d: Duration| d.as_secs_f64() * 1e6 / commands as f64;
+    println!(
+        "traces {traces}, commands {commands}, total {:.0} ms",
+        ms(total)
+    );
+    println!("per command, in microseconds:");
+    println!("  checker's copy of the state      {:.2}", per_cmd(time[0]));
+    println!("  coordinator (command itself)     {:.2}", per_cmd(time[1]));
+    println!("  invariant checker                {:.2}", per_cmd(time[2]));
+    let sig_time = per_check * u32::try_from(checks).unwrap_or(u32::MAX);
+    println!(
+        "inside the coordinator: {checks} signature checks at {:.1} us = {:.2} us per command",
+        per_check.as_secs_f64() * 1e6,
+        per_cmd(sig_time)
+    );
+    println!(
+        "inside the coordinator: one copy of the final state costs {:.2} us on average",
+        clone_cost.as_secs_f64() * 1e6 / f64::from(traces)
+    );
+}
+
 #[test]
 fn generator_reaches_interesting_paths() {
     use proptest::strategy::ValueTree;
 
+    // 180 operations per trace (150 before per-node leases): starting a cluster now takes three
+    // steps per lender and a corroboration per stage. The thresholds below did not move.
+    const TRACE: usize = 180;
     let mut total = Stats::default();
     for (gen_name, n) in [("faults", 300usize), ("delivery", 300)] {
         let mut runner = TestRunner::deterministic();
         let mut st = Stats::default();
         for _ in 0..n {
             let ops = if gen_name == "faults" {
-                prop::collection::vec(fault_heavy_op(), 150)
+                prop::collection::vec(fault_heavy_op(), TRACE)
                     .new_tree(&mut runner)
                     .unwrap()
                     .current()
             } else {
-                prop::collection::vec(delivery_adversary_op(), 150)
+                prop::collection::vec(delivery_adversary_op(), TRACE)
                     .new_tree(&mut runner)
                     .unwrap()
                     .current()
@@ -245,6 +325,10 @@ fn generator_reaches_interesting_paths() {
         ("refunds by arbitration", 10),
         ("reward contests", 10),
         ("rewards released", 100),
+        ("attempts revoked with an expired lease", 50),
+        ("attempts revoked for one silent node", 10),
+        ("restorations corroborated", 500),
+        ("recovery held (cap or no corroboration)", 5),
     ];
     let missing: Vec<String> = minimum
         .iter()

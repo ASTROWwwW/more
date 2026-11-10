@@ -128,18 +128,10 @@ fn f26_lost_ack_then_resume_replays_without_double_billing() {
     });
     // The resume starts from delivered positions, not validated ones.
     assert!(matches!(
-        t.err(Command::AttemptReady {
-            job: J1,
-            attempt: 2,
-            restored: [0, 4, 0],
-        }),
+        t.ready_err(J1, 2, [0, 4, 0]),
         DomainError::Precondition(_)
     ));
-    t.ok(Command::AttemptReady {
-        job: J1,
-        attempt: 2,
-        restored: [0, 6, 0],
-    });
+    t.ready(J1, 2, [0, 6, 0]);
     t.gen(J1, 1); // cumulative ack up to 7, also covers the replay of 4 and 5
     assert_eq!(t.charge(J1, 5).unwrap().basis, ChargeBasis::ClientSigned);
     assert!(t.charge(J1, 5).unwrap().contest.is_none());
@@ -231,11 +223,7 @@ fn f27_lost_replay_buffer_contest_refunds_and_rewinds() {
         witness: WITNESS,
         expected_version: None,
     });
-    t.ok(Command::AttemptReady {
-        job: J1,
-        attempt: 2,
-        restored: [0, 3, 0],
-    });
+    t.ready(J1, 2, [0, 3, 0]);
     t.gen(J1, 2); // positions 3 and 4 produced again and charged again
     assert_eq!(t.net_charges(J1, 3), 1);
     assert_eq!(t.charge(J1, 3).unwrap().gen, 1);
@@ -316,7 +304,8 @@ fn f29_expired_lease_rejects_work_until_reconciliation_revokes() {
     assert_eq!(
         t.err(Command::Heartbeat {
             job: J1,
-            attempt: a
+            attempt: a,
+            lender: L[0],
         }),
         DomainError::LeaseExpired,
         "an expired lease is never renewed"

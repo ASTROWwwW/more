@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use gpu_ledger::{
-    Account, Amount, EscrowBucket, IssueTo, Ledger, LedgerApiError, LedgerError, LedgerOp,
-    LedgerOutcome, LedgerService, LineRef, LineSource,
+    Account, Amount, Assignment, EscrowBucket, IssueTo, ItemId, JobTerms, Ledger, LedgerApiError,
+    LedgerError, LedgerOp, LedgerOutcome, LedgerService, LineRef, OutputRef,
 };
 use more_identity::{AuthContext, CredentialVerifier, ServiceCredential, ServiceRole};
 
@@ -29,6 +29,7 @@ mod contests;
 mod delivery;
 mod dispatch;
 mod evaluation;
+mod leases;
 mod lifecycle;
 mod placement;
 mod receipts;
@@ -63,6 +64,9 @@ pub struct Coordinator {
     uncommitted_paid: BTreeMap<AccountId, Vec<(Time, Amount)>>,
     /// Receipt commitment history: (covered up to, time, seq) (JOB-R15).
     commit_log: CommitLog,
+    /// Receipts co-signed by the recipient and presented by the producer: highest position
+    /// covered, per (job, attempt, producer, type) (JOB-R12, LEDGER-016).
+    presented: BTreeMap<(JobId, u32, AccountId, WorkType), u32>,
     /// Logical sequence number: total order of applied commands (CE-03).
     seq: u64,
     audit: Vec<AuditEvent>,
@@ -83,6 +87,13 @@ fn line_ref(s: SliceId, lender: AccountId) -> LineRef {
         attempt: s.attempt,
         slice: s.slice,
         lender: lender.0,
+    }
+}
+
+fn output_ref(o: OutputId) -> OutputRef {
+    OutputRef {
+        wt: o.wt.idx() as u8,
+        pos: o.pos,
     }
 }
 
@@ -115,6 +126,22 @@ impl Coordinator {
                 "orchestrator credential expected",
             ));
         }
+        // JOB-R22: the coordinator never releases a reward before the ledger would let it.
+        if cfg.reward_window < ledger.limits().reward_hold {
+            return Err(DomainError::InvalidInput(
+                "reward window shorter than the ledger's hold",
+            ));
+        }
+        // LEDGER-018: with a contest limit below the hold, a payment could be stuck.
+        ledger
+            .limits()
+            .validate()
+            .map_err(DomainError::InvalidInput)?;
+        if verifier.domain() != ledger.domain() {
+            return Err(DomainError::InvalidInput(
+                "ledger and coordinator of different deployments",
+            ));
+        }
         Ok(Coordinator {
             cfg,
             now: 0,
@@ -129,6 +156,7 @@ impl Coordinator {
             recovery_items: BTreeMap::new(),
             uncommitted_paid: BTreeMap::new(),
             commit_log: BTreeMap::new(),
+            presented: BTreeMap::new(),
             seq: 0,
             audit: Vec::new(),
         })
@@ -161,6 +189,11 @@ impl Coordinator {
     /// Coordinator clock (JOB-R09).
     pub fn now(&self) -> Time {
         self.now
+    }
+
+    /// The deployment this coordinator serves: the one its credential verifier belongs to.
+    pub fn domain(&self) -> more_identity::Domain {
+        self.verifier.domain()
     }
 
     /// Position of the last applied command in the log (CE-03).
@@ -204,6 +237,10 @@ impl Coordinator {
         &self.commit_log
     }
 
+    pub fn presented_receipts(&self) -> &BTreeMap<(JobId, u32, AccountId, WorkType), u32> {
+        &self.presented
+    }
+
     /// Full read access to the ledger, for the Auditor role only.
     pub fn audit_ledger(&self, auditor: &ServiceCredential) -> R<&Ledger> {
         Ok(self.ledger.audit_view(auditor)?)
@@ -214,8 +251,39 @@ impl Coordinator {
         &self.ledger
     }
 
+    /// Test only: the ledger's journal fails after `after` more entries (`None` clears it).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_ledger_fault(&mut self, after: Option<u64>) {
+        self.ledger.inject_fault(after);
+    }
+
     fn ledger_op(&mut self, op: LedgerOp) -> R<LedgerOutcome> {
         Ok(self.ledger.execute(&self.cred, op)?)
+    }
+
+    /// The ledger's name for a line item.
+    fn item_id(&self, slice: SliceId, kind: ItemKind) -> R<ItemId> {
+        Ok(match kind {
+            ItemKind::Contribution(cid) => {
+                let a = self
+                    .job(slice.job)?
+                    .attempts
+                    .get(&slice.attempt)
+                    .ok_or_else(|| DomainError::Internal("attempt".into()))?;
+                let stage = (0..a.layout.len())
+                    .find(|s| a.layer_range(*s) == Some((cid.layer_start, cid.layer_end)))
+                    .ok_or_else(|| DomainError::Internal("contribution stage".into()))?;
+                ItemId::Contribution {
+                    output: output_ref(cid.output),
+                    gen: cid.charge,
+                    stage: stage as u32,
+                }
+            }
+            ItemKind::Recovery(rid) => ItemId::Recovery {
+                attempt: rid.attempt,
+                segment: rid.segment,
+            },
+        })
     }
 
     fn escrow_work(&self, job: JobId) -> R<Amount> {
@@ -390,16 +458,30 @@ impl Coordinator {
         let now = self.now;
         let seq = self.seq;
         let drain = self.cfg.drain_window;
-        let j = self.job_mut(job)?;
+        let j = self.job(job)?;
         let attempt = j.attempt;
-        let Some(a) = j.attempts.get_mut(&attempt) else {
-            return Ok(());
-        };
-        if a.revoked_at.is_some() {
+        if j.attempts
+            .get(&attempt)
+            .is_none_or(|a| a.revoked_at.is_some())
+        {
             return Ok(());
         }
+        // CE-03: the ledger closes the attempt's set of proofs at the same point of the log.
+        self.ledger_op(LedgerOp::RevokeAttempt {
+            job: job_acct(job),
+            attempt,
+        })?;
+        let a = self.attempt_mut(job, attempt)?;
         a.revoked_at = Some(now);
         a.revoked_seq = Some(seq);
+        let nodes = a.expired_nodes(now);
+        if !nodes.is_empty() {
+            self.audit.push(AuditEvent::LeasesExpired {
+                job,
+                attempt,
+                nodes,
+            });
+        }
         for id in self.slices_of(job, Some(attempt)) {
             if self.slices[&id].status == SliceStatus::Open {
                 self.set_slice(id, SliceStatus::Draining, "JOB-S02")?;
@@ -429,6 +511,19 @@ impl Coordinator {
             .ok_or_else(|| DomainError::Internal("recovery reserved > earmark".into()))?;
         a.earmark_returned = true;
         j.recovery_unearmarked = add(j.recovery_unearmarked, unused, "recovery budget")?;
+        // The ledger computes the same amount from its own records; a difference is a bug.
+        let LedgerOutcome::Moved(back) = self.ledger_op(LedgerOp::ReturnEarmark {
+            job: job_acct(job),
+            attempt,
+        })?
+        else {
+            return Err(DomainError::Internal("earmark outcome".into()));
+        };
+        if back != unused {
+            return Err(DomainError::Internal(format!(
+                "earmark returned: ledger {back}, coordinator {unused}"
+            )));
+        }
         Ok(())
     }
 

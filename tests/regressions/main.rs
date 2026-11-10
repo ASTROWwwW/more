@@ -14,6 +14,35 @@ fn run(ops: &[Op]) -> Sim {
     sim
 }
 
+/// Stands for "every lender of the job's first attempt accepts, loads and reports ready"
+/// (JOB-R38) in the command lists below, which predate per-node leases.
+fn ready(job: JobId) -> Command {
+    Command::AttemptReady {
+        job,
+        attempt: 1,
+        lender: AccountId(0),
+        restored: [0; 3],
+        state: UNSET_STATE,
+        segments: Vec::new(),
+        signature: UNSIGNED,
+    }
+}
+
+#[track_caller]
+fn step(sim: &mut Sim, cmd: &Command) {
+    let r = match cmd {
+        Command::AttemptReady {
+            job,
+            attempt,
+            lender: AccountId(0),
+            restored,
+            ..
+        } => sim.start_cluster(*job, *attempt, *restored),
+        _ => sim.exec(cmd.clone()),
+    };
+    r.unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+}
+
 #[track_caller]
 fn assert_clean(sim: &Sim) {
     assert!(sim.violations.is_empty(), "{:#?}", sim.violations);
@@ -34,6 +63,7 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     let r = sim.exec(Command::FundRecovery {
         job: JobId(1),
         amount: 1,
+        signature: UNSIGNED,
     });
     assert_eq!(
         r,
@@ -43,6 +73,7 @@ fn ce01_pool_cannot_fund_a_job_without_active_escrow() {
     sim.exec(Command::FundRecovery {
         job: JobId(1),
         amount: 1,
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Cancel {
@@ -74,12 +105,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
             sim.coord.jobs()[&j1].attempt,
             sim.coord.jobs()[&j1].validated,
         );
-        sim.exec(Command::AttemptReady {
-            job: j1,
-            attempt: a,
-            restored: v,
-        })
-        .unwrap();
+        sim.start_cluster(j1, a, v).unwrap();
     };
     sim.exec(Command::Reserve { job: j1 }).unwrap();
     sim.exec(Command::Place {
@@ -115,6 +141,7 @@ fn ce02_pool_relay_never_benefits_the_borrower() {
     sim.exec(Command::FundRecovery {
         job: j1,
         amount: 10,
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Place {
@@ -180,12 +207,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
         expected_version: None,
     })
     .unwrap();
-    sim.exec(Command::AttemptReady {
-        job: j1,
-        attempt: 1,
-        restored: [0; 3],
-    })
-    .unwrap();
+    sim.start_cluster(j1, 1, [0; 3]).unwrap();
     sim.exec(Command::Produce {
         job: j1,
         attempt: 1,
@@ -229,6 +251,7 @@ fn ce03_commitment_after_slice_closure_proves_nothing() {
         wt: WorkType::Generate,
         upto: 1,
         digest: sim.coord.receipt_digest(j1, 1, l, WorkType::Generate, 1),
+        signature: UNSIGNED,
     })
     .unwrap();
     sim.exec(Command::Cancel {
@@ -272,12 +295,7 @@ fn ce03_commitment_before_closure_still_counts() {
         expected_version: None,
     })
     .unwrap();
-    sim.exec(Command::AttemptReady {
-        job: j1,
-        attempt: 1,
-        restored: [0; 3],
-    })
-    .unwrap();
+    sim.start_cluster(j1, 1, [0; 3]).unwrap();
     sim.exec(Command::Produce {
         job: j1,
         attempt: 1,
@@ -299,6 +317,7 @@ fn ce03_commitment_before_closure_still_counts() {
         wt: WorkType::Generate,
         upto: 1,
         digest: sim.coord.receipt_digest(j1, 1, l, WorkType::Generate, 1),
+        signature: UNSIGNED,
     })
     .unwrap();
     let s = SliceId {
@@ -348,11 +367,7 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -380,10 +395,10 @@ fn ce04_voided_output_after_closure_does_not_block_evaluation() {
             wt: gen,
             upto: 2,
             digest: sim.coord.receipt_digest(j, 1, AccountId(10), gen, 2),
+            signature: UNSIGNED,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let s = SliceId {
         job: j,
@@ -456,11 +471,7 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -480,10 +491,10 @@ fn ce05_zero_reward_in_free_pool_completes_at_payment() {
             wt: gen,
             upto: 1,
             digest: sim.coord.receipt_digest(j, 1, AccountId(11), gen, 1),
+            signature: UNSIGNED,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let s = SliceId {
         job: j,
@@ -532,11 +543,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
             witness: WITNESS,
             expected_version: None,
         },
-        Command::AttemptReady {
-            job: j,
-            attempt: 1,
-            restored: [0; 3],
-        },
+        ready(j),
         Command::Produce {
             job: j,
             attempt: 1,
@@ -550,8 +557,7 @@ fn ce06_awaiting_contribution_reverting_to_pending_keeps_slice_open() {
             upto: 1,
         },
     ] {
-        sim.exec(cmd.clone())
-            .unwrap_or_else(|e| panic!("{cmd:?}: {e:?}"));
+        step(&mut sim, &cmd);
     }
     let digest = sim.coord.frame_digest(j, gen, 2);
     sim.exec(Command::Deliver {
@@ -637,4 +643,190 @@ fn ce07_only_the_reconciler_reconciles() {
     let ctx = sim.as_service(ServiceRole::Reconciler);
     assert!(sim.exec_as(&ctx, Command::Reconcile).is_ok());
     assert_clean(&sim);
+}
+
+/// CE-08, found by `r2_a_fault_during_a_partial_settlement_then_restart_and_reconciliation`.
+/// When the ledger refused or failed a payment inside a due evaluation, reconciliation dropped
+/// the error and reported success: the slice stayed closed with its reserve in place and nobody
+/// was told. Fix (JOB-R20): a ledger failure inside reconciliation is reported like an internal
+/// error, and the whole reconciliation is rolled back.
+#[test]
+fn ce08_reconciliation_reports_a_ledger_failure() {
+    let mut sim = Sim::default();
+    let j = JobId(1);
+    let gen = WorkType::Generate;
+    let (l0, l1) = (AccountId(10), AccountId(11));
+    sim.exec(Command::Reserve { job: j }).unwrap();
+    sim.exec(Command::Place {
+        job: j,
+        lenders: vec![l0, l1, AccountId(12)],
+        layout: layout_of(j),
+        recovery_estimate: 0,
+        witness: WITNESS,
+        expected_version: None,
+    })
+    .unwrap();
+    sim.start_cluster(j, 1, [0; 3]).unwrap();
+    let slice = SliceId {
+        job: j,
+        attempt: 1,
+        slice: 1,
+    };
+    for cmd in [
+        Command::Produce {
+            job: j,
+            attempt: 1,
+            wt: gen,
+            upto: 1,
+        },
+        Command::Ack {
+            job: j,
+            attempt: 1,
+            wt: gen,
+            upto: 1,
+        },
+        Command::CommitReceipts {
+            job: j,
+            attempt: 1,
+            lender: l0,
+            wt: gen,
+            upto: 1,
+            digest: sim.coord.receipt_digest(j, 1, l0, gen, 1),
+            signature: UNSIGNED,
+        },
+        Command::Claim {
+            slice,
+            lender: l0,
+            items: vec![ClaimItem::Contribution {
+                output: OutputId {
+                    job: j,
+                    wt: gen,
+                    pos: 0,
+                },
+                stage: 0,
+                evidence: Evidence::Committed,
+            }],
+        },
+        Command::CloseSlice { slice },
+        Command::Tick { dt: 600 },
+    ] {
+        step(&mut sim, &cmd);
+    }
+    assert_clean(&sim);
+    // The journal refuses its next entry: the payment of the due evaluation.
+    sim.coord.inject_ledger_fault(Some(0));
+    let reconciler = sim.as_service(ServiceRole::Reconciler);
+    let before = sim.coord.clone();
+    let r = sim.coord.execute(&reconciler, &Command::Reconcile);
+    assert!(matches!(r, Err(DomainError::Internal(_))), "{r:?}");
+    assert!(sim.coord == before, "a failed reconciliation left a trace");
+    // Once the ledger answers again, the same reconciliation completes.
+    sim.coord.inject_ledger_fault(None);
+    sim.exec(Command::Reconcile).unwrap();
+    assert_eq!(sim.coord.slices()[&slice].lines[&l0].paid, 6);
+    sim.drain();
+    assert_clean(&sim);
+}
+
+/// CE-09, found in review, not by proptest. LEDGER-018 gave a line one window for all its
+/// payments: release at least 48 h after the latest payment still held, contest at most 7 days
+/// after the oldest. With a payment on day 0 and another on day 6 (here by a ruling), on day 7
+/// the line could be neither contested nor released, and the day-6 payment had one day of
+/// contest left instead of its own window. Fix (LEDGER-018, JOB-R22): each payment has its own
+/// hold and its own contest limit, counted from that payment; a contest takes back the payments
+/// still inside their limit and leaves the others held.
+#[test]
+fn ce09_staggered_payments_keep_their_own_contest_window() {
+    const DAY: u64 = 24 * 3600;
+    let mut sim = Sim::default();
+    let j = JobId(1);
+    let l0 = AccountId(10);
+    let place = |estimate| Command::Place {
+        job: j,
+        lenders: vec![l0, AccountId(11), AccountId(12)],
+        layout: layout_of(j),
+        recovery_estimate: estimate,
+        witness: WITNESS,
+        expected_version: None,
+    };
+    let slice = SliceId {
+        job: j,
+        attempt: 2,
+        slice: 1,
+    };
+    // Segment 0 is proven by a commitment and paid at evaluation. Segment 1, uncommitted and
+    // above the sliding cap, is held for a ruling (JOB-R19).
+    let recovery = |segment, amount, evidence| ClaimItem::Recovery {
+        segment,
+        amount,
+        evidence,
+    };
+    let claim = Command::Claim {
+        slice,
+        lender: l0,
+        items: vec![
+            recovery(0, 1, Evidence::Committed),
+            recovery(1, 5, Evidence::Uncommitted),
+        ],
+    };
+    let node_lost = Command::NodeLost {
+        job: j,
+        expected_version: None,
+    };
+    let ruling = Command::Arbitrate {
+        slice,
+        lender: l0,
+        pay: true,
+    };
+    sim.exec(Command::Reserve { job: j }).unwrap();
+    sim.exec(place(0)).unwrap();
+    sim.start_cluster(j, 1, [0; 3]).unwrap();
+    sim.exec(node_lost).unwrap();
+    sim.exec(place(6)).unwrap();
+    sim.start_cluster(j, 2, [0; 3]).unwrap();
+    for cmd in [
+        claim,
+        Command::CloseSlice { slice },
+        Command::Tick { dt: 600 },
+        Command::Evaluate { slice },
+    ] {
+        step(&mut sim, &cmd);
+    }
+    let line = |sim: &Sim| sim.coord.slices()[&slice].lines[&l0].clone();
+    assert_eq!((line(&sim).paid, line(&sim).disputed), (1, 5));
+    // Day 6: the ruling pays the second item and the slice becomes final.
+    step(&mut sim, &Command::Tick { dt: 6 * DAY });
+    step(&mut sim, &ruling);
+    assert_eq!(sim.coord.slices()[&slice].status, SliceStatus::Final);
+    assert_eq!(line(&sim).held, 6);
+    let release = Command::ReleaseReward { slice, lender: l0 };
+    let contest = Command::ContestReward { slice, lender: l0 };
+    // Day 7. The day-6 payment still has its contest window: the line is not released, and the
+    // borrower's contest takes back that payment only.
+    step(&mut sim, &Command::Tick { dt: DAY });
+    assert_eq!(
+        sim.exec(release.clone()),
+        Err(DomainError::Precondition("JOB-R22: contest window open"))
+    );
+    assert_eq!(sim.exec(contest.clone()), Ok(Outcome::Applied));
+    assert_eq!((line(&sim).held, line(&sim).contested), (1, 5));
+    // The day-0 payment is past its own limit: it can only be released.
+    assert_eq!(
+        sim.exec(contest.clone()),
+        Err(DomainError::Precondition("JOB-R22: contest limit reached"))
+    );
+    // Day 8: the window on the slice has passed and what is left is released.
+    step(&mut sim, &Command::Tick { dt: DAY });
+    assert_eq!(sim.exec(release.clone()), Ok(Outcome::Applied));
+    assert_eq!((line(&sim).held, line(&sim).released), (0, 1));
+    assert!(sim.exec(release).is_err());
+    assert!(sim.exec(contest).is_err());
+    sim.drain();
+    assert_clean(&sim);
+    assert_eq!(sim.balance(gpu_ledger::Account::User(l0.0)), 1);
+    // The borrower got the contested payment back: only the released credit left its account.
+    assert_eq!(
+        sim.balance(gpu_ledger::Account::User(BORROWERS[0].0)),
+        1_999
+    );
 }

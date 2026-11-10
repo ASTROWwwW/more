@@ -14,6 +14,13 @@ use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+mod statements;
+
+pub use statements::{
+    lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
+    Assignment, Domain, JobTerms, Readiness, Restoration,
+};
+
 /// Account number, as used by the ledger and the domain (`AccountId.0`).
 pub type AccountNo = u32;
 
@@ -140,6 +147,11 @@ impl IdentityAuthority {
         set.insert(id);
     }
 
+    /// This deployment's identifier in signed statements (LEDGER-019).
+    pub fn domain(&self) -> Domain {
+        Domain(self.key.verifying_key().to_bytes())
+    }
+
     /// Verifier handed to the services that must check credentials (Ledger, coordinator). It holds
     /// the authority's public key only, so it cannot mint.
     pub fn verifier(&self) -> CredentialVerifier {
@@ -164,6 +176,11 @@ pub struct CredentialVerifier {
 }
 
 impl CredentialVerifier {
+    /// The deployment this verifier belongs to: statements signed for another one are void here.
+    pub fn domain(&self) -> Domain {
+        Domain(self.authority.to_bytes())
+    }
+
     pub fn verify(&self, cred: &ServiceCredential) -> Result<ServiceRole, AuthError> {
         let key = (cred.id.0, cred.role as u8, cred.tag);
         let known = self
@@ -210,6 +227,8 @@ impl Eq for CredentialVerifier {}
 #[derive(Clone, Default)]
 pub struct KeyDirectory {
     keys: Arc<RwLock<BTreeMap<AccountNo, VerifyingKey>>>,
+    /// Signature checks done through this directory (cost accounting).
+    checks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KeyDirectory {
@@ -228,6 +247,11 @@ impl KeyDirectory {
         Ok(())
     }
 
+    /// Number of signature checks done through this directory and its clones.
+    pub fn signature_checks(&self) -> u64 {
+        self.checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn contains(&self, account: AccountNo) -> bool {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         keys.contains_key(&account)
@@ -244,6 +268,8 @@ impl KeyDirectory {
             let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
             *keys.get(&account).ok_or(AuthError::UnknownAccount)?
         };
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         key.verify(message, &Signature::from_bytes(signature))
             .map_err(|_| AuthError::BadSignature)?;
         Ok(VerifiedAccount(account))
@@ -348,18 +374,6 @@ impl AuthContext {
     }
 }
 
-/// Bytes a borrower signs to let the Ledger lock up to `max_budget` credits for one job. Binding
-/// the job, the pool and the borrower keeps a mandate from being reused elsewhere.
-pub fn mandate_message(job: u32, pool: u32, borrower: AccountNo, max_budget: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(36);
-    m.extend_from_slice(b"more/mandate/v1");
-    m.extend_from_slice(&job.to_le_bytes());
-    m.extend_from_slice(&pool.to_le_bytes());
-    m.extend_from_slice(&borrower.to_le_bytes());
-    m.extend_from_slice(&max_budget.to_le_bytes());
-    m
-}
-
 /// Test support: builds an authenticated account context without a signature. Compiled only with
 /// the `test-support` feature, which production builds must not enable. The simulation uses it to
 /// test authorization rules on millions of commands; signatures are tested at the protocol edge.
@@ -394,6 +408,17 @@ mod tests {
             auth.verifier().verify(&cred),
             Err(AuthError::InvalidCredential)
         );
+    }
+
+    #[test]
+    fn domain_is_the_authority_and_nothing_else() {
+        let (a, b) = (
+            IdentityAuthority::new([7; 32]),
+            IdentityAuthority::new([8; 32]),
+        );
+        assert_eq!(a.domain(), a.verifier().domain());
+        assert_eq!(a.domain(), IdentityAuthority::new([7; 32]).domain());
+        assert_ne!(a.domain(), b.domain());
     }
 
     #[test]

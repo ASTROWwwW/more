@@ -23,6 +23,26 @@ pub enum AuditEvent {
         to: SliceStatus,
         rule: &'static str,
     },
+    /// A stage's lease moved forward (JOB-R38).
+    Lease {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        state: LeaseState,
+    },
+    /// The recipient of `lender`'s output attested its restored state (JOB-R18).
+    RestoreCorroborated {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        segments: Vec<u32>,
+    },
+    /// Nodes whose own lease had expired when the attempt was revoked (JOB-R39).
+    LeasesExpired {
+        job: JobId,
+        attempt: u32,
+        nodes: Vec<AccountId>,
+    },
     AttemptStarted {
         job: JobId,
         attempt: u32,

@@ -111,6 +111,9 @@ impl Pool {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Registry {
     pools: BTreeMap<PoolId, Pool>,
+    /// Log position of the last time an account lost its lend right (`false`) or its witness
+    /// right (`true`) in a pool (CE-03).
+    lost: BTreeMap<(PoolId, AccountId, bool), u64>,
 }
 
 impl Registry {
@@ -120,6 +123,19 @@ impl Registry {
 
     pub fn pool(&self, id: PoolId) -> R<&Pool> {
         self.pools.get(&id).ok_or(DomainError::UnknownPool)
+    }
+
+    /// `account` lost its lend right (or its witness right) in `pool` after log position `seq`.
+    pub fn right_lost_since(
+        &self,
+        pool: PoolId,
+        account: AccountId,
+        witness: bool,
+        seq: u64,
+    ) -> bool {
+        self.lost
+            .get(&(pool, account, witness))
+            .is_some_and(|at| *at > seq)
     }
 
     fn pool_mut(&mut self, id: PoolId) -> R<&mut Pool> {
@@ -159,11 +175,24 @@ impl Registry {
         pool: PoolId,
         account: AccountId,
         rights: Rights,
+        seq: u64,
     ) -> R<Outcome> {
         let p = self.pool_mut(pool)?;
-        if p.rights(account) == rights {
+        let old = p.rights(account);
+        if old == rights {
             return Ok(Outcome::AlreadyApplied);
         }
+        // A withdrawal is kept with its position: granting the right again later does not make
+        // what was signed in between admissible.
+        for (witness, had, has) in [
+            (false, old.lend, rights.lend),
+            (true, old.witness, rights.witness),
+        ] {
+            if had && !has {
+                self.lost.insert((pool, account, witness), seq);
+            }
+        }
+        let p = self.pool_mut(pool)?;
         if rights == Rights::NONE {
             p.members.remove(&account);
         } else {

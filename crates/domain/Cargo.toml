@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Test only: see `gpu-ledger`'s feature of the same name.
+fault-injection = ["gpu-ledger/fault-injection"]
+
 [dependencies]
 more-identity.workspace = true
 gpu-ledger.workspace = true

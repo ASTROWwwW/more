@@ -7,8 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Lets tests make the journal fail at a chosen entry, to check that a failure in the middle of an
+# operation leaves nothing behind. Never enable it in a production build.
+fault-injection = []
+
 [dependencies]
 more-identity.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

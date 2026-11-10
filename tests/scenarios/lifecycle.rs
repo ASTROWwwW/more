@@ -27,7 +27,14 @@ fn f01_partial_transition_leaves_no_trace() {
         model: ModelId(1),
         outputs: [4, 12, 3],
         max_budget: 1_000,
-        mandate: mandate(JobId(4), CREDIT_POOL, AccountId(3), 1_000),
+        mandate: mandate(
+            JobId(4),
+            CREDIT_POOL,
+            AccountId(3),
+            ModelId(1),
+            [4, 12, 3],
+            1_000,
+        ),
     });
     // Enough for the work part (177), not for the recovery budget (17).
     let e = t.err(Command::Reserve { job: JobId(4) });
@@ -56,11 +63,7 @@ fn f02_redelivered_assignments_are_harmless() {
     t.ok(Command::Tick { dt: 61 });
     t.ok(Command::Reconcile);
     assert_eq!(t.job(J1).exec, ExecStatus::Reserved);
-    t.err(Command::AttemptReady {
-        job: J1,
-        attempt: 1,
-        restored: [0; 3],
-    });
+    t.err(ready_cmd(J1, 1, L[0], [0; 3]));
     t.finish();
 }
 

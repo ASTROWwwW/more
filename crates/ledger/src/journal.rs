@@ -56,6 +56,9 @@ pub struct Ledger {
     entries: Vec<Entry>,
     balances: BTreeMap<Account, i128>,
     keys: BTreeMap<String, u64>,
+    /// Test only: entries left before the journal fails once.
+    #[cfg(feature = "fault-injection")]
+    fail_in: Option<u64>,
 }
 
 impl Ledger {
@@ -119,6 +122,12 @@ impl Ledger {
                 requested: amount,
             });
         }
+        #[cfg(feature = "fault-injection")]
+        match self.fail_in {
+            Some(0) => return Err(LedgerError::Invalid("injected fault")),
+            Some(n) => self.fail_in = Some(n - 1),
+            None => {}
+        }
         let seq =
             u64::try_from(self.entries.len()).map_err(|_| LedgerError::Invalid("journal full"))?;
         let prev_hash = self.entries.last().map_or(FNV_OFFSET, |e| e.hash);
@@ -137,6 +146,13 @@ impl Ledger {
             hash,
         });
         Ok(())
+    }
+
+    /// Test only: the journal accepts `after` more entries, then refuses every entry until the
+    /// fault is cleared with `None`.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn inject_fault(&mut self, after: Option<u64>) {
+        self.fail_in = after;
     }
 
     /// Journal length, to roll back a multi-entry operation that fails half way.

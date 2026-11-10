@@ -106,6 +106,7 @@ fn f17_receipts_fabricated_after_revocation() {
         wt: GEN,
         upto: 4,
         digest: t.c().receipt_digest(J1, 1, L[0], GEN, 4),
+        signature: UNSIGNED,
     });
     let ev = |p| ClaimItem::Contribution {
         output: OutputId {
@@ -139,6 +140,8 @@ fn f17_receipts_fabricated_after_revocation() {
         }),
         DomainError::FlowBudgetExceeded
     );
+    // Its receipts were co-signed by its recipient before the fault.
+    t.present(J1, 1, L[1], 4);
     t.ok(Command::Claim {
         slice: s,
         lender: L[1],
@@ -227,16 +230,8 @@ fn f19_resume_after_pause_keeps_intent() {
         Intent::Resume,
         "JOB-T04 does not reset the intent"
     );
-    t.err(Command::AttemptReady {
-        job: J1,
-        attempt: 2,
-        restored: [0; 3],
-    });
-    t.ok(Command::AttemptReady {
-        job: J1,
-        attempt: 2,
-        restored: [0, 3, 0],
-    });
+    t.ready_err(J1, 2, [0; 3]);
+    t.ready(J1, 2, [0, 3, 0]);
     t.finish();
 }
 
@@ -442,6 +437,7 @@ fn f23_recovery_budget_exhausted_then_pool_relay() {
     t.ok(Command::FundRecovery {
         job: J1,
         amount: 10,
+        signature: UNSIGNED,
     });
     t.start(J1, 10);
     t.gen(J1, 1);
@@ -519,11 +515,7 @@ fn r21_rounding_never_exceeds_price() {
         witness: WITNESS,
         expected_version: None,
     });
-    t.ok(Command::AttemptReady {
-        job: j2,
-        attempt: 1,
-        restored: [0; 3],
-    });
+    t.ready(j2, 1, [0; 3]);
     t.gen(j2, 1);
     t.commit_all(j2);
     let s = t.open_slice(j2);

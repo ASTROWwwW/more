@@ -7,8 +7,10 @@ use gpu_domain::*;
 mod accounting;
 mod delivery;
 mod fairness;
+mod leases;
 mod lifecycle;
 mod payments;
+mod proofs;
 mod security;
 
 pub use fairness::check_fairness;
@@ -110,6 +112,9 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     delivery::charges(c, &mut out);
     payments::payments(c, ledger, &mut out);
     lifecycle::attempts(c, &mut out);
+    leases::state(c, &mut out);
+    proofs::state(c, ledger, auditor, &mut out);
+    proofs::recovery(c, &mut out);
     out
 }
 
@@ -162,59 +167,10 @@ pub fn check_step(
         Ok(_) => {}
     }
     out.extend(delivery::check_charge_basis(before, cmd, after));
-    // TEST-P24: nothing accepted under an expired lease; after reconciliation no live attempt has
-    // an expired lease.
-    if let Ok(Outcome::Applied) = result {
-        if let Command::Produce { job, attempt, .. }
-        | Command::Ack { job, attempt, .. }
-        | Command::Deliver { job, attempt, .. }
-        | Command::AttemptReady { job, attempt, .. }
-        | Command::Heartbeat { job, attempt } = cmd
-        {
-            // Late attestation: governed by JOB-R32 (TEST-P20), not by the lease.
-            let late = matches!(cmd, Command::Deliver { .. })
-                && before
-                    .jobs()
-                    .get(job)
-                    .and_then(|j| j.attempts.get(attempt))
-                    .is_some_and(|a| a.revoked_at.is_some());
-            let expired = !late
-                && before
-                    .jobs()
-                    .get(job)
-                    .and_then(|j| j.attempts.get(attempt))
-                    .is_none_or(|a| before.now() >= a.lease_expires_at);
-            if expired {
-                out.push(v(
-                    "TEST-P24",
-                    format!("{cmd:?} accepted under an expired lease"),
-                ));
-            }
-        }
-    }
-    // Only a reconciliation that actually ran (a refused one changes nothing, TEST-P16).
-    if matches!(cmd, Command::Reconcile) && result.is_ok() {
-        for (o, ch) in after.delivery().charges() {
-            if !ch.definitive && ch.contest.is_some_and(|k| after.now() >= k.deadline) {
-                out.push(v(
-                    "TEST-P27",
-                    format!("{o:?}: contest past its deadline survived reconciliation"),
-                ));
-            }
-        }
-        for j in after.jobs().values() {
-            if matches!(j.exec, ExecStatus::Running | ExecStatus::Placing) {
-                if let Some(a) = j.current() {
-                    if a.revoked_at.is_none() && after.now() >= a.lease_expires_at {
-                        out.push(v(
-                            "TEST-P24",
-                            format!("{:?}: expired lease survived reconciliation", j.id),
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    out.extend(leases::step(before, cmd, result, after));
+    out.extend(proofs::receipts_step(before, after));
+    out.extend(proofs::finality_step(before, cmd, after, auditor));
+    out.extend(proofs::anteriority_step(before, cmd, after));
     // TEST-P04: production and acks only on the live attempt.
     if result.is_ok() {
         if let Command::Produce { job, attempt, .. } | Command::Ack { job, attempt, .. } = cmd {

@@ -185,12 +185,18 @@ impl Coordinator {
                             let amount = j.share(&a, output.wt, stage).ok_or_else(|| {
                                 DomainError::Internal("share of a missing stage".into())
                             })?;
-                            self.ledger_op(LedgerOp::ReserveLine {
+                            // The ledger computes the share from the signed terms; it must agree.
+                            let moved = self.ledger_op(LedgerOp::ReserveContribution {
                                 line: line_ref(slice, *lender),
-                                source: LineSource::OutputHold,
-                                key: format!("claim/{:?}/{}/{:?}", slice, lender.0, cid),
-                                amount,
+                                output: output_ref(output),
+                                gen: cid.charge,
+                                stage: stage as u32,
                             })?;
+                            if moved != LedgerOutcome::Moved(amount) {
+                                return Err(DomainError::Internal(format!(
+                                    "share of {cid:?}: ledger {moved:?}, coordinator {amount}"
+                                )));
+                            }
                             self.contributions.insert(cid, slice);
                             Some((ItemKind::Contribution(cid), amount, evidence))
                         }
@@ -214,10 +220,9 @@ impl Coordinator {
                     if !a.ready || self.recovery_items.contains_key(&rid) || !fits || amount == 0 {
                         None
                     } else {
-                        self.ledger_op(LedgerOp::ReserveLine {
+                        self.ledger_op(LedgerOp::ReserveRecovery {
                             line: line_ref(slice, *lender),
-                            source: LineSource::Recovery,
-                            key: format!("claim/{:?}/{}/{:?}", slice, lender.0, rid),
+                            segment,
                             amount,
                         })?;
                         recovery_reserved = add(recovery_reserved, amount, "recovery reserved")?;
@@ -239,6 +244,7 @@ impl Coordinator {
                         status: ItemStatus::PendingEvaluation,
                         pool_part: 0,
                         reward_done: false,
+                        paid_at: None,
                         awaiting_delivery: false,
                     });
                     self.audit.push(AuditEvent::ItemReserved {

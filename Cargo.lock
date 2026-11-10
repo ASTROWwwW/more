@@ -292,6 +292,7 @@ name = "gpu-ledger"
 version = "0.3.0"
 dependencies = [
  "more-identity",
+ "proptest",
 ]
 
 [[package]]

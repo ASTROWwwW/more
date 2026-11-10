@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b5f83d3e07f1ed854ee73c4ffd74cdb4897a39644c34f2646760030f68abb30f # shrinks to seq = [Fund(27), Register { attempt: 0, shape: 4, earmark: 107 }, Accept { attempt: 12, stage: 14, signer: 0 }, Ready { attempt: 0, stage: 72, signer: 0 }, Recovery { attempt: 0, lender: 16, segment: 0, amount: 26 }, Pay { attempt: 0, lender: 0, item: 0, pos: 0, gen: 0, stage: 0 }, Release { attempt: 0, lender: 20 }]
+cc b5680fff9c684dd21314507254b745af2dc933e6f914ef61d0584ff382f624c9 # shrinks to seq = [Reserve(false, 8), Register { attempt: 12, shape: 95, earmark: 210 }, Accept { attempt: 12, stage: 14, signer: 0 }, Reserve(true, 8), Charge { attempt: 12, pos: 15, gen: 0 }, Receipt { attempt: 0, producer: 16, upto: 103, signer: 1 }, Contribution { attempt: 0, lender: 4, pos: 0, gen: 0, stage: 0 }, Pay { attempt: 0, lender: 0, item: 0, pos: 0, gen: 0, stage: 0 }]

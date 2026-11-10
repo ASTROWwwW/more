@@ -46,8 +46,8 @@ publish = false
 
 [dev-dependencies]
 more-identity = { workspace = true, features = ["test-support"] }
-gpu-ledger.workspace = true
-gpu-domain.workspace = true
+gpu-ledger = { workspace = true, features = ["fault-injection"] }
+gpu-domain = { workspace = true, features = ["fault-injection"] }
 gpu-protocol.workspace = true
 gpu-simulation.workspace = true
 proptest.workspace = true

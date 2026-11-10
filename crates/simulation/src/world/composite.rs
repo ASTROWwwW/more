@@ -4,15 +4,81 @@
 use super::*;
 
 impl Sim {
+    /// Every node of the live attempt renews its own lease: a healthy cluster (JOB-R39).
+    pub fn renew_all(&self, id: JobId) -> Vec<Command> {
+        let Ok(j) = self.coord.job(id) else {
+            return vec![];
+        };
+        let Some(a) = j.current().filter(|a| a.revoked_at.is_none()) else {
+            return vec![];
+        };
+        let mut v: Vec<Command> = a
+            .lenders
+            .iter()
+            .map(|l| Command::Heartbeat {
+                job: id,
+                attempt: j.attempt,
+                lender: *l,
+            })
+            .collect();
+        v.push(Command::WitnessHeartbeat {
+            job: id,
+            attempt: j.attempt,
+            witness: a.witness,
+        });
+        v
+    }
+
+    /// An honest lender presents the receipts its recipient co-signed before sending an
+    /// uncommitted claim (JOB-R12, LEDGER-016).
+    pub fn presenting(&self, claim: Command) -> Vec<Command> {
+        let Command::Claim {
+            slice,
+            lender,
+            items,
+        } = &claim
+        else {
+            return vec![claim];
+        };
+        let mut upto: std::collections::BTreeMap<WorkType, u32> = Default::default();
+        for it in items {
+            if let ClaimItem::Contribution {
+                output,
+                evidence: Evidence::Uncommitted,
+                ..
+            } = it
+            {
+                let u = upto.entry(output.wt).or_default();
+                *u = (*u).max(output.pos + 1);
+            }
+        }
+        let mut v: Vec<Command> = upto
+            .into_iter()
+            .map(|(wt, upto)| Command::PresentReceipt {
+                job: slice.job,
+                attempt: slice.attempt,
+                lender: *lender,
+                wt,
+                upto,
+                digest: self
+                    .coord
+                    .receipt_digest(slice.job, slice.attempt, *lender, wt, upto),
+                signature: UNSIGNED,
+            })
+            .collect();
+        v.push(claim);
+        v
+    }
+
     /// Next normal step for a job, given its state.
     pub(super) fn drive(&self, id: JobId, sel: u8) -> Vec<Command> {
         let c = &self.coord;
         let Ok(j) = c.job(id) else { return vec![] };
         // Advance slices first, whatever the job state.
-        let mut slice_work = Vec::new();
+        let mut slice_work: Vec<Vec<Command>> = Vec::new();
         for s in c.slices().values().filter(|s| s.id.job == id) {
             match s.status {
-                SliceStatus::Closed => slice_work.push(Command::Evaluate { slice: s.id }),
+                SliceStatus::Closed => slice_work.push(vec![Command::Evaluate { slice: s.id }]),
                 SliceStatus::Disputed => {
                     let arbitrable = s.lines.iter().find(|(_, l)| {
                         l.items
@@ -34,33 +100,33 @@ impl Sim {
                             .final_at
                             .is_some_and(|f| c.now() < f + c.config().reward_window);
                         if !open {
-                            slice_work.push(Command::ReleaseReward {
+                            slice_work.push(vec![Command::ReleaseReward {
                                 slice: s.id,
                                 lender: *l,
-                            });
+                            }]);
                         } else if sel.is_multiple_of(4) {
                             // Fraud found during the window (JOB-R22).
-                            slice_work.push(Command::ContestReward {
+                            slice_work.push(vec![Command::ContestReward {
                                 slice: s.id,
                                 lender: *l,
-                            });
+                            }]);
                         }
                     }
                 }
                 SliceStatus::Draining => {
                     // The lender still online presents its receipts (JOB-F16).
                     if let Some(cmd) = self.honest_claim(s.id, sel) {
-                        slice_work.push(cmd);
+                        slice_work.push(self.presenting(cmd));
                     }
                     if c.now() >= s.receipt_deadline.unwrap_or(0) {
-                        slice_work.push(Command::CloseSlice { slice: s.id });
+                        slice_work.push(vec![Command::CloseSlice { slice: s.id }]);
                     }
                 }
                 SliceStatus::Open => {}
             }
         }
         if !slice_work.is_empty() && sel.is_multiple_of(3) {
-            return vec![slice_work[usize::from(sel) % slice_work.len()].clone()];
+            return slice_work[usize::from(sel) % slice_work.len()].clone();
         }
         match j.exec {
             ExecStatus::Queued => vec![Command::Reserve { job: id }],
@@ -84,17 +150,18 @@ impl Sim {
                 });
                 v
             }
-            ExecStatus::Placing => vec![
-                Command::Heartbeat {
-                    job: id,
-                    attempt: j.attempt,
-                },
-                Command::AttemptReady {
-                    job: id,
-                    attempt: j.attempt,
-                    restored: j.delivered,
-                },
-            ],
+            ExecStatus::Placing => {
+                let mut v = self.renew_all(id);
+                if let Some(a) = j.current() {
+                    v.extend(bring_up(id, j.attempt, &a.lenders, j.delivered));
+                    // Most clusters corroborate each other's restoration right away; some never
+                    // do, and their recovery claims stay held (JOB-R18).
+                    if !sel.is_multiple_of(4) {
+                        v.extend(corroborate(id, j.attempt, &a.lenders));
+                    }
+                }
+                v
+            }
             ExecStatus::Paused => {
                 let mut v = self.client_confirm(id, sel);
                 v.push(Command::Resume {
@@ -124,11 +191,8 @@ impl Sim {
                         s.id.job == id && s.id.attempt == j.attempt && s.status == SliceStatus::Open
                     })
                     .map(|s| s.id);
-                // Healthy cluster: renews its lease at every step.
-                let hb = Command::Heartbeat {
-                    job: id,
-                    attempt: j.attempt,
-                };
+                // Healthy cluster: every node renews its lease at every step.
+                let hb = self.renew_all(id);
                 let step: Vec<Command> = match sel % 10 {
                     0 | 1 => vec![Command::Produce {
                         job: id,
@@ -169,12 +233,13 @@ impl Sim {
                             wt,
                             upto: a.produced[t],
                             digest: c.receipt_digest(id, j.attempt, *l, wt, a.produced[t]),
+                            signature: UNSIGNED,
                         })
                         .collect(),
                     5 | 6 => open
                         .and_then(|s| self.honest_claim(s, sel))
-                        .into_iter()
-                        .collect(),
+                        .map(|cl| self.presenting(cl))
+                        .unwrap_or_default(),
                     7 => {
                         let mut v: Vec<Command> = open
                             .map(|s| Command::CloseSlice { slice: s })
@@ -212,13 +277,13 @@ impl Sim {
                         }
                     }
                 };
-                let mut v = vec![hb];
+                let mut v = hb;
                 v.extend(step);
                 v
             }
             _ => {
                 let mut v = self.client_confirm(id, sel);
-                v.extend(slice_work.into_iter().take(1));
+                v.extend(slice_work.into_iter().take(1).flatten());
                 v
             }
         }
@@ -335,7 +400,11 @@ impl Sim {
                 job: id,
                 expected_version: None,
             }),
-            2 => Some(Command::FundRecovery { job: id, amount: 5 }),
+            2 => Some(Command::FundRecovery {
+                job: id,
+                amount: 5,
+                signature: UNSIGNED,
+            }),
             3 => Some(Command::SetRights {
                 pool: CREDIT_POOL,
                 account: STRANGER,

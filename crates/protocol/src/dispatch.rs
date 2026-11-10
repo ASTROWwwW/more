@@ -64,10 +64,71 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             job,
             attempt,
             restored,
+            state,
+            segments,
+            signature,
         } => Command::AttemptReady {
             job: *job,
             attempt: *attempt,
+            lender: sender,
             restored: *restored,
+            state: *state,
+            segments: segments.clone(),
+            signature: *signature,
+        },
+        M::AssignAccept {
+            job,
+            attempt,
+            signature,
+        } => Command::AcceptLease {
+            job: *job,
+            attempt: *attempt,
+            lender: sender,
+            signature: *signature,
+        },
+        M::LayersLoaded {
+            job,
+            attempt,
+            config,
+        } => Command::LeaseLoaded {
+            job: *job,
+            attempt: *attempt,
+            lender: sender,
+            config: *config,
+        },
+        M::RestoreCorroboration {
+            job,
+            attempt,
+            producer,
+            segments,
+            signature,
+        } => Command::CorroborateRestore {
+            job: *job,
+            attempt: *attempt,
+            lender: *producer,
+            segments: segments.clone(),
+            signature: *signature,
+        },
+        M::WitnessHeartbeat { job, attempt } => Command::WitnessHeartbeat {
+            job: *job,
+            attempt: *attempt,
+            witness: sender,
+        },
+        M::ReceiptPresent {
+            job,
+            attempt,
+            wt,
+            upto,
+            digest,
+            signature,
+        } => Command::PresentReceipt {
+            job: *job,
+            attempt: *attempt,
+            lender: sender,
+            wt: *wt,
+            upto: *upto,
+            digest: *digest,
+            signature: *signature,
         },
         M::AssignReject { job, .. } => Command::PlacementFailed { job: *job },
         M::Produced {
@@ -99,6 +160,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             wt,
             upto,
             digest,
+            signature,
         } => Command::CommitReceipts {
             job: *job,
             attempt: *attempt,
@@ -106,6 +168,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             wt: *wt,
             upto: *upto,
             digest: *digest,
+            signature: *signature,
         },
         M::UsageReport { slice, items } => Command::Claim {
             slice: *slice,
@@ -125,6 +188,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
         M::Heartbeat { job, attempt } => Command::Heartbeat {
             job: *job,
             attempt: *attempt,
+            lender: sender,
         },
         M::DeliveryAttestation {
             job,
@@ -181,9 +245,14 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             lender: *lender,
             pay: *pay,
         },
-        M::FundRecovery { job, amount } => Command::FundRecovery {
+        M::FundRecovery {
+            job,
+            amount,
+            signature,
+        } => Command::FundRecovery {
             job: *job,
             amount: *amount,
+            signature: *signature,
         },
     }
 }
@@ -199,6 +268,9 @@ pub fn handle(
 ) -> Answer {
     if env.version != PROTOCOL_VERSION {
         return Err(ProtoError::UnsupportedVersion);
+    }
+    if env.domain != coord.domain() {
+        return Err(ProtoError::WrongDeployment);
     }
     let verified = keys
         .verify(env.sender.0, &env.signing_bytes(), &env.signature)

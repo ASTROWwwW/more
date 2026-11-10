@@ -63,10 +63,36 @@ pub(super) fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool
         | Fail { .. } => is(ctx, &drivers),
         Reconcile => is(ctx, &[S::Reconciler]),
         Place { .. } => is(ctx, &[S::Scheduler]),
-        Heartbeat { job: id, attempt }
+        // JOB-R38, JOB-R39: a lender speaks for its own lease, the witness for its own.
+        AcceptLease {
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
+        | LeaseLoaded {
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
         | AttemptReady {
-            job: id, attempt, ..
-        } => att(id, *attempt).is_none_or(|a| me.is_some_and(|m| a.lenders.contains(&m))),
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
+        | Heartbeat {
+            job: id,
+            attempt,
+            lender,
+        } => me == Some(*lender) && att(id, *attempt).is_none_or(|a| a.lenders.contains(lender)),
+        WitnessHeartbeat {
+            job: id,
+            attempt,
+            witness,
+        } => me == Some(*witness) && att(id, *attempt).is_none_or(|a| a.witness == *witness),
+        PresentReceipt { lender, .. } => me == Some(*lender),
         PlacementFailed { job: id } => {
             is(ctx, &drivers)
                 || job(id)
@@ -99,6 +125,12 @@ pub(super) fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool
             is(ctx, &[S::Reconciler]) || att(id, *attempt).is_none_or(|a| me == Some(a.witness))
         }
         CommitReceipts {
+            job: id,
+            attempt,
+            lender,
+            ..
+        }
+        | CorroborateRestore {
             job: id,
             attempt,
             lender,

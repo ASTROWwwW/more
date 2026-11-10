@@ -8,7 +8,10 @@ use more_identity::UserKey;
 
 mod attacks;
 mod compromise;
+mod finality;
+mod leases;
 mod protocol;
+mod recovery;
 
 const J1: JobId = JobId(1);
 const J2: JobId = JobId(2);
@@ -35,20 +38,17 @@ impl Edge {
                 witness: WITNESS,
                 expected_version: None,
             },
-            Command::AttemptReady {
-                job: J1,
-                attempt: 1,
-                restored: [0; 3],
-            },
-            Command::Produce {
-                job: J1,
-                attempt: 1,
-                wt: GEN,
-                upto: 2,
-            },
         ] {
             sim.exec(c).unwrap();
         }
+        sim.start_cluster(J1, 1, [0; 3]).unwrap();
+        sim.exec(Command::Produce {
+            job: J1,
+            attempt: 1,
+            wt: GEN,
+            upto: 2,
+        })
+        .unwrap();
         Edge {
             sim,
             guard: ReplayGuard::default(),
@@ -58,7 +58,7 @@ impl Edge {
 
     fn envelope(&mut self, from: AccountId, body: Message) -> Envelope {
         self.seq += 1;
-        Envelope::signed(from, 1, self.seq, body, &user_key(from))
+        Envelope::signed(sim_domain(), from, 1, self.seq, body, &user_key(from))
     }
 
     fn send_env(&mut self, env: &Envelope) -> Answer {

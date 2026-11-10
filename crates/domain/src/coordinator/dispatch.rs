@@ -9,19 +9,22 @@ impl Coordinator {
         // Rejected commands roll back with the rest of the state, so sequence numbers have no gaps.
         self.seq += 1;
         match cmd {
-            Tick { dt } => self.tick(*dt),
+            Tick { dt } => self.tick(ctx, *dt),
             Issue { id, to, amount } => self.issue(ctx, *id, *to, *amount),
             CreatePool {
                 pool,
                 mode,
                 access,
                 admin,
-            } => self.registry.create(*pool, *mode, *access, *admin),
+            } => self.create_pool(ctx, *pool, *mode, *access, *admin),
             SetRights {
                 pool,
                 account,
                 rights,
-            } => self.registry.set_rights(*pool, *account, *rights),
+            } => {
+                let seq = self.seq;
+                self.registry.set_rights(*pool, *account, *rights, seq)
+            }
             JoinPool { pool, account } => self.registry.join(*pool, *account),
             RegisterModel { pool, model, spec } => {
                 self.registry.register_model(*pool, *model, *spec)
@@ -56,7 +59,35 @@ impl Coordinator {
                 self.check_version(*job, *expected_version)?;
                 self.place(*job, lenders, layout, *recovery_estimate, *witness)
             }
-            Heartbeat { job, attempt } => self.heartbeat(*job, *attempt),
+            AcceptLease {
+                job,
+                attempt,
+                lender,
+                signature,
+            } => self.accept_lease(*job, *attempt, *lender, signature),
+            CorroborateRestore {
+                job,
+                attempt,
+                lender,
+                segments,
+                signature,
+            } => self.corroborate_restore(*job, *attempt, *lender, segments, signature),
+            LeaseLoaded {
+                job,
+                attempt,
+                lender,
+                config,
+            } => self.lease_loaded(*job, *attempt, *lender, *config),
+            Heartbeat {
+                job,
+                attempt,
+                lender,
+            } => self.heartbeat(*job, *attempt, *lender),
+            WitnessHeartbeat {
+                job,
+                attempt,
+                witness,
+            } => self.witness_heartbeat(*job, *attempt, *witness),
             Deliver {
                 job,
                 attempt,
@@ -97,8 +128,18 @@ impl Coordinator {
             AttemptReady {
                 job,
                 attempt,
+                lender,
                 restored,
-            } => self.attempt_ready(*job, *attempt, *restored),
+                state,
+                segments,
+                signature,
+            } => self.attempt_ready(
+                *job,
+                *attempt,
+                *lender,
+                (*restored, *state, segments),
+                signature,
+            ),
             Produce {
                 job,
                 attempt,
@@ -118,7 +159,17 @@ impl Coordinator {
                 wt,
                 upto,
                 digest,
-            } => self.commit_receipts(*job, *attempt, *lender, *wt, *upto, *digest),
+                signature,
+            } => self.commit_receipts(*job, *attempt, *lender, (*wt, *upto, *digest), signature),
+            PresentReceipt {
+                job,
+                attempt,
+                lender,
+                wt,
+                upto,
+                digest,
+                signature,
+            } => self.present_receipt(*job, *attempt, *lender, (*wt, *upto, *digest), signature),
             Claim {
                 slice,
                 lender,
@@ -144,7 +195,11 @@ impl Coordinator {
             }
             Resume { job, topup } => self.resume(*job, *topup),
             RecoveryTimeout { job } => self.recovery_timeout(*job),
-            FundRecovery { job, amount } => self.fund_recovery(*job, *amount),
+            FundRecovery {
+                job,
+                amount,
+                signature,
+            } => self.fund_recovery(*job, *amount, signature),
             Finish {
                 job,
                 expected_version,

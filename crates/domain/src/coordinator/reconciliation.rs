@@ -25,7 +25,7 @@ impl Coordinator {
                     }
                     ExecStatus::Placing
                         if since >= c.placing_timeout
-                            || j.current().is_some_and(|a| now >= a.lease_expires_at) =>
+                            || j.current().is_some_and(|a| a.any_expired(now)) =>
                     {
                         todo.push(Command::PlacementFailed { job: j.id })
                     }
@@ -36,8 +36,8 @@ impl Coordinator {
                         todo.push(Command::ExpirePause { job: j.id })
                     }
                     ExecStatus::Running => {
-                        // JOB-R31: expired lease means lost node.
-                        if j.current().is_some_and(|a| now >= a.lease_expires_at) {
+                        // JOB-R31, JOB-R39: any node's expired lease means a lost node.
+                        if j.current().is_some_and(|a| a.any_expired(now)) {
                             todo.push(Command::NodeLost {
                                 job: j.id,
                                 expected_version: None,
@@ -119,6 +119,14 @@ impl Coordinator {
                     // job (CE-04).
                     Err(DomainError::Internal(m)) => {
                         return Err(DomainError::Internal(format!("reconcile {cmd:?}: {m}")))
+                    }
+                    // A due transition the ledger refuses or cannot write is never skipped in
+                    // silence either: the job would look settled-in-progress forever while credits
+                    // sit in its accounts.
+                    Err(DomainError::Ledger(e)) => {
+                        return Err(DomainError::Internal(format!(
+                            "reconcile {cmd:?}: ledger {e:?}"
+                        )))
                     }
                     // A due transition the reconciler may not run is a permission matrix bug: it
                     // would stay due forever.

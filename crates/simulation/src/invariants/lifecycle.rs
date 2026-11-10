@@ -1,5 +1,5 @@
-//! Lifecycle properties: allowed transitions, live attempts, leases, restarts (TEST-P01, P07, P09,
-//! P24, P25).
+//! Lifecycle properties: allowed transitions, live attempts, restarts (TEST-P01, P07, P09, P25).
+//! Leases are in `leases.rs`.
 
 use super::*;
 
@@ -99,18 +99,6 @@ pub(super) fn attempts(c: &Coordinator, out: &mut Vec<Violation>) {
                     j.id, a.no, j.delivered
                 ),
             ));
-        }
-    }
-
-    // TEST-P24: a lease is never extended beyond one TTL.
-    for j in c.jobs().values() {
-        if let Some(a) = j.current() {
-            if a.revoked_at.is_none() && a.lease_expires_at > c.now() + c.config().lease_ttl {
-                out.push(v(
-                    "TEST-P24",
-                    format!("{:?} attempt {}: lease beyond now + ttl", j.id, a.no),
-                ));
-            }
         }
     }
 

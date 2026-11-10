@@ -174,11 +174,8 @@ impl Coordinator {
         let price = self.job(output.job)?.price[output.wt.idx()];
         self.ledger_op(LedgerOp::VoidOutput {
             job: job_acct(output.job),
-            key: format!(
-                "void/{}/{:?}/{}/{}",
-                output.job.0, output.wt, output.pos, ch.gen
-            ),
-            amount: price,
+            output: output_ref(output),
+            gen: ch.gen,
         })?;
         self.delivery.void(output)?;
         self.audit.push(AuditEvent::OutputVoided {
