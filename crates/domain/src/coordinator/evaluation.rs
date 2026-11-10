@@ -111,14 +111,14 @@ impl Coordinator {
         })
     }
 
-    /// JOB-R18: the recipient of `lender`'s stage corroborated its restoration on that attempt,
-    /// for a number of segments that covers this one.
+    /// JOB-R18: the recipient of `lender`'s stage corroborated its restoration on that attempt
+    /// and named this segment.
     pub(super) fn restore_corroborated(&self, rid: RecoveryWorkId, lender: AccountId) -> bool {
         self.jobs
             .get(&rid.job)
             .and_then(|j| j.attempts.get(&rid.attempt))
-            .and_then(|a| a.stage_of(lender).and_then(|s| a.leases[s].corroborated))
-            .is_some_and(|n| rid.segment < n)
+            .and_then(|a| a.leases.get(a.stage_of(lender)?)?.corroborated.as_ref())
+            .is_some_and(|c| c.segments.contains(&rid.segment))
     }
 
     /// JOB-S04: evaluates a closed slice.

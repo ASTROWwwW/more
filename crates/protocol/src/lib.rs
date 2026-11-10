@@ -21,10 +21,11 @@ pub use replay_guard::{Admission, Answer, ReplayGuard, RECENT};
 mod tests {
     use super::*;
     use gpu_domain::{AccountId, JobId, Outcome};
-    use more_identity::UserKey;
+    use more_identity::{IdentityAuthority, UserKey};
 
     fn env(session: u64, seq: u64, body: Message) -> Envelope {
         Envelope::signed(
+            IdentityAuthority::new([1; 32]).domain(),
             AccountId(9),
             session,
             seq,
@@ -51,6 +52,9 @@ mod tests {
         let mut c = a.clone();
         c.session = 2;
         assert_ne!(a.signing_bytes(), c.signing_bytes());
+        let mut d = a.clone();
+        d.domain = IdentityAuthority::new([2; 32]).domain();
+        assert_ne!(a.signing_bytes(), d.signing_bytes());
     }
 
     #[test]

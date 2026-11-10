@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use more_identity::{CredentialVerifier, KeyDirectory, ServiceCredential, ServiceRole};
+use more_identity::{CredentialVerifier, Domain, KeyDirectory, ServiceCredential, ServiceRole};
 
 use crate::{Account, Amount, Ledger};
 
@@ -20,7 +20,7 @@ mod lines;
 mod types;
 mod work;
 
-pub use book::{AttemptRec, Escrow, ItemRec, ItemState, OutputRec};
+pub use book::{AttemptRec, Corroboration, Escrow, ItemRec, ItemState, OutputRec};
 pub use types::{
     Assignment, Denial, EscrowBucket, IssueTo, ItemId, JobTerms, LedgerApiError, LedgerLimits,
     LedgerOp, LedgerOutcome, LineRef, OutputRef,
@@ -33,6 +33,8 @@ const DENIAL_LOG: usize = 256;
 pub struct LedgerService {
     ledger: Ledger,
     verifier: CredentialVerifier,
+    /// The deployment every signed statement must name (LEDGER-019).
+    domain: Domain,
     keys: KeyDirectory,
     limits: LedgerLimits,
     escrows: BTreeMap<u32, Escrow>,
@@ -40,6 +42,8 @@ pub struct LedgerService {
     pools: BTreeMap<u32, u32>,
     /// Ledger time, moved by the Clock service only (LEDGER-018).
     now: u64,
+    /// Accepted operations so far: the order of the ledger's records (CE-03).
+    seq: u64,
     /// Accepted requests per (role, operation).
     accepted: BTreeMap<(ServiceRole, &'static str), u64>,
     denials: Vec<Denial>,
@@ -52,12 +56,14 @@ impl LedgerService {
     pub fn new(verifier: CredentialVerifier, keys: KeyDirectory, limits: LedgerLimits) -> Self {
         LedgerService {
             ledger: Ledger::new(),
+            domain: verifier.domain(),
             verifier,
             keys,
             limits,
             escrows: BTreeMap::new(),
             pools: BTreeMap::new(),
             now: 0,
+            seq: 0,
             accepted: BTreeMap::new(),
             denials: Vec::new(),
             denied: 0,
@@ -79,6 +85,16 @@ impl LedgerService {
         &self.limits
     }
 
+    /// The deployment whose statements this ledger accepts.
+    pub fn domain(&self) -> Domain {
+        self.domain
+    }
+
+    /// Number of operations accepted so far.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Runs one operation for `caller`. Nothing is written unless every check passes and every
     /// entry of the operation succeeds: each operation checks first, writes its entries, and only
     /// then updates the job records, so rolling back the journal is enough.
@@ -95,6 +111,7 @@ impl LedgerService {
         let mark = self.ledger.mark();
         match self.run(op) {
             Ok(out) => {
+                self.seq += 1;
                 *self.accepted.entry((role, kind)).or_default() += 1;
                 Ok(out)
             }
@@ -254,8 +271,9 @@ impl LedgerService {
                 stage,
                 restored,
                 state,
+                segments,
                 signature,
-            } => self.lease_ready(job, attempt, stage, (restored, state), &signature),
+            } => self.lease_ready(job, attempt, stage, (restored, state, segments), &signature),
             LedgerOp::RecordRestore {
                 job,
                 attempt,
@@ -263,6 +281,7 @@ impl LedgerService {
                 segments,
                 signature,
             } => self.record_restore(job, attempt, producer, segments, &signature),
+            LedgerOp::RevokeAttempt { job, attempt } => self.revoke_attempt(job, attempt),
             LedgerOp::RecordReceipt {
                 job,
                 attempt,
@@ -333,7 +352,7 @@ mod tests {
             max_outputs: [0, 1, 0],
             max_budget: 50,
         };
-        let signature = owner.sign(&mandate_message(1, 1, 1, &terms));
+        let signature = owner.sign(&mandate_message(&s.domain(), 1, 1, 1, &terms));
         let open = LedgerOp::OpenEscrow {
             job: 1,
             owner: 1,

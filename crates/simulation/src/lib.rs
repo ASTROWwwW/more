@@ -8,8 +8,8 @@ pub mod world;
 pub use invariants::{check_fairness, check_state, check_step, Violation};
 pub use stats::Stats;
 pub use world::{
-    assignment_of, bring_up, catalog, corroborate, layout_of, mandate, op_strategy, restoration_of,
-    setup_commands, sim_config, state_commitment, user_key, Op, Sim, SimIdentity, BORROWERS,
-    CREDIT_POOL, FREE_POOL, JOBS, LENDERS, POOL_ADMIN, SEGMENTS, STRANGER, UNSET_CONFIG,
-    UNSET_STATE, UNSIGNED, WITNESS,
+    all_segments, assignment_of, bring_up, catalog, corroborate, layout_of, mandate, op_strategy,
+    readiness_of, restoration_of, segment_commitments, setup_commands, sim_config, sim_domain,
+    state_commitment, user_key, Op, Sim, SimIdentity, BORROWERS, CREDIT_POOL, FREE_POOL, JOBS,
+    LENDERS, POOL_ADMIN, SEGMENTS, STRANGER, UNSET_CONFIG, UNSET_STATE, UNSIGNED, WITNESS,
 };

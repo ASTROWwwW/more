@@ -170,7 +170,7 @@ fn r2_settlement_waits_for_every_item_and_is_final() {
         LedgerOp::FundRecovery {
             job: JOB,
             amount: 5,
-            signature: key(ADMIN).sign(&more_identity::relay_message(JOB, POOL, 5)),
+            signature: key(ADMIN).sign(&more_identity::relay_message(&dom(), JOB, POOL, 5)),
         },
         LedgerOp::ChargeOutput {
             job: JOB,
@@ -235,7 +235,7 @@ fn r2_only_a_lender_that_signed_its_lease_gets_a_line() {
         job: JOB,
         attempt: 1,
         stage: 0,
-        signature: key(L1).sign(&more_identity::lease_message(&other)),
+        signature: key(L1).sign(&more_identity::lease_message(&dom(), &other)),
     }));
     w.accept(&a, 0, L1).unwrap();
     w.accept(&a, 1, L2).unwrap();
@@ -433,7 +433,7 @@ fn r2_pool_relay_needs_the_admins_consent() {
         assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
     }
     assert_eq!(w.bal(Account::PoolReserve(POOL)), 1_000);
-    let consent = key(ADMIN).sign(&more_identity::relay_message(JOB, POOL, 30));
+    let consent = key(ADMIN).sign(&more_identity::relay_message(&dom(), JOB, POOL, 30));
     let relay = |amount| LedgerOp::FundRecovery {
         job: JOB,
         amount,
@@ -490,10 +490,11 @@ fn r2_recovery_is_settled_only_on_a_corroborated_restoration() {
         job: JOB,
         attempt: 2,
         producer: MALLORY,
-        segments: SEGMENTS,
-        signature: key(L2).sign(&more_identity::restore_message(&restoration(
-            &honest, 0, SEGMENTS, STATE,
-        ))),
+        segments: (0..SEGMENTS).collect(),
+        signature: key(L2).sign(&more_identity::restore_message(
+            &dom(),
+            &restoration(&honest, 0, SEGMENTS, STATE),
+        )),
     };
     bad_proof(w.run(replay));
     // The amount stays reserved, never paid; the only way out is back to the recovery escrow.
@@ -560,7 +561,15 @@ fn r2_a_replayed_receipt_never_pays_twice() {
     assert!(w.run(again).is_err());
     // The signature binds the attempt and the job: it does not verify anywhere else.
     w.place(&assignment(2, &[L1, L2], &[3, 1], 0));
-    let signature = key(L2).sign(&more_identity::receipt_message(JOB, 1, L1, WT, 1, 0));
+    let signature = key(L2).sign(&more_identity::receipt_message(
+        &dom(),
+        JOB,
+        1,
+        L1,
+        WT,
+        1,
+        0,
+    ));
     let replay = |job, attempt| LedgerOp::RecordReceipt {
         job,
         attempt,
@@ -586,9 +595,9 @@ fn r2_a_replayed_receipt_never_pays_twice() {
 }
 
 /// Verification 1: what the recipient signs is the restoration itself. Change the job, the
-/// attempt, the lender, the layer range, the positions, the number of segments or the
-/// commitment, and the signature no longer verifies; a corroboration covers the segments it
-/// names and no other recovery.
+/// attempt, the lender, the layer range, the positions, the state commitment, the segments
+/// named or the commitment of one of them, and the signature no longer verifies; a
+/// corroboration covers the segments it names and no other recovery.
 #[test]
 fn r2_a_corroboration_is_bound_to_what_was_restored() {
     let (mut w, _) = World::running();
@@ -598,27 +607,36 @@ fn r2_a_corroboration_is_bound_to_what_was_restored() {
     let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
     // The recipient (L2) signs something else than what the ledger holds for this stage.
     let altered = [
-        more_identity::Restoration { job: 9, ..good },
-        more_identity::Restoration { attempt: 1, ..good },
+        more_identity::Restoration {
+            job: 9,
+            ..good.clone()
+        },
+        more_identity::Restoration {
+            attempt: 1,
+            ..good.clone()
+        },
         more_identity::Restoration {
             producer: L2,
-            ..good
+            ..good.clone()
         },
         more_identity::Restoration {
             layers: (0, 4),
-            ..good
+            ..good.clone()
         },
         more_identity::Restoration {
             restored: [0, 5, 0],
-            ..good
+            ..good.clone()
         },
         more_identity::Restoration {
             state: STATE + 1,
-            ..good
+            ..good.clone()
         },
+        // One segment more, another segment, or another content for the same segment.
+        restoration(&a, 0, 3, STATE),
+        restoration_of(&a, 0, &[0, 2], STATE),
         more_identity::Restoration {
-            segments: 3,
-            ..good
+            segments: vec![(0, SEGS[0]), (1, SEGS[1] + 1)],
+            ..good.clone()
         },
     ];
     for r in altered {
@@ -627,8 +645,8 @@ fn r2_a_corroboration_is_bound_to_what_was_restored() {
             job: JOB,
             attempt: 2,
             producer: L1,
-            segments: 2,
-            signature: key(L2).sign(&more_identity::restore_message(&r)),
+            segments: vec![0, 1],
+            signature: key(L2).sign(&more_identity::restore_message(&dom(), &r)),
         };
         bad_proof(w.run(op));
     }
@@ -662,8 +680,8 @@ fn r2_a_corroboration_is_bound_to_what_was_restored() {
         job: JOB,
         attempt: 3,
         producer: L1,
-        segments: 2,
-        signature: key(L2).sign(&more_identity::restore_message(&good)),
+        segments: vec![0, 1],
+        signature: key(L2).sign(&more_identity::restore_message(&dom(), &good)),
     };
     bad_proof(w.run(replay));
     let _ = next;
@@ -688,7 +706,7 @@ fn r2_a_recorded_proof_cannot_be_replaced() {
     reserve_contribution(&mut w, 1, L1, 0, 0).unwrap();
     w.receipt(1, L1, 1, L2).unwrap();
     let receipt = |digest| {
-        let m = more_identity::receipt_message(JOB, 1, L1, WT, 1, digest);
+        let m = more_identity::receipt_message(&dom(), JOB, 1, L1, WT, 1, digest);
         LedgerOp::RecordReceipt {
             job: JOB,
             attempt: 1,
@@ -742,7 +760,8 @@ fn r2_a_recorded_proof_cannot_be_replaced() {
     assert!(w
         .corroborate_with(&restoration(&a, 0, 1, STATE), L2)
         .is_err());
-    assert_eq!(w.escrow().attempts[&2].corroborated[0], Some(1));
+    let kept = w.escrow().attempts[&2].corroborated[0].clone();
+    assert_eq!(kept.map(|c| c.segments), Some(vec![0]));
     // Nor can the lender sign a second, different readiness.
     assert!(w.ready(&a, 0, L1).is_err());
 }
@@ -788,12 +807,20 @@ fn r2_contests_follow_a_bounded_cycle() {
     window(w.run(release(L1)));
     w.advance(limits.reward_hold - 1);
     window(w.run(release(L1)));
-    // A later payment on the same line restarts the hold for the line.
+    // A later payment on the same line has its own window: it does not delay the first one and
+    // does not leave with it.
     pay(&mut w, L1, 1, 0);
     w.advance(1);
+    let one = LedgerOutcome::Released {
+        to_lender: 6,
+        commission: 0,
+    };
+    assert_eq!(w.run(release(L1)), Ok(one));
     window(w.run(release(L1)));
-    w.advance(limits.reward_hold - 1);
-    assert!(w.run(release(L1)).is_ok());
+    w.advance(limits.reward_hold - 2);
+    window(w.run(release(L1)));
+    w.advance(1);
+    assert_eq!(w.run(release(L1)), Ok(one));
     // Released is final: nothing left to contest or to release.
     assert!(w.run(contest(L1)).is_err());
     assert!(w.run(release(L1)).is_err());
@@ -814,4 +841,330 @@ fn r2_contests_follow_a_bounded_cycle() {
     window(w.run(contest(L2)));
     assert!(w.run(release(L2)).is_ok());
     assert!(limits.reward_hold < limits.contest_limit);
+}
+
+const DAY: u64 = 24 * HOUR;
+
+/// Job 1 with two outputs delivered. `L1` is paid for the first on day 0 and for the second on
+/// day 6, on the same line. Returns the world on day 6, just after the second payment.
+fn staggered() -> World {
+    let (mut w, _) = World::running();
+    for pos in 0..2 {
+        w.charge(1, pos).unwrap();
+        reserve_contribution(&mut w, 1, L1, pos, 0).unwrap();
+    }
+    w.receipt(1, L1, 2, L2).unwrap();
+    for pos in 0..2 {
+        w.run(LedgerOp::PayLine {
+            line: line(1, L1),
+            item: contribution(pos, 0),
+        })
+        .unwrap();
+        if pos == 0 {
+            w.advance(6 * DAY);
+        }
+    }
+    w
+}
+
+fn held(w: &World) -> i128 {
+    w.bal(line(1, L1).reward_account())
+}
+
+/// Third review, LEDGER-018. Two payments on the same line, six days apart. With one window per
+/// line, on day 7 the line could be neither contested (oldest payment + 7 days) nor released
+/// (latest payment + 48 h), and the second payment had one day of contest instead of its own
+/// window. Each payment now has its own cycle.
+#[test]
+fn r3_staggered_payments_each_have_their_own_window() {
+    let release = LedgerOp::ReleaseReward { line: line(1, L1) };
+    let contest = LedgerOp::ContestReward { line: line(1, L1) };
+    let first = Ok(LedgerOutcome::Released {
+        to_lender: 6,
+        commission: 0,
+    });
+    let second = Ok(LedgerOutcome::Contested {
+        to_pool: 0,
+        to_owner: 6,
+    });
+    let window = |r: Res| assert!(matches!(r, Err(LedgerApiError::OutOfWindow(_))), "{r:?}");
+
+    // Day 7, release first: the day-0 payment leaves, the day-6 payment stays held and is still
+    // contestable.
+    let mut w = staggered();
+    w.advance(DAY);
+    assert_eq!(w.run(release.clone()), first);
+    assert_eq!(held(&w), 6);
+    window(w.run(release.clone()));
+    assert_eq!(w.run(contest.clone()), second);
+    assert_eq!(held(&w), 0);
+
+    // Day 7, contest first: only the day-6 payment is taken back. The day-0 payment is past its
+    // limit: it stays held and can only be released.
+    let mut w = staggered();
+    w.advance(DAY);
+    assert_eq!(w.run(contest.clone()), second);
+    assert_eq!(held(&w), 6);
+    window(w.run(contest.clone()));
+    assert_eq!(w.run(release.clone()), first);
+    assert_eq!(held(&w), 0);
+    assert_eq!(w.bal(Account::User(L1)), 6);
+
+    // The day-6 payment is not releasable before day 8, and is from then on.
+    let mut w = staggered();
+    w.advance(2 * DAY - 1);
+    assert_eq!(w.run(release.clone()), first);
+    window(w.run(release.clone()));
+    w.advance(1);
+    assert_eq!(w.run(release.clone()), first);
+
+    // It stays contestable until day 13, not a second longer.
+    let mut w = staggered();
+    w.advance(7 * DAY - 1);
+    assert_eq!(w.run(contest.clone()), second);
+    let mut w = staggered();
+    w.advance(7 * DAY);
+    window(w.run(contest.clone()));
+    // Both payments released together: the commission is taken on what is released.
+    let both = LedgerOutcome::Released {
+        to_lender: 11,
+        commission: 1,
+    };
+    assert_eq!(w.run(release.clone()), Ok(both));
+
+    // At no hour from day 6 to day 14 is the line stuck: one of the two always applies.
+    let mut w = staggered();
+    for hour in 0..8 * 24 {
+        let orch = w.orch.clone();
+        let mut a = w.ledger.clone();
+        let mut b = w.ledger.clone();
+        let (r, c) = (
+            a.execute(&orch, release.clone()),
+            b.execute(&orch, contest.clone()),
+        );
+        assert!(
+            r.is_ok() || c.is_ok(),
+            "stuck at hour {hour}: {r:?} / {c:?}"
+        );
+        w.advance(HOUR);
+    }
+    let l = w.ledger.limits();
+    assert!(l.reward_hold <= l.contest_limit);
+}
+
+/// Third review: a corroboration pays the segments it names, one by one. It cannot name a
+/// segment the lender did not commit to, and the orchestrator cannot stretch it to another.
+#[test]
+fn r3_a_corroboration_pays_only_the_segments_it_names() {
+    let (mut w, _) = World::running();
+    w.fund(40).unwrap();
+    let a = resumed_uncorroborated(&mut w, 2, 40);
+    let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // The lender committed to segments 0, 1 and 2: there is no segment 3 to attest.
+    bad_proof(w.corroborate_with(&restoration_of(&a, 0, &[0, 3], STATE), L2));
+    // A segment is named once, in order.
+    for named in [[1, 1], [2, 0]] {
+        let r = restoration_of(&a, 0, &named, STATE);
+        assert!(w.corroborate_with(&r, L2).is_err(), "{named:?}");
+    }
+    // The recipient signed for segments 0 and 2. Announcing anything else with that signature
+    // is refused: the ledger rebuilds the statement from the announced list.
+    let signed = restoration_of(&a, 0, &[0, 2], STATE);
+    let signature = key(L2).sign(&more_identity::restore_message(&dom(), &signed));
+    for announced in [vec![0, 1, 2], vec![0, 1], vec![0], vec![2], vec![1]] {
+        bad_proof(w.run(LedgerOp::RecordRestore {
+            job: JOB,
+            attempt: 2,
+            producer: L1,
+            segments: announced,
+            signature,
+        }));
+    }
+    w.corroborate_with(&signed, L2).unwrap();
+    for segment in 0..3 {
+        reserve_recovery(&mut w, 2, L1, segment, 10).unwrap();
+    }
+    let pay = |w: &mut World, segment| {
+        w.run(LedgerOp::PayLine {
+            line: line(2, L1),
+            item: ItemId::Recovery {
+                attempt: 2,
+                segment,
+            },
+        })
+    };
+    assert!(pay(&mut w, 0).is_ok());
+    assert!(pay(&mut w, 2).is_ok());
+    // Segment 1 sits between two attested segments and is still not covered.
+    bad_proof(pay(&mut w, 1));
+    assert_eq!(w.bal(line(2, L1).reward_account()), 20);
+    // A lender that committed to no segment has nothing that can be corroborated.
+    let b = assignment(3, &[L1, L2], &[3, 1], 0);
+    w.place(&b);
+    let mut none = readiness(&b, 0);
+    none.segments.clear();
+    w.ready_with(0, &none, L1).unwrap();
+    bad_proof(w.corroborate_with(&restoration_of(&b, 0, &[0], STATE), L2));
+    // The orchestrator cannot announce other commitments than the ones the lender signed.
+    let signed = readiness(&b, 1);
+    let swapped = LedgerOp::LeaseReady {
+        job: JOB,
+        attempt: 3,
+        stage: 1,
+        restored: signed.restored,
+        state: signed.state,
+        segments: vec![SEGS[0], SEGS[1], SEGS[2] + 1],
+        signature: key(L2).sign(&more_identity::ready_message(&dom(), &signed)),
+    };
+    bad_proof(w.run(swapped));
+    // Nor can it commit to more segments than the limit.
+    let mut many = readiness(&b, 1);
+    many.segments = vec![1; w.ledger.limits().max_segments + 1];
+    let r = w.ready_with(1, &many, L2);
+    assert!(matches!(r, Err(LedgerApiError::LimitExceeded(_))), "{r:?}");
+}
+
+/// Third review, CE-03 at the ledger: a proof counts only if it was on record before the
+/// attempt's revocation. What was recorded before still pays; what comes after proves nothing,
+/// even honestly signed by the right account.
+#[test]
+fn r3_no_proof_is_added_after_the_revocation() {
+    let (mut w, _) = World::running();
+    w.fund(40).unwrap();
+    let a = resumed_uncorroborated(&mut w, 2, 40);
+    w.corroborate(&a, 0, L2).unwrap();
+    reserve_recovery(&mut w, 2, L1, 0, 10).unwrap();
+    reserve_recovery(&mut w, 2, L2, 1, 10).unwrap();
+    // Only the orchestrator records a revocation, once.
+    let revoke = LedgerOp::RevokeAttempt {
+        job: JOB,
+        attempt: 2,
+    };
+    let r = w.ledger.execute(&w.clock.clone(), revoke);
+    assert!(matches!(r, Err(LedgerApiError::Forbidden { .. })), "{r:?}");
+    w.revoke(2).unwrap();
+    assert!(w.revoke(2).is_err());
+    assert!(w.revoke(9).is_err());
+    // L2's restoration, attested by the witness after the revocation: refused, and it stays
+    // refused. Its recovery is never paid.
+    let late = w.corroborate(&a, 1, WIT);
+    assert!(matches!(late, Err(LedgerApiError::BadProof(_))), "{late:?}");
+    let pay = |w: &mut World, lender, segment| {
+        w.run(LedgerOp::PayLine {
+            line: line(2, lender),
+            item: ItemId::Recovery {
+                attempt: 2,
+                segment,
+            },
+        })
+    };
+    let unpaid = pay(&mut w, L2, 1);
+    assert!(
+        matches!(unpaid, Err(LedgerApiError::BadProof(_))),
+        "{unpaid:?}"
+    );
+    // L1's was on record before: the revocation does not undo it.
+    assert!(pay(&mut w, L1, 0).is_ok());
+    let rec = &w.escrow().attempts[&2];
+    let before = rec.corroborated[0].as_ref().map(|c| c.seq);
+    assert!(before < rec.revoked && before.is_some());
+    assert_eq!(rec.corroborated[1], None);
+    // No lease step is added to a revoked attempt either.
+    let b = assignment(3, &[L1, L2], &[3, 1], 0);
+    let register = LedgerOp::RegisterAttempt {
+        assignment: b.clone(),
+    };
+    w.run(register).unwrap();
+    w.accept(&b, 0, L1).unwrap();
+    w.revoke(3).unwrap();
+    assert!(w.accept(&b, 1, L2).is_err());
+    assert!(w.ready(&b, 0, L1).is_err());
+    let rec = &w.escrow().attempts[&3];
+    assert_eq!(
+        (&rec.accepted, &rec.ready),
+        (&vec![true, false], &vec![false; 2])
+    );
+}
+
+/// LEDGER-019: every statement is signed for one deployment. The same accounts signing the same
+/// business content for another deployment prove nothing here, for each kind of statement.
+#[test]
+fn r3_statements_signed_for_another_deployment_are_refused() {
+    use more_identity::{
+        lease_message, mandate_message, ready_message, receipt_message, relay_message,
+        restore_message, Domain, IdentityAuthority,
+    };
+    let other = IdentityAuthority::new([4; 32]).domain();
+    assert_ne!(other, dom());
+    let mut w = world();
+    assert_eq!(w.ledger.domain(), dom());
+    let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // Each statement is tried for the other deployment first, then for this one.
+    let t = terms(500);
+    let open = |d: &Domain| LedgerOp::OpenEscrow {
+        job: JOB,
+        owner: ALICE,
+        pool: POOL,
+        terms: t,
+        signature: key(ALICE).sign(&mandate_message(d, JOB, POOL, ALICE, &t)),
+    };
+    assert_eq!(w.run(open(&other)), Err(LedgerApiError::BadMandate));
+    w.run(open(&dom())).unwrap();
+    w.reserve(EscrowBucket::Work, 100).unwrap();
+    w.reserve(EscrowBucket::Recovery, 20).unwrap();
+    let relay = |d: &Domain| LedgerOp::FundRecovery {
+        job: JOB,
+        amount: 10,
+        signature: key(ADMIN).sign(&relay_message(d, JOB, POOL, 10)),
+    };
+    bad_proof(w.run(relay(&other)));
+    w.run(relay(&dom())).unwrap();
+    let a = assignment(1, &[L1, L2], &[3, 1], 10);
+    let register = LedgerOp::RegisterAttempt {
+        assignment: a.clone(),
+    };
+    w.run(register).unwrap();
+    for (stage, lender) in [(0, L1), (1, L2)] {
+        let accept = |d: &Domain| LedgerOp::AcceptLease {
+            job: JOB,
+            attempt: 1,
+            stage,
+            signature: key(lender).sign(&lease_message(d, &a)),
+        };
+        bad_proof(w.run(accept(&other)));
+        w.run(accept(&dom())).unwrap();
+        let r = readiness(&a, stage);
+        let ready = |d: &Domain| LedgerOp::LeaseReady {
+            job: JOB,
+            attempt: 1,
+            stage,
+            restored: r.restored,
+            state: r.state,
+            segments: r.segments.clone(),
+            signature: key(lender).sign(&ready_message(d, &r)),
+        };
+        bad_proof(w.run(ready(&other)));
+        w.run(ready(&dom())).unwrap();
+    }
+    let seen = restoration(&a, 0, SEGMENTS, STATE);
+    let restore = |d: &Domain| LedgerOp::RecordRestore {
+        job: JOB,
+        attempt: 1,
+        producer: L1,
+        segments: (0..SEGMENTS).collect(),
+        signature: key(L2).sign(&restore_message(d, &seen)),
+    };
+    bad_proof(w.run(restore(&other)));
+    w.run(restore(&dom())).unwrap();
+    let receipt = |d: &Domain| LedgerOp::RecordReceipt {
+        job: JOB,
+        attempt: 1,
+        producer: L1,
+        wt: WT,
+        upto: 1,
+        digest: 0,
+        signature: key(L2).sign(&receipt_message(d, JOB, 1, L1, WT, 1, 0)),
+    };
+    bad_proof(w.run(receipt(&other)));
+    w.run(receipt(&dom())).unwrap();
 }

@@ -21,7 +21,10 @@ impl Coordinator {
                 pool,
                 account,
                 rights,
-            } => self.registry.set_rights(*pool, *account, *rights),
+            } => {
+                let seq = self.seq;
+                self.registry.set_rights(*pool, *account, *rights, seq)
+            }
             JoinPool { pool, account } => self.registry.join(*pool, *account),
             RegisterModel { pool, model, spec } => {
                 self.registry.register_model(*pool, *model, *spec)
@@ -68,7 +71,7 @@ impl Coordinator {
                 lender,
                 segments,
                 signature,
-            } => self.corroborate_restore(*job, *attempt, *lender, *segments, signature),
+            } => self.corroborate_restore(*job, *attempt, *lender, segments, signature),
             LeaseLoaded {
                 job,
                 attempt,
@@ -128,8 +131,15 @@ impl Coordinator {
                 lender,
                 restored,
                 state,
+                segments,
                 signature,
-            } => self.attempt_ready(*job, *attempt, *lender, (*restored, *state), signature),
+            } => self.attempt_ready(
+                *job,
+                *attempt,
+                *lender,
+                (*restored, *state, segments),
+                signature,
+            ),
             Produce {
                 job,
                 attempt,

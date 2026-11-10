@@ -46,6 +46,7 @@ fn ready(l: AccountId) -> Command {
         lender: l,
         restored: [0; 3],
         state: UNSET_STATE,
+        segments: Vec::new(),
         signature: UNSIGNED,
     }
 }
@@ -56,7 +57,7 @@ fn clean(sim: &Sim) {
 }
 
 fn lease(sim: &Sim, k: usize) -> Lease {
-    sim.coord.jobs()[&J1].attempts[&1].leases[k]
+    sim.coord.jobs()[&J1].attempts[&1].leases[k].clone()
 }
 
 /// Finding 4: the attempt starts only when every lender has accepted, loaded and reported ready.
@@ -111,7 +112,7 @@ fn r2_lease_steps_are_ordered_personal_and_signed() {
     refused(&mut sim, &me(STRANGER), accept(STRANGER), "UNAUTHORIZED");
     // A lease signed with another key: the ledger refuses it, so does the coordinator.
     let a = sim.coord.jobs()[&J1].attempts[&1].clone();
-    let msg = more_identity::lease_message(&assignment_of(J1, &a));
+    let msg = more_identity::lease_message(&sim_domain(), &assignment_of(J1, &a));
     let forged = Command::AcceptLease {
         job: J1,
         attempt: 1,
@@ -136,7 +137,18 @@ fn r2_lease_steps_are_ordered_personal_and_signed() {
         lender: L[0],
         restored: [0; 3],
         state: 7,
-        signature: user_key(L[1]).sign(&more_identity::ready_message(J1.0, 1, L[0].0, [0; 3], 7)),
+        segments: Vec::new(),
+        signature: user_key(L[1]).sign(&more_identity::ready_message(
+            &sim_domain(),
+            &more_identity::Readiness {
+                job: J1.0,
+                attempt: 1,
+                lender: L[0].0,
+                restored: [0; 3],
+                state: 7,
+                segments: Vec::new(),
+            },
+        )),
     };
     refused(&mut sim, &me(L[0]), forged, "INADMISSIBLE_PROOF");
     // A repeated step changes nothing.
@@ -285,7 +297,8 @@ fn r2_an_uncommitted_claim_needs_the_recipients_receipt() {
         signature,
     };
     // Signed by the producer itself instead of its recipient (the witness).
-    let msg = more_identity::receipt_message(J1.0, 1, L[2].0, GEN.idx() as u8, 1, digest);
+    let msg =
+        more_identity::receipt_message(&sim_domain(), J1.0, 1, L[2].0, GEN.idx() as u8, 1, digest);
     assert_eq!(
         sim.exec(present(user_key(L[2]).sign(&msg))),
         Err(DomainError::InadmissibleProof)
@@ -317,7 +330,7 @@ fn r2_pool_relay_needs_its_admins_signature() {
     let mut e = Edge::running();
     let sim = &mut e.sim;
     let pool = sim.balance(Account::PoolReserve(CREDIT_POOL.0));
-    let msg = more_identity::relay_message(J1.0, CREDIT_POOL.0, 10);
+    let msg = more_identity::relay_message(&sim_domain(), J1.0, CREDIT_POOL.0, 10);
     let fund = |signature| Command::FundRecovery {
         job: J1,
         amount: 10,

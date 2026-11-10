@@ -152,6 +152,7 @@ fn unsigned_or_altered_messages_are_refused() {
     env.body = Message::CancelJob { job: J2 };
     assert_eq!(e.send_env(&env).map_err(|x| x.code()), Err("BAD_SIGNATURE"));
     let env = Envelope::signed(
+        sim_domain(),
         AccountId(4242),
         1,
         1,
@@ -161,6 +162,22 @@ fn unsigned_or_altered_messages_are_refused() {
     assert_eq!(
         e.send_env(&env).map_err(|x| x.code()),
         Err("UNKNOWN_ACCOUNT")
+    );
+    // LEDGER-019: a message signed by the right account for another deployment is refused before
+    // anything else; changing the field afterwards breaks the signature.
+    let other = more_identity::IdentityAuthority::new([9; 32]).domain();
+    let cancel = Message::CancelJob { job: J1 };
+    let borrower = user_key(BORROWERS[0]);
+    let elsewhere = Envelope::signed(other, BORROWERS[0], 1, 900, cancel.clone(), &borrower);
+    assert_eq!(
+        e.send_env(&elsewhere).map_err(|x| x.code()),
+        Err("WRONG_DEPLOYMENT")
+    );
+    let mut moved = elsewhere.clone();
+    moved.domain = sim_domain();
+    assert_eq!(
+        e.send_env(&moved).map_err(|x| x.code()),
+        Err("BAD_SIGNATURE")
     );
     assert_eq!(e.sim.coord.jobs()[&J1].exec, ExecStatus::Running);
 }

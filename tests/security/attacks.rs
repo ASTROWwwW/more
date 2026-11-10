@@ -142,7 +142,15 @@ fn receipt_commitments_come_from_the_recipient_only() {
         let Message::ReceiptCommit { digest, .. } = commit(e, producer, None) else {
             unreachable!()
         };
-        let msg = more_identity::receipt_message(J1.0, 1, producer.0, GEN.idx() as u8, 2, digest);
+        let msg = more_identity::receipt_message(
+            &sim_domain(),
+            J1.0,
+            1,
+            producer.0,
+            GEN.idx() as u8,
+            2,
+            digest,
+        );
         Message::ReceiptCommit {
             job: J1,
             attempt: 1,

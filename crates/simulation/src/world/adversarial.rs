@@ -548,13 +548,14 @@ impl Sim {
                 lender,
                 restored: j.delivered,
                 state: UNSET_STATE,
+                segments: Vec::new(),
                 signature: UNSIGNED,
             },
             4 => Command::AcceptLease {
                 job: id,
                 attempt,
                 lender,
-                signature: forged(lease_message(&assignment_of(id, a))),
+                signature: forged(lease_message(&sim_domain(), &assignment_of(id, a))),
             },
             _ => Command::AttemptReady {
                 job: id,
@@ -562,7 +563,18 @@ impl Sim {
                 lender,
                 restored: j.delivered,
                 state: 7,
-                signature: forged(ready_message(id.0, attempt, lender.0, j.delivered, 7)),
+                segments: Vec::new(),
+                signature: forged(ready_message(
+                    &sim_domain(),
+                    &Readiness {
+                        job: id.0,
+                        attempt,
+                        lender: lender.0,
+                        restored: j.delivered,
+                        state: 7,
+                        segments: Vec::new(),
+                    },
+                )),
             },
         }]
     }

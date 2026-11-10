@@ -112,7 +112,7 @@ fn issuance_limits_hold_near_u64_max() {
 fn escrow_needs_the_owners_signed_mandate() {
     let mut w = world();
     let t = terms(100);
-    let signature = key(ALICE).sign(&mandate_message(1, POOL, ALICE, &t));
+    let signature = key(ALICE).sign(&mandate_message(&dom(), 1, POOL, ALICE, &t));
     let open = |job, owner, terms, signature| LedgerOp::OpenEscrow {
         job,
         owner,

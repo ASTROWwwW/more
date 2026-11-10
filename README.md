@@ -30,7 +30,8 @@ The tests generate random command sequences: nodes going down, duplicated messag
 ```sh
 cargo test --release --workspace
 PROPTEST_CASES=5000 cargo test --release --workspace   # more random traces
-python3 scripts/mutation.py                            # several hours; --check only verifies the anchors
+python3 scripts/mutation.py                            # several hours; --check only verifies the anchors,
+                                                       # --shard=K/N splits the table over N machines
 ```
 
 Requires Rust 1.88 or newer.

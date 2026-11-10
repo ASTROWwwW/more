@@ -146,7 +146,7 @@ impl Coordinator {
         job: JobId,
         attempt: u32,
         lender: AccountId,
-        (restored, commitment): (PerType<u32>, u64),
+        (restored, commitment, segments): (PerType<u32>, u64, &[u64]),
         signature: &[u8; 64],
     ) -> R<Outcome> {
         let stage = self.placing_stage(job, attempt, lender)?;
@@ -163,18 +163,23 @@ impl Coordinator {
                 "JOB-T05: state not restored to last delivered position",
             ));
         }
+        if segments.len() > self.ledger.limits().max_segments {
+            return Err(DomainError::InvalidInput("too many recovery segments"));
+        }
         self.ledger_proof(LedgerOp::LeaseReady {
             job: job_acct(job),
             attempt,
             stage: stage as u32,
             restored,
             state: commitment,
+            segments: segments.to_vec(),
             signature: *signature,
         })?;
         self.advance_lease(job, attempt, stage, LeaseState::Loaded, LeaseState::Ready)?;
         self.attempt_mut(job, attempt)?.leases[stage].restored = Some(Restored {
             positions: restored,
             state: commitment,
+            segments: segments.to_vec(),
         });
         self.audit.push(AuditEvent::Lease {
             job,
@@ -208,14 +213,19 @@ impl Coordinator {
     }
 
     /// JOB-R18: the recipient of `lender`'s output attests that it received `lender`'s restored
-    /// state. Without it, `lender`'s recovery work is never paid automatically. The statement is
-    /// about the past: it is accepted after a revocation, until the job is settled.
+    /// state, naming each recovery segment it received. Without it, `lender`'s recovery work is
+    /// never paid, and a segment it does not name is never paid either.
+    ///
+    /// CE-03: the corroboration counts only if it is recorded before the revocation, by the
+    /// log's order and not by anyone's word. So it is refused once the attempt is revoked, once
+    /// the producer's or the recipient's own lease has expired, and once either lost in the pool
+    /// the right its place in the attempt relies on.
     pub(super) fn corroborate_restore(
         &mut self,
         job: JobId,
         attempt: u32,
         lender: AccountId,
-        segments: u32,
+        segments: &[u32],
         signature: &[u8; 64],
     ) -> R<Outcome> {
         let j = self.job(job)?;
@@ -226,16 +236,16 @@ impl Coordinator {
         let stage = a
             .stage_of(lender)
             .ok_or(DomainError::Precondition("lender not in attempt"))?;
-        let lease = a.leases[stage];
-        if lease.state != LeaseState::Ready {
+        let lease = &a.leases[stage];
+        let Some(restored) = lease.restored.as_ref() else {
             return Err(DomainError::Precondition(
                 "JOB-R18: nothing restored to corroborate",
             ));
-        }
+        };
         // The first corroboration is final: the same one again changes nothing, another one is
         // refused, so a proof a payment relied on cannot be replaced.
-        match lease.corroborated {
-            Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),
+        match &lease.corroborated {
+            Some(c) if c.segments == segments => return Ok(Outcome::AlreadyApplied),
             Some(_) => {
                 return Err(DomainError::Precondition(
                     "JOB-R18: restoration already corroborated",
@@ -243,22 +253,54 @@ impl Coordinator {
             }
             None => {}
         }
-        if segments == 0 {
-            return Err(DomainError::InvalidInput("no segment corroborated"));
+        if segments.is_empty() || !segments.windows(2).all(|w| w[0] < w[1]) {
+            return Err(DomainError::InvalidInput(
+                "segments named once each, in increasing order",
+            ));
+        }
+        if a.revoked_seq.is_some() {
+            return Err(DomainError::InadmissibleProof);
+        }
+        let last = stage + 1 == a.lenders.len();
+        let recipient_expiry = match a.leases.get(stage + 1) {
+            Some(next) => next.expires_at,
+            None => a.witness_expires_at,
+        };
+        if self.now >= lease.expires_at || self.now >= recipient_expiry {
+            return Err(DomainError::LeaseExpired);
+        }
+        let recipient = a
+            .recipient_of(stage)
+            .ok_or_else(|| DomainError::Internal("stage without a recipient".into()))?;
+        let lost = |who, witness| {
+            self.registry
+                .right_lost_since(j.pool, who, witness, a.placed_seq)
+        };
+        if lost(lender, false) || lost(recipient, last) {
+            return Err(DomainError::InadmissibleProof);
+        }
+        // A segment the lender did not commit to in its readiness cannot be attested.
+        let known = |k: &u32| usize::try_from(*k).is_ok_and(|i| i < restored.segments.len());
+        if !segments.iter().all(known) {
+            return Err(DomainError::InadmissibleProof);
         }
         self.ledger_proof(LedgerOp::RecordRestore {
             job: job_acct(job),
             attempt,
             producer: lender.0,
-            segments,
+            segments: segments.to_vec(),
             signature: *signature,
         })?;
-        self.attempt_mut(job, attempt)?.leases[stage].corroborated = Some(segments);
+        let seq = self.seq;
+        self.attempt_mut(job, attempt)?.leases[stage].corroborated = Some(Corroboration {
+            segments: segments.to_vec(),
+            seq,
+        });
         self.audit.push(AuditEvent::RestoreCorroborated {
             job,
             attempt,
             lender,
-            segments,
+            segments: segments.to_vec(),
         });
         Ok(Outcome::Applied)
     }
@@ -284,11 +326,11 @@ impl Coordinator {
         let stage = a
             .stage_of(lender)
             .ok_or(DomainError::Precondition("lender not in attempt"))?;
-        let lease = a.leases[stage];
-        if now >= lease.expires_at {
+        let expires_at = a.leases[stage].expires_at;
+        if now >= expires_at {
             return Err(DomainError::LeaseExpired);
         }
-        if lease.expires_at == now + ttl {
+        if expires_at == now + ttl {
             return Ok(Outcome::AlreadyApplied);
         }
         self.attempt_mut(job, attempt)?.leases[stage].expires_at = now + ttl;

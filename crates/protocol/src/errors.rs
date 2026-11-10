@@ -6,6 +6,8 @@ use more_identity::AuthError;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtoError {
     UnsupportedVersion,
+    /// Message signed for another deployment.
+    WrongDeployment,
     FrameTooLarge,
     /// Signature missing, malformed or not made by the sender's registered key.
     Unauthenticated(AuthError),
@@ -21,6 +23,7 @@ impl ProtoError {
     pub fn code(&self) -> &'static str {
         match self {
             ProtoError::UnsupportedVersion => "UNSUPPORTED_VERSION",
+            ProtoError::WrongDeployment => "WRONG_DEPLOYMENT",
             ProtoError::FrameTooLarge => "FRAME_TOO_LARGE",
             ProtoError::Unauthenticated(e) => e.code(),
             ProtoError::Replay => "REPLAY",

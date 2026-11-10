@@ -85,15 +85,15 @@ fn r2_an_accomplice_cannot_collect_recovery_without_corroboration() {
         J1,
         &sim.coord.jobs()[&J1].attempts[&2],
         accomplice,
-        SEGMENTS,
+        &all_segments(),
     )
     .expect("the accomplice reported ready");
     let vouch = Command::CorroborateRestore {
         job: J1,
         attempt: 2,
         lender: accomplice,
-        segments: SEGMENTS,
-        signature: user_key(accomplice).sign(&more_identity::restore_message(&said)),
+        segments: all_segments(),
+        signature: user_key(accomplice).sign(&more_identity::restore_message(&sim_domain(), &said)),
     };
     for ctx in [
         more_identity::assume_account(accomplice.0),
@@ -169,15 +169,31 @@ fn r2_an_honest_restoration_is_paid_even_if_no_output_follows() {
     assert_eq!(sim.balance(Account::User(L[0].0)), EARMARK as i128);
 }
 
-/// A corroboration that comes after the item was held lets a ruling pay it; without one the
-/// same ruling is refused (see above).
+/// Time passes on a healthy cluster: every node keeps renewing its own lease.
+fn wait_alive(sim: &mut Sim, total: u64) {
+    let step = sim.coord.config().lease_ttl - 1;
+    let mut left = total;
+    while left > 0 {
+        let dt = left.min(step);
+        sim.exec(Command::Tick { dt }).unwrap();
+        for cmd in sim.renew_all(J1) {
+            sim.exec(cmd).unwrap();
+        }
+        left -= dt;
+    }
+}
+
+/// A corroboration that comes after the item was held, on an attempt that is still alive, lets
+/// a ruling pay it; without one the same ruling is refused (see above). After the third review
+/// the cluster has to be kept alive for this: a corroboration recorded after the revocation or
+/// on an expired lease no longer counts (see the `r3_` tests below).
 #[test]
 fn r2_a_late_corroboration_lets_a_ruling_pay() {
     let mut sim = resumed();
     claim_recovery(&mut sim, L[0]);
     sim.exec(Command::CloseSlice { slice: SLICE }).unwrap();
     let deadline = sim.coord.config().evaluation_deadline;
-    sim.exec(Command::Tick { dt: deadline }).unwrap();
+    wait_alive(&mut sim, deadline);
     sim.exec(Command::Evaluate { slice: SLICE }).unwrap();
     assert_eq!(line(&sim, L[0]).disputed, EARMARK);
     sim.exec(corroborate(J1, 2, &L[..1]).remove(0)).unwrap();
@@ -294,7 +310,8 @@ fn r2_a_replayed_receipt_pays_once() {
         sim.exec(cmd).unwrap();
     }
     let digest = sim.coord.receipt_digest(J1, 1, L[2], GEN, 1);
-    let msg = more_identity::receipt_message(J1.0, 1, L[2].0, GEN.idx() as u8, 1, digest);
+    let msg =
+        more_identity::receipt_message(&sim_domain(), J1.0, 1, L[2].0, GEN.idx() as u8, 1, digest);
     let signature = user_key(WITNESS).sign(&msg);
     let present = |attempt| Command::PresentReceipt {
         job: J1,
@@ -509,4 +526,254 @@ fn r2_a_fault_during_a_partial_settlement_then_restart_and_reconciliation() {
     };
     assert_eq!(balances(&sim), balances(&reference));
     assert!(sim.ledger().check_invariants().is_empty());
+}
+
+/// What the ledger holds about attempt 2 of job 1.
+fn ledger_attempt(sim: &Sim) -> gpu_ledger::AttemptRec {
+    let escrows = sim
+        .coord
+        .ledger_service()
+        .audit_escrows(&sim.ids.auditor)
+        .unwrap();
+    escrows[&J1.0].attempts[&2].clone()
+}
+
+fn claim(sim: &mut Sim, lender: AccountId, segment: u32, amount: Amount) {
+    sim.exec(Command::Claim {
+        slice: SLICE,
+        lender,
+        items: vec![ClaimItem::Recovery {
+            segment,
+            amount,
+            evidence: Evidence::Committed,
+        }],
+    })
+    .unwrap();
+}
+
+/// The slice is closed and evaluated once its claims had their evaluation deadline.
+fn close_and_evaluate(sim: &mut Sim) {
+    if sim.coord.slices()[&SLICE].status == SliceStatus::Draining {
+        let drain = sim.coord.config().drain_window;
+        sim.exec(Command::Tick { dt: drain }).unwrap();
+    }
+    sim.exec(Command::CloseSlice { slice: SLICE }).unwrap();
+    let deadline = sim.coord.config().evaluation_deadline;
+    sim.exec(Command::Tick { dt: deadline }).unwrap();
+    sim.exec(Command::Evaluate { slice: SLICE }).unwrap();
+}
+
+/// Third review. The lender signed its restoration, then its node is revoked before its
+/// recipient corroborates. The recipient's statement, honestly signed, comes after the
+/// revocation in the log: it proves nothing (CE-03), on the coordinator and on the ledger, and
+/// the recovery is never paid.
+#[test]
+fn r3_a_corroboration_after_the_lender_is_revoked_proves_nothing() {
+    let mut sim = resumed();
+    // L1's restoration is attested by L2 while the attempt is alive.
+    sim.exec(corroborate(J1, 2, &L[1..2]).remove(0)).unwrap();
+    claim(&mut sim, L[0], 0, 2);
+    claim(&mut sim, L[1], 1, 2);
+    sim.exec(Command::NodeLost {
+        job: J1,
+        expected_version: None,
+    })
+    .unwrap();
+    let vouch = corroborate(J1, 2, &L[..1]).remove(0);
+    let denied = |sim: &Sim| {
+        let ledger = sim.coord.ledger_service();
+        ledger.audit_denials(&sim.ids.auditor).unwrap().1
+    };
+    let asked = denied(&sim);
+    assert_eq!(sim.exec(vouch.clone()), Err(DomainError::InadmissibleProof));
+    assert_eq!(denied(&sim), asked, "refused on the coordinator's own log");
+    // The ledger closed the attempt's proofs at the revocation: L1's corroboration is on record
+    // before it, L0's is not on record at all.
+    let rec = ledger_attempt(&sim);
+    let before = rec.corroborated[1].as_ref().map(|c| c.seq);
+    assert!(before.is_some() && before < rec.revoked);
+    assert_eq!(rec.corroborated[0], None);
+    let a = sim.coord.jobs()[&J1].attempts[&2].clone();
+    assert!(a.leases[1].corroborated.as_ref().map(|c| c.seq) < a.revoked_seq);
+    // Evaluation pays what was corroborated in time and holds the rest; a ruling cannot pay it,
+    // and the late statement stays refused.
+    close_and_evaluate(&mut sim);
+    assert_eq!(line(&sim, L[1]).paid, 2);
+    assert_eq!(line(&sim, L[0]).disputed, 2);
+    let ruling = Command::Arbitrate {
+        slice: SLICE,
+        lender: L[0],
+        pay: true,
+    };
+    assert_eq!(sim.exec(ruling), Err(DomainError::InadmissibleProof));
+    assert_eq!(sim.exec(vouch), Err(DomainError::InadmissibleProof));
+    sim.drain();
+    clean(&sim);
+    assert_eq!(sim.balance(Account::User(L[0].0)), 0);
+    assert_eq!(sim.balance(Account::User(L[1].0)), 2);
+}
+
+/// Third review, the recipient's side. L1 goes silent after the restorations were signed: its
+/// own lease runs out while the others keep renewing. What L1 would attest for L0, and what L2
+/// would attest for L1, is refused on the recorded expiry, before reconciliation even notices.
+/// L2's restoration, attested by the witness while both are alive, counts. Once the attempt is
+/// revoked for the expired node, the refusal is final.
+#[test]
+fn r3_a_corroboration_after_the_recipient_lease_expired_proves_nothing() {
+    let mut sim = resumed();
+    let ttl = sim.coord.config().lease_ttl;
+    sim.exec(Command::Tick { dt: ttl - 1 }).unwrap();
+    for cmd in sim.renew_all(J1) {
+        let silent = matches!(cmd, Command::Heartbeat { lender, .. } if lender == L[1]);
+        if !silent {
+            sim.exec(cmd).unwrap();
+        }
+    }
+    sim.exec(Command::Tick { dt: 1 }).unwrap();
+    let vouch = |k: usize| corroborate(J1, 2, &L[k..=k]).remove(0);
+    // L1 is the recipient of L0 and the producer attested by L2.
+    assert_eq!(sim.exec(vouch(0)), Err(DomainError::LeaseExpired));
+    assert_eq!(sim.exec(vouch(1)), Err(DomainError::LeaseExpired));
+    sim.exec(vouch(2)).unwrap();
+    claim(&mut sim, L[0], 0, 2);
+    claim(&mut sim, L[2], 1, 2);
+    // Reconciliation revokes the attempt for the expired node.
+    sim.exec(Command::Reconcile).unwrap();
+    let a = sim.coord.jobs()[&J1].attempts[&2].clone();
+    assert!(a.revoked_seq.is_some());
+    assert_eq!(sim.exec(vouch(0)), Err(DomainError::InadmissibleProof));
+    assert_eq!(sim.exec(vouch(1)), Err(DomainError::InadmissibleProof));
+    close_and_evaluate(&mut sim);
+    assert_eq!(line(&sim, L[2]).paid, 2);
+    assert_eq!(line(&sim, L[0]).disputed, 2);
+    sim.drain();
+    clean(&sim);
+    assert_eq!(sim.balance(Account::User(L[0].0)), 0);
+    assert_eq!(sim.balance(Account::User(L[2].0)), 2);
+}
+
+/// Third review, the witness as recipient. The witness stops renewing: what it would attest for
+/// the last stage is refused, while the lenders' corroborations of each other still count.
+#[test]
+fn r3_a_corroboration_by_an_expired_witness_proves_nothing() {
+    let mut sim = resumed();
+    let ttl = sim.coord.config().lease_ttl;
+    sim.exec(Command::Tick { dt: ttl - 1 }).unwrap();
+    for cmd in sim.renew_all(J1) {
+        if !matches!(cmd, Command::WitnessHeartbeat { .. }) {
+            sim.exec(cmd).unwrap();
+        }
+    }
+    sim.exec(Command::Tick { dt: 1 }).unwrap();
+    let vouch = |k: usize| corroborate(J1, 2, &L[k..=k]).remove(0);
+    assert_eq!(sim.exec(vouch(2)), Err(DomainError::LeaseExpired));
+    sim.exec(vouch(0)).unwrap();
+    sim.exec(vouch(1)).unwrap();
+    assert_eq!(ledger_attempt(&sim).corroborated[2], None);
+    sim.drain();
+    clean(&sim);
+}
+
+/// Third review, rights. The pool's admin withdraws a right between the restoration signature
+/// and the corroboration: the lender's right to lend, or the witness's right to witness. The
+/// corroboration is refused on the recorded withdrawal, and granting the right again later does
+/// not make it admissible. A lender that lost nothing is not affected.
+#[test]
+fn r3_a_right_withdrawn_before_the_corroboration_voids_it() {
+    let mut sim = resumed();
+    let rights_of = |sim: &Sim, who| {
+        let pool = sim.coord.registry().pool(CREDIT_POOL).unwrap();
+        pool.rights(who)
+    };
+    let set = |account, rights| Command::SetRights {
+        pool: CREDIT_POOL,
+        account,
+        rights,
+    };
+    let vouch = |k: usize| corroborate(J1, 2, &L[k..=k]).remove(0);
+    // L0 may lend and witness. Losing the right to witness, which its stage does not rely on,
+    // changes nothing (tried on a copy).
+    let had = rights_of(&sim, L[0]);
+    assert!(had.lend && had.witness);
+    let lend_only = Rights {
+        witness: false,
+        ..had
+    };
+    sim.exec(set(L[0], lend_only)).unwrap();
+    assert_eq!(sim.try_on_copy(&vouch(0)), Ok(Outcome::Applied));
+    // Losing the right to lend does, and getting it back does not undo it.
+    sim.exec(set(L[0], Rights::NONE)).unwrap();
+    assert_eq!(sim.exec(vouch(0)), Err(DomainError::InadmissibleProof));
+    sim.exec(set(L[0], had)).unwrap();
+    assert_eq!(sim.exec(vouch(0)), Err(DomainError::InadmissibleProof));
+    // L1 and its recipient L2 lost nothing: that corroboration counts.
+    sim.exec(vouch(1)).unwrap();
+    // The witness, recipient of the last stage, loses its right to witness.
+    let had = rights_of(&sim, WITNESS);
+    assert!(had.witness);
+    sim.exec(set(WITNESS, Rights::NONE)).unwrap();
+    assert_eq!(sim.exec(vouch(2)), Err(DomainError::InadmissibleProof));
+    sim.exec(set(WITNESS, had)).unwrap();
+    assert_eq!(sim.exec(vouch(2)), Err(DomainError::InadmissibleProof));
+    let rec = ledger_attempt(&sim);
+    assert_eq!((&rec.corroborated[0], &rec.corroborated[2]), (&None, &None));
+    assert!(rec.corroborated[1].is_some());
+    // Only L1's recovery is ever paid.
+    for (k, segment) in [(0, 0), (1, 1), (2, 2)] {
+        claim(&mut sim, L[k], segment, 1);
+    }
+    wait_alive(&mut sim, 1);
+    sim.exec(Command::CloseSlice { slice: SLICE }).unwrap();
+    let deadline = sim.coord.config().evaluation_deadline;
+    sim.exec(Command::Tick { dt: deadline }).unwrap();
+    sim.exec(Command::Evaluate { slice: SLICE }).unwrap();
+    assert_eq!(line(&sim, L[1]).paid, 1);
+    assert_eq!(line(&sim, L[0]).disputed + line(&sim, L[2]).disputed, 2);
+    sim.drain();
+    clean(&sim);
+    assert_eq!(sim.balance(Account::User(L[0].0)), 0);
+    assert_eq!(sim.balance(Account::User(L[1].0)), 1);
+    assert_eq!(sim.balance(Account::User(L[2].0)), 0);
+}
+
+/// LEDGER-019 through the coordinator: a lender's readiness and a recipient's corroboration
+/// signed for another deployment are refused, with the same keys and the same content.
+#[test]
+fn r3_statements_for_another_deployment_are_refused_by_the_coordinator() {
+    let other = more_identity::IdentityAuthority::new([9; 32]).domain();
+    assert_ne!(other, sim_domain());
+    let mut sim = Sim::default();
+    sim.exec(Command::Reserve { job: J1 }).unwrap();
+    place(&mut sim, 0);
+    let mut cmds = bring_up(J1, 1, &L, [0; 3]);
+    let ready = cmds.split_off(cmds.len() - L.len());
+    for cmd in cmds {
+        sim.exec(cmd).unwrap();
+    }
+    for (cmd, l) in ready.into_iter().zip(L) {
+        let r = readiness_of(J1, 1, l, [0; 3]);
+        let elsewhere = Command::AttemptReady {
+            job: J1,
+            attempt: 1,
+            lender: l,
+            restored: r.restored,
+            state: r.state,
+            segments: r.segments.clone(),
+            signature: user_key(l).sign(&more_identity::ready_message(&other, &r)),
+        };
+        assert_eq!(sim.exec(elsewhere), Err(DomainError::InadmissibleProof));
+        sim.exec(cmd).unwrap();
+    }
+    let a = sim.coord.jobs()[&J1].attempts[&1].clone();
+    let said = restoration_of(J1, &a, L[0], &all_segments()).unwrap();
+    let elsewhere = Command::CorroborateRestore {
+        job: J1,
+        attempt: 1,
+        lender: L[0],
+        segments: all_segments(),
+        signature: user_key(L[1]).sign(&more_identity::restore_message(&other, &said)),
+    };
+    assert_eq!(sim.exec(elsewhere), Err(DomainError::InadmissibleProof));
+    sim.exec(corroborate(J1, 1, &L[..1]).remove(0)).unwrap();
+    clean(&sim);
 }

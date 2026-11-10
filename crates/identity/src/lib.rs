@@ -18,7 +18,7 @@ mod statements;
 
 pub use statements::{
     lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
-    Assignment, JobTerms, Restoration,
+    Assignment, Domain, JobTerms, Readiness, Restoration,
 };
 
 /// Account number, as used by the ledger and the domain (`AccountId.0`).
@@ -147,6 +147,11 @@ impl IdentityAuthority {
         set.insert(id);
     }
 
+    /// This deployment's identifier in signed statements (LEDGER-019).
+    pub fn domain(&self) -> Domain {
+        Domain(self.key.verifying_key().to_bytes())
+    }
+
     /// Verifier handed to the services that must check credentials (Ledger, coordinator). It holds
     /// the authority's public key only, so it cannot mint.
     pub fn verifier(&self) -> CredentialVerifier {
@@ -171,6 +176,11 @@ pub struct CredentialVerifier {
 }
 
 impl CredentialVerifier {
+    /// The deployment this verifier belongs to: statements signed for another one are void here.
+    pub fn domain(&self) -> Domain {
+        Domain(self.authority.to_bytes())
+    }
+
     pub fn verify(&self, cred: &ServiceCredential) -> Result<ServiceRole, AuthError> {
         let key = (cred.id.0, cred.role as u8, cred.tag);
         let known = self
@@ -398,6 +408,17 @@ mod tests {
             auth.verifier().verify(&cred),
             Err(AuthError::InvalidCredential)
         );
+    }
+
+    #[test]
+    fn domain_is_the_authority_and_nothing_else() {
+        let (a, b) = (
+            IdentityAuthority::new([7; 32]),
+            IdentityAuthority::new([8; 32]),
+        );
+        assert_eq!(a.domain(), a.verifier().domain());
+        assert_eq!(a.domain(), IdentityAuthority::new([7; 32]).domain());
+        assert_ne!(a.domain(), b.domain());
     }
 
     #[test]

@@ -58,19 +58,37 @@ jobs:
           name: coverage
           path: target/coverage/
 
-  heavy:
-    name: Reference run and mutation campaign
+  reference:
+    name: Reference run (5,000 traces per generator)
     if: github.event_name == 'workflow_dispatch' && inputs.heavy
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: PROPTEST_CASES=5000 cargo test --release --workspace
-      - run: python3 scripts/mutation.py | tee mutation.log
       - uses: actions/upload-artifact@v4
         with:
-          name: heavy-run
-          path: |
-            mutation.log
-            target/coverage/
+          name: reference-run
+          path: target/coverage/
+
+  mutation:
+    name: Mutation campaign (shard ${{ matrix.shard }} of 4)
+    if: github.event_name == 'workflow_dispatch' && inputs.heavy
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `shell: bash` turns pipefail on: a missed mutant fails the job despite `tee`.
+      - shell: bash
+        run: python3 scripts/mutation.py --shard=${{ matrix.shard }}/4 | tee mutation-${{ matrix.shard }}.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-${{ matrix.shard }}
+          path: mutation-${{ matrix.shard }}.log

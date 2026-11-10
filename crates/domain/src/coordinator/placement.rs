@@ -93,6 +93,7 @@ impl Coordinator {
                 recovery_earmark: recovery_estimate,
             },
         })?;
+        let seq = self.seq;
         let j = self.job_mut(job)?;
         j.recovery_unearmarked = unearmarked;
         j.attempt = no;
@@ -111,6 +112,7 @@ impl Coordinator {
                 lenders: lenders.to_vec(),
                 layout: layout.to_vec(),
                 issued_at: now,
+                placed_seq: seq,
                 witness,
                 leases: vec![lease; lenders.len()],
                 witness_expires_at: now + ttl,

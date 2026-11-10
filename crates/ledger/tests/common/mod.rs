@@ -5,7 +5,8 @@
 use gpu_ledger::*;
 use more_identity::{
     lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
-    IdentityAuthority, KeyDirectory, Restoration, ServiceCredential, ServiceRole, UserKey,
+    Domain, IdentityAuthority, KeyDirectory, Readiness, Restoration, ServiceCredential,
+    ServiceRole, UserKey,
 };
 
 pub const ALICE: u32 = 1;
@@ -23,8 +24,17 @@ pub const JOB: u32 = 1;
 pub const WT: u8 = 1;
 /// Commitment an honest lender signs for its restored state in these tests.
 pub const STATE: u64 = 0xabc;
-/// Recovery segments an honest recipient attests by default.
+/// Commitments an honest lender signs for its recovery segments 0, 1 and 2.
+pub const SEGS: [u64; 3] = [0xa0, 0xa1, 0xa2];
+/// Recovery segments an honest recipient attests by default: all of them.
 pub const SEGMENTS: u32 = 3;
+/// Seed of the identity authority of the tests' deployment.
+pub const AUTHORITY: [u8; 32] = [3; 32];
+
+/// The deployment every honest account signs for.
+pub fn dom() -> Domain {
+    IdentityAuthority::new(AUTHORITY).domain()
+}
 pub const HOUR: u64 = 3600;
 
 pub type Res = Result<LedgerOutcome, LedgerApiError>;
@@ -55,7 +65,7 @@ pub struct World {
 }
 
 pub fn world() -> World {
-    let mut auth = IdentityAuthority::new([3; 32]);
+    let mut auth = IdentityAuthority::new(AUTHORITY);
     let keys = KeyDirectory::new();
     for a in [ALICE, BOB, L1, L2, WIT, MALLORY, ADMIN] {
         keys.register(a, key(a).public()).unwrap();
@@ -93,18 +103,38 @@ pub fn world() -> World {
     }
 }
 
-/// What the recipient of `stage` attests about its lender's restoration.
+/// What the recipient of `stage` attests about its lender's restoration: segments `0..segments`
+/// with the commitments an honest lender signed.
 pub fn restoration(a: &Assignment, stage: u32, segments: u32, state: u64) -> Restoration {
+    let named: Vec<u32> = (0..segments).collect();
+    restoration_of(a, stage, &named, state)
+}
+
+/// Same, for exactly the segments named.
+pub fn restoration_of(a: &Assignment, stage: u32, segments: &[u32], state: u64) -> Restoration {
     let s = stage as usize;
     let start: u32 = a.layout[..s].iter().sum();
+    let commitment = |k: &u32| SEGS.get(*k as usize).copied().unwrap_or(0);
     Restoration {
         job: a.job,
         attempt: a.attempt,
         producer: a.lenders[s],
         layers: (start, start + a.layout[s]),
         restored: [0; 3],
-        segments,
         state,
+        segments: segments.iter().map(|k| (*k, commitment(k))).collect(),
+    }
+}
+
+/// What the lender of `stage` signs when it reports ready.
+pub fn readiness(a: &Assignment, stage: u32) -> Readiness {
+    Readiness {
+        job: a.job,
+        attempt: a.attempt,
+        lender: a.lenders[stage as usize],
+        restored: [0; 3],
+        state: STATE,
+        segments: SEGS.to_vec(),
     }
 }
 
@@ -153,7 +183,7 @@ impl World {
 
     pub fn open(&mut self, job: u32, max: Amount) -> Res {
         let t = terms(max);
-        let signature = key(ALICE).sign(&mandate_message(job, POOL, ALICE, &t));
+        let signature = key(ALICE).sign(&mandate_message(&dom(), job, POOL, ALICE, &t));
         self.run(LedgerOp::OpenEscrow {
             job,
             owner: ALICE,
@@ -189,7 +219,7 @@ impl World {
         self.run(LedgerOp::FundRecovery {
             job: JOB,
             amount,
-            signature: key(signer).sign(&relay_message(JOB, POOL, total)),
+            signature: key(signer).sign(&relay_message(&dom(), JOB, POOL, total)),
         })
     }
 
@@ -210,21 +240,29 @@ impl World {
             job: a.job,
             attempt: a.attempt,
             stage,
-            signature: key(signer).sign(&lease_message(a)),
+            signature: key(signer).sign(&lease_message(&dom(), a)),
         })
     }
 
     pub fn ready(&mut self, a: &Assignment, stage: u32, signer: u32) -> Res {
-        let lender = a.lenders[stage as usize];
-        let m = ready_message(a.job, a.attempt, lender, [0; 3], STATE);
+        self.ready_with(stage, &readiness(a, stage), signer)
+    }
+
+    /// `signer` signs exactly `r` for `stage`.
+    pub fn ready_with(&mut self, stage: u32, r: &Readiness, signer: u32) -> Res {
         self.run(LedgerOp::LeaseReady {
-            job: a.job,
-            attempt: a.attempt,
+            job: r.job,
+            attempt: r.attempt,
             stage,
-            restored: [0; 3],
-            state: STATE,
-            signature: key(signer).sign(&m),
+            restored: r.restored,
+            state: r.state,
+            segments: r.segments.clone(),
+            signature: key(signer).sign(&ready_message(&dom(), r)),
         })
+    }
+
+    pub fn revoke(&mut self, attempt: u32) -> Res {
+        self.run(LedgerOp::RevokeAttempt { job: JOB, attempt })
     }
 
     /// `signer` attests that it received the restored state of the lender of `stage`.
@@ -232,14 +270,14 @@ impl World {
         self.corroborate_with(&restoration(a, stage, SEGMENTS, STATE), signer)
     }
 
-    /// `signer` signs exactly `r`; the ledger is told `r.segments` and rebuilds the rest.
+    /// `signer` signs exactly `r`; the ledger is told which segments and rebuilds the rest.
     pub fn corroborate_with(&mut self, r: &Restoration, signer: u32) -> Res {
         self.run(LedgerOp::RecordRestore {
             job: r.job,
             attempt: r.attempt,
             producer: r.producer,
-            segments: r.segments,
-            signature: key(signer).sign(&restore_message(r)),
+            segments: r.segments.iter().map(|(k, _)| *k).collect(),
+            signature: key(signer).sign(&restore_message(&dom(), r)),
         })
     }
 
@@ -253,7 +291,7 @@ impl World {
 
     /// `signer` signs a receipt for `producer`'s outputs `0..upto`.
     pub fn receipt(&mut self, attempt: u32, producer: u32, upto: u32, signer: u32) -> Res {
-        let m = receipt_message(JOB, attempt, producer, WT, upto, 0);
+        let m = receipt_message(&dom(), JOB, attempt, producer, WT, upto, 0);
         self.run(LedgerOp::RecordReceipt {
             job: JOB,
             attempt,

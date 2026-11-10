@@ -65,6 +65,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             attempt,
             restored,
             state,
+            segments,
             signature,
         } => Command::AttemptReady {
             job: *job,
@@ -72,6 +73,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             lender: sender,
             restored: *restored,
             state: *state,
+            segments: segments.clone(),
             signature: *signature,
         },
         M::AssignAccept {
@@ -104,7 +106,7 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             job: *job,
             attempt: *attempt,
             lender: *producer,
-            segments: *segments,
+            segments: segments.clone(),
             signature: *signature,
         },
         M::WitnessHeartbeat { job, attempt } => Command::WitnessHeartbeat {
@@ -266,6 +268,9 @@ pub fn handle(
 ) -> Answer {
     if env.version != PROTOCOL_VERSION {
         return Err(ProtoError::UnsupportedVersion);
+    }
+    if env.domain != coord.domain() {
+        return Err(ProtoError::WrongDeployment);
     }
     let verified = keys
         .verify(env.sender.0, &env.signing_bytes(), &env.signature)

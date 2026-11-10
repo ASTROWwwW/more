@@ -132,6 +132,16 @@ impl Coordinator {
                 "reward window shorter than the ledger's hold",
             ));
         }
+        // LEDGER-018: with a contest limit below the hold, a payment could be stuck.
+        ledger
+            .limits()
+            .validate()
+            .map_err(DomainError::InvalidInput)?;
+        if verifier.domain() != ledger.domain() {
+            return Err(DomainError::InvalidInput(
+                "ledger and coordinator of different deployments",
+            ));
+        }
         Ok(Coordinator {
             cfg,
             now: 0,
@@ -179,6 +189,11 @@ impl Coordinator {
     /// Coordinator clock (JOB-R09).
     pub fn now(&self) -> Time {
         self.now
+    }
+
+    /// The deployment this coordinator serves: the one its credential verifier belongs to.
+    pub fn domain(&self) -> more_identity::Domain {
+        self.verifier.domain()
     }
 
     /// Position of the last applied command in the log (CE-03).
@@ -443,14 +458,20 @@ impl Coordinator {
         let now = self.now;
         let seq = self.seq;
         let drain = self.cfg.drain_window;
-        let j = self.job_mut(job)?;
+        let j = self.job(job)?;
         let attempt = j.attempt;
-        let Some(a) = j.attempts.get_mut(&attempt) else {
-            return Ok(());
-        };
-        if a.revoked_at.is_some() {
+        if j.attempts
+            .get(&attempt)
+            .is_none_or(|a| a.revoked_at.is_some())
+        {
             return Ok(());
         }
+        // CE-03: the ledger closes the attempt's set of proofs at the same point of the log.
+        self.ledger_op(LedgerOp::RevokeAttempt {
+            job: job_acct(job),
+            attempt,
+        })?;
+        let a = self.attempt_mut(job, attempt)?;
         a.revoked_at = Some(now);
         a.revoked_seq = Some(seq);
         let nodes = a.expired_nodes(now);

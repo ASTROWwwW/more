@@ -63,6 +63,27 @@ impl Coordinator {
         }
     }
 
+    /// Paid items of the line whose reward is still held and whose own payment time passes
+    /// `open`: their indexes, their total and the pool's share of it (LEDGER-018).
+    fn held_items(
+        &self,
+        slice: SliceId,
+        lender: AccountId,
+        open: impl Fn(Time) -> bool,
+    ) -> R<(Vec<usize>, Amount, Amount)> {
+        let (mut idxs, mut total, mut pool) = (Vec::new(), 0, 0);
+        let line = self.slices.get(&slice).and_then(|s| s.lines.get(&lender));
+        for (k, i) in line.iter().flat_map(|l| l.items.iter().enumerate()) {
+            let held = i.status == ItemStatus::Paid && !i.reward_done && i.amount > 0;
+            if held && i.paid_at.is_some_and(&open) {
+                idxs.push(k);
+                total = add(total, i.amount, "held items")?;
+                pool = add(pool, i.pool_part, "pool part")?;
+            }
+        }
+        Ok((idxs, total, pool))
+    }
+
     pub(super) fn release_reward(&mut self, slice: SliceId, lender: AccountId) -> R<Outcome> {
         let s = self
             .slices
@@ -74,9 +95,15 @@ impl Coordinator {
         if self.now < final_at + self.cfg.reward_window {
             return Err(DomainError::Precondition("JOB-R22: contest window open"));
         }
-        let held = s.lines.get(&lender).map_or(0, |l| l.held);
-        if held == 0 {
+        if s.lines.get(&lender).map_or(0, |l| l.held) == 0 {
             return Err(DomainError::Precondition("nothing held"));
+        }
+        // LEDGER-018: each payment has had its own window, counted from that payment.
+        let (now, hold) = (self.now, self.ledger.limits().reward_hold);
+        let due = |paid_at: Time| paid_at.checked_add(hold).is_some_and(|t| now >= t);
+        let (idxs, amount, _) = self.held_items(slice, lender, due)?;
+        if idxs.is_empty() {
+            return Err(DomainError::Precondition("JOB-R22: contest window open"));
         }
         let LedgerOutcome::Released {
             to_lender,
@@ -87,11 +114,16 @@ impl Coordinator {
         else {
             return Err(DomainError::Internal("release outcome".into()));
         };
+        if to_lender.checked_add(commission) != Some(amount) {
+            return Err(DomainError::Internal(format!(
+                "release: ledger {to_lender} + {commission}, coordinator {amount}"
+            )));
+        }
         let l = self.line_mut(slice, lender)?;
-        l.held = 0;
-        l.released = add(l.released, held, "released")?;
-        for it in l.items.iter_mut().filter(|i| i.status == ItemStatus::Paid) {
-            it.reward_done = true;
+        l.held = sub(l.held, amount, "held")?;
+        l.released = add(l.released, amount, "released")?;
+        for k in idxs {
+            l.items[k].reward_done = true;
         }
         self.audit.push(AuditEvent::RewardReleased {
             slice,
@@ -114,35 +146,25 @@ impl Coordinator {
                 return Err(DomainError::Precondition("JOB-R22: contest window closed"));
             }
         }
-        let held = s.lines.get(&lender).map_or(0, |l| l.held);
-        if held == 0 {
+        if s.lines.get(&lender).map_or(0, |l| l.held) == 0 {
             return Err(DomainError::Precondition("nothing held"));
         }
-        // LEDGER-018: a contest is bounded even if the slice is not final yet. Past the ledger's
-        // limit, counted from the oldest payment still held, the reward can only be released.
-        let oldest = s.lines[&lender]
-            .items
-            .iter()
-            .filter(|i| i.status == ItemStatus::Paid && !i.reward_done)
-            .filter_map(|i| i.paid_at)
-            .min();
-        let limit = self.ledger.limits().contest_limit;
-        if oldest.is_some_and(|t| self.now >= t + limit) {
+        // LEDGER-018: a contest is bounded payment by payment, even if the slice is not final
+        // yet. It takes back the payments still inside their own limit; one past it stays held
+        // and can only be released. CE-02: each payer gets its own share back (the pool for the
+        // recovery it funded).
+        let (now, limit) = (self.now, self.ledger.limits().contest_limit);
+        let open = |paid_at: Time| paid_at.checked_add(limit).is_none_or(|t| now < t);
+        let (idxs, amount, to_pool) = self.held_items(slice, lender, open)?;
+        if idxs.is_empty() {
             return Err(DomainError::Precondition("JOB-R22: contest limit reached"));
         }
-        // CE-02: each payer gets its own share back (the pool for the recovery it funded).
-        let to_pool = s.lines[&lender]
-            .items
-            .iter()
-            .filter(|i| i.status == ItemStatus::Paid && !i.reward_done)
-            .try_fold(0u64, |acc, i| acc.checked_add(i.pool_part))
-            .ok_or(DomainError::Overflow("pool part"))?;
         let out = self.ledger_op(LedgerOp::ContestReward {
             line: line_ref(slice, lender),
         })?;
         let expected = LedgerOutcome::Contested {
             to_pool,
-            to_owner: sub(held, to_pool, "contest")?,
+            to_owner: sub(amount, to_pool, "contest")?,
         };
         if out != expected {
             return Err(DomainError::Internal(format!(
@@ -152,15 +174,15 @@ impl Coordinator {
         let j = self.job_mut(slice.job)?;
         j.recovery_contested_pool = add(j.recovery_contested_pool, to_pool, "contested pool")?;
         let l = self.line_mut(slice, lender)?;
-        l.held = 0;
-        l.contested = add(l.contested, held, "contested")?;
-        for it in l.items.iter_mut().filter(|i| i.status == ItemStatus::Paid) {
-            it.reward_done = true;
+        l.held = sub(l.held, amount, "held")?;
+        l.contested = add(l.contested, amount, "contested")?;
+        for k in idxs {
+            l.items[k].reward_done = true;
         }
         self.audit.push(AuditEvent::RewardContested {
             slice,
             lender,
-            amount: held,
+            amount,
         });
         Ok(Outcome::Applied)
     }

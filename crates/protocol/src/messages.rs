@@ -46,6 +46,8 @@ pub enum Message {
         restored: PerType<u32>,
         /// Commitment to the restored state.
         state: u64,
+        /// Commitment to each recovery segment recomputed, by segment number.
+        segments: Vec<u64>,
         signature: [u8; 64],
     },
     AssignReject {
@@ -154,12 +156,12 @@ pub enum Message {
         attempt: u32,
     },
     /// The sender received `producer`'s restored state: `signature` over `restore_message`
-    /// (JOB-R18). The sender is the producer's recipient.
+    /// (JOB-R18). The sender is the producer's recipient; `segments` names each segment received.
     RestoreCorroboration {
         job: JobId,
         attempt: u32,
         producer: AccountId,
-        segments: u32,
+        segments: Vec<u32>,
         signature: [u8; 64],
     },
     /// The sender presents a receipt for its own output, signed by its recipient (JOB-R12).
@@ -293,12 +295,15 @@ impl Message {
                 attempt,
                 restored,
                 state,
+                segments,
                 signature,
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
                 restored.iter().for_each(|r| w.u32(*r));
                 w.u64(*state);
+                w.len(segments.len());
+                segments.iter().for_each(|c| w.u64(*c));
                 w.bytes(signature);
             }
             M::AssignAccept {
@@ -320,7 +325,8 @@ impl Message {
                 w.u32(job.0);
                 w.u32(*attempt);
                 w.u32(producer.0);
-                w.u32(*segments);
+                w.len(segments.len());
+                segments.iter().for_each(|k| w.u32(*k));
                 w.bytes(signature);
             }
             M::LayersLoaded {
@@ -486,6 +492,10 @@ impl Writer<'_> {
     }
     fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    /// Length prefix of a list.
+    fn len(&mut self, n: usize) {
+        self.u32(u32::try_from(n).unwrap_or(u32::MAX));
     }
     fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());

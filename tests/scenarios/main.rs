@@ -22,6 +22,7 @@ fn ready_cmd(job: JobId, attempt: u32, lender: AccountId, restored: PerType<u32>
         lender,
         restored,
         state: UNSET_STATE,
+        segments: Vec::new(),
         signature: UNSIGNED,
     }
 }

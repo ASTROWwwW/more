@@ -52,7 +52,7 @@ impl LedgerService {
         if terms.layers == 0 {
             return Err(LedgerApiError::Invalid("model without layers"));
         }
-        let msg = mandate_message(job, pool, owner, &terms);
+        let msg = mandate_message(&self.domain, job, pool, owner, &terms);
         self.keys
             .verify(owner, &msg, signature)
             .map_err(|_| LedgerApiError::BadMandate)?;
@@ -112,7 +112,11 @@ impl LedgerService {
             .get(&pool)
             .ok_or(LedgerApiError::BadProof("pool without a registered admin"))?;
         self.keys
-            .verify(admin, &relay_message(job, pool, funded), signature)
+            .verify(
+                admin,
+                &relay_message(&self.domain, job, pool, funded),
+                signature,
+            )
             .map_err(|_| LedgerApiError::BadProof("relay not signed by the pool's admin"))?;
         self.ledger.transfer(
             format!("fund/{job}/{funded}"),

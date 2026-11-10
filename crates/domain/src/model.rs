@@ -98,23 +98,32 @@ pub enum LeaseState {
 }
 
 /// One node's lease: its own state and its own expiry (JOB-R39). Only its holder renews it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub state: LeaseState,
     pub expires_at: Time,
     /// What the lender signed it restored, once `Ready` (JOB-T05).
     pub restored: Option<Restored>,
-    /// The recipient of this stage's output signed that it received that restored state, and
-    /// how many recovery segments of it: the restoration is attested by a second account
-    /// (JOB-R18). Written once.
-    pub corroborated: Option<u32>,
+    /// What the recipient of this stage's output signed it received of that restored state: the
+    /// restoration is attested by a second account (JOB-R18). Written once.
+    pub corroborated: Option<Corroboration>,
 }
 
-/// A lender's restored state: the positions it resumed from and its commitment to that state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A lender's restored state: the positions it resumed from, its commitment to that state and
+/// its commitment to each recovery segment it recomputed (index = segment).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Restored {
     pub positions: PerType<u32>,
     pub state: u64,
+    pub segments: Vec<u64>,
+}
+
+/// A recipient's corroboration: the segments it names, and its position in the coordinator log.
+/// It counts only if that position comes before the attempt's revocation (CE-03).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corroboration {
+    pub segments: Vec<u32>,
+    pub seq: u64,
 }
 
 /// An attempt: fixed cluster, leases, production counters.
@@ -126,6 +135,8 @@ pub struct Attempt {
     /// Layers per stage, chosen by the scheduler; covers the model exactly.
     pub layout: Vec<u32>,
     pub issued_at: Time,
+    /// Position of the placement in the coordinator log (CE-03).
+    pub placed_seq: u64,
     /// Assigned delivery witness (JOB-R26), independent of lenders and borrower; the only one
     /// allowed to attest delivery.
     pub witness: AccountId,

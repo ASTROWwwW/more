@@ -46,15 +46,35 @@ pub struct AttemptRec {
     pub restored: Vec<[u32; 3]>,
     /// Per stage: the commitment to the restored state the lender signed.
     pub state: Vec<u64>,
-    /// Per stage: the stage's recipient signed that it received that restored state, and how
-    /// many recovery segments of it (JOB-R18). Written once.
-    pub corroborated: Vec<Option<u32>>,
+    /// Per stage: the commitment the lender signed for each recovery segment, by segment number.
+    pub segments: Vec<Vec<u64>>,
+    /// Per stage: what the stage's recipient signed it received (JOB-R18). Written once.
+    pub corroborated: Vec<Option<Corroboration>>,
+    /// Position of the revocation in the ledger's order of records. Proofs are only added to an
+    /// attempt before it (CE-03).
+    pub revoked: Option<u64>,
     /// Recovery reserved in lines for this attempt, paid or not (refunds give it back).
     pub recovery_reserved: Amount,
     pub earmark_returned: bool,
 }
 
+/// A recipient's corroboration as recorded: the segments it names, and when it was recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corroboration {
+    pub segments: Vec<u32>,
+    /// Position in the ledger's order of records.
+    pub seq: u64,
+}
+
 impl AttemptRec {
+    /// The recipient of `stage` corroborated `segment` explicitly.
+    pub fn corroborates(&self, stage: usize, segment: u32) -> bool {
+        self.corroborated
+            .get(stage)
+            .and_then(|c| c.as_ref())
+            .is_some_and(|c| c.segments.contains(&segment))
+    }
+
     pub fn stage_of(&self, lender: u32) -> Option<usize> {
         self.assignment.lenders.iter().position(|l| *l == lender)
     }

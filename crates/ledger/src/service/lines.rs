@@ -3,7 +3,7 @@
 //! The orchestrator proposes; the Ledger checks against what it holds signed: a line is only
 //! reserved for a lender who signed the attempt, a contribution is only paid with a receipt signed
 //! by the stage's recipient, recovery only on a restoration its recipient corroborated, and a
-//! held reward leaves only through its contest cycle.
+//! held reward leaves only through its own contest cycle, payment by payment.
 
 use super::book::{ItemRec, ItemState};
 use super::types::{ItemId, LedgerApiError, LedgerOutcome, LineRef, OutputRef};
@@ -159,12 +159,12 @@ impl LedgerService {
             }
             ItemId::Recovery { attempt, segment } => {
                 // JOB-R18: settled only on a restoration its recipient corroborated, and only for
-                // the segments that corroboration covers.
+                // the segments that corroboration names.
                 let rec = e.attempts.get(&attempt).ok_or(invalid("unknown attempt"))?;
                 let s = rec
                     .stage_of(line.lender)
                     .ok_or(proof("lender not in the attempt"))?;
-                if !rec.corroborated[s].is_some_and(|n| segment < n) {
+                if !rec.corroborates(s, segment) {
                     return Err(proof("recovery without a corroborated restoration"));
                 }
                 let left = e
@@ -248,41 +248,47 @@ impl LedgerService {
         Ok(LedgerOutcome::Moved(it.amount))
     }
 
-    /// Held rewards of `line`, with the pool's share and the times of the oldest and the latest
-    /// payment still held. Works after settlement: a held reward always ends in a user, pool or
-    /// commission account.
-    fn held(&self, line: LineRef) -> ApiResult<(Amount, Amount, (u64, u64))> {
+    /// Paid items of `line` whose reward is still held and whose own payment time passes `open`:
+    /// the items, their total and the pool's share of it. Works after settlement: a held reward
+    /// always ends in a user, pool or commission account.
+    fn held_items(
+        &self,
+        line: LineRef,
+        open: impl Fn(u64) -> bool,
+        closed: &'static str,
+    ) -> ApiResult<(Vec<ItemId>, Amount, Amount)> {
         let e = self.escrow(line.job)?;
-        let held = self.ledger.available(line.reward_account());
-        if held == 0 {
+        let mut held = e
+            .items
+            .iter()
+            .filter(|(_, i)| i.line == line && i.state == ItemState::Paid && !i.rewarded)
+            .peekable();
+        if held.peek().is_none() {
             return Err(invalid("nothing held"));
         }
-        let pool = e
-            .items
-            .values()
-            .filter(|i| i.line == line && i.state == ItemState::Paid && !i.rewarded)
-            .try_fold(0u64, |acc, i| acc.checked_add(i.pool_part))
-            .ok_or(invalid("pool part"))?;
-        if pool > held {
-            return Err(invalid("pool share above the held reward"));
+        let (mut ids, mut total, mut pool) = (Vec::new(), 0u64, 0u64);
+        for (id, i) in held {
+            let paid_at = i.paid_at.ok_or(invalid("held reward without a payment"))?;
+            if !open(paid_at) {
+                continue;
+            }
+            ids.push(*id);
+            total = total.checked_add(i.amount).ok_or(invalid("held total"))?;
+            pool = pool.checked_add(i.pool_part).ok_or(invalid("pool part"))?;
         }
-        let times = || {
-            e.items
-                .values()
-                .filter(|i| i.line == line && i.state == ItemState::Paid && !i.rewarded)
-                .filter_map(|i| i.paid_at)
-        };
-        let window = times()
-            .min()
-            .zip(times().max())
-            .ok_or(invalid("held reward without a payment"))?;
-        Ok((held, pool, window))
+        if ids.is_empty() {
+            return Err(LedgerApiError::OutOfWindow(closed));
+        }
+        if pool > total || total > self.ledger.available(line.reward_account()) {
+            return Err(invalid("held items above the held reward"));
+        }
+        Ok((ids, total, pool))
     }
 
-    fn mark_rewarded(&mut self, line: LineRef) {
-        if let Some(e) = self.escrows.get_mut(&line.job) {
-            for i in e.items.values_mut() {
-                if i.line == line && i.state == ItemState::Paid {
+    fn mark_rewarded(&mut self, job: u32, ids: &[ItemId]) {
+        if let Some(e) = self.escrows.get_mut(&job) {
+            for id in ids {
+                if let Some(i) = e.items.get_mut(id) {
                     i.rewarded = true;
                 }
             }
@@ -290,15 +296,12 @@ impl LedgerService {
     }
 
     /// JOB-R22, LEDGER-018: a payment becomes final only after the borrower had its contest
-    /// window, counted by the ledger's own clock from the latest payment still held.
+    /// window on that payment, counted by the ledger's own clock from the payment itself. Items
+    /// paid later on the same line stay held until their own window has passed.
     pub(super) fn release_reward(&mut self, line: LineRef) -> ApiResult {
-        let (held, _, (_, latest)) = self.held(line)?;
-        let open_until = latest
-            .checked_add(self.limits.reward_hold)
-            .ok_or(invalid("contest window overflow"))?;
-        if self.now < open_until {
-            return Err(LedgerApiError::OutOfWindow("contest window still open"));
-        }
+        let (now, hold) = (self.now, self.limits.reward_hold);
+        let due = |paid_at: u64| paid_at.checked_add(hold).is_some_and(|t| now >= t);
+        let (ids, held, _) = self.held_items(line, due, "contest window still open")?;
         let commission =
             u64::try_from(u128::from(held) * u128::from(self.limits.commission_bps) / 10_000)
                 .map_err(|_| invalid("commission"))?;
@@ -325,7 +328,7 @@ impl LedgerService {
             held - to_lender,
             "JOB-R22 commission",
         )?;
-        self.mark_rewarded(line);
+        self.mark_rewarded(line.job, &ids);
         Ok(LedgerOutcome::Released {
             to_lender,
             commission: held - to_lender,
@@ -333,16 +336,12 @@ impl LedgerService {
     }
 
     /// CE-02: each payer gets its own share back; the pool's share is what the Ledger recorded.
-    /// LEDGER-018: a contest is bounded in time. Past the limit, counted from the oldest payment
-    /// still held, the reward can only be released.
+    /// LEDGER-018: a contest is bounded in time, payment by payment. It takes back the items
+    /// still inside their own limit; an item past it can only be released.
     pub(super) fn contest_reward(&mut self, line: LineRef) -> ApiResult {
-        let (held, to_pool, (oldest, _)) = self.held(line)?;
-        let limit = oldest
-            .checked_add(self.limits.contest_limit)
-            .ok_or(invalid("contest limit overflow"))?;
-        if self.now >= limit {
-            return Err(LedgerApiError::OutOfWindow("contest limit reached"));
-        }
+        let (now, limit) = (self.now, self.limits.contest_limit);
+        let open = |paid_at: u64| paid_at.checked_add(limit).is_none_or(|t| now < t);
+        let (ids, held, to_pool) = self.held_items(line, open, "contest limit reached")?;
         let e = self.escrow(line.job)?;
         let (owner, pool) = (e.owner, e.pool);
         let n = self.ledger.entries().len();
@@ -365,7 +364,7 @@ impl LedgerService {
             held - to_pool,
             "JOB-R22 contest",
         )?;
-        self.mark_rewarded(line);
+        self.mark_rewarded(line.job, &ids);
         Ok(LedgerOutcome::Contested {
             to_pool,
             to_owner: held - to_pool,

@@ -94,7 +94,13 @@ pub fn mandate(
         max_outputs: outputs,
         max_budget,
     };
-    user_key(borrower).sign(&mandate_message(job.0, pool.0, borrower.0, &terms))
+    user_key(borrower).sign(&mandate_message(
+        &sim_domain(),
+        job.0,
+        pool.0,
+        borrower.0,
+        &terms,
+    ))
 }
 
 /// JOB-R38: every lender of the attempt accepts its lease, loads its layers and reports its state
@@ -127,6 +133,7 @@ pub fn bring_up(
             lender: *l,
             restored,
             state: UNSET_STATE,
+            segments: Vec::new(),
             signature: UNSIGNED,
         });
     }
@@ -141,7 +148,7 @@ pub fn corroborate(job: JobId, attempt: u32, lenders: &[AccountId]) -> Vec<Comma
             job,
             attempt,
             lender: *l,
-            segments: SEGMENTS,
+            segments: all_segments(),
             signature: UNSIGNED,
         })
         .collect()

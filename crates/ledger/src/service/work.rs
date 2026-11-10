@@ -4,10 +4,11 @@
 use std::collections::BTreeSet;
 
 use more_identity::{
-    lease_message, ready_message, receipt_message, restore_message, Assignment, Restoration,
+    lease_message, ready_message, receipt_message, restore_message, Assignment, Readiness,
+    Restoration,
 };
 
-use super::book::AttemptRec;
+use super::book::{AttemptRec, Corroboration};
 use super::types::{LedgerApiError, LedgerOutcome};
 use super::{ApiResult, LedgerService};
 
@@ -25,6 +26,18 @@ impl LedgerService {
             .attempts
             .get(&attempt)
             .ok_or(invalid("unknown attempt"))
+    }
+
+    /// CE-03: once the revocation is on record, the attempt's set of proofs is closed. A lease
+    /// step or a corroboration that comes after it proves nothing, whoever signed it.
+    pub(super) fn revoke_attempt(&mut self, job: u32, attempt: u32) -> ApiResult {
+        let seq = self.seq;
+        let rec = self.attempt_mut(job, attempt)?;
+        if rec.revoked.is_some() {
+            return Err(invalid("attempt already revoked"));
+        }
+        rec.revoked = Some(seq);
+        Ok(LedgerOutcome::Done)
     }
 
     pub(super) fn attempt_mut(&mut self, job: u32, attempt: u32) -> ApiResult<&mut AttemptRec> {
@@ -73,7 +86,9 @@ impl LedgerService {
             ready: vec![false; n],
             restored: vec![[0; 3]; n],
             state: vec![0; n],
+            segments: vec![Vec::new(); n],
             corroborated: vec![None; n],
+            revoked: None,
             recovery_reserved: 0,
             earmark_returned: false,
         };
@@ -103,11 +118,15 @@ impl LedgerService {
     ) -> ApiResult {
         let rec = self.attempt(job, attempt)?;
         let (s, lender) = Self::stage_lender(rec, stage)?;
-        if rec.accepted[s] {
-            return Err(invalid("lease already accepted"));
+        if rec.accepted[s] || rec.revoked.is_some() {
+            return Err(invalid("lease already accepted, or attempt revoked"));
         }
         self.keys
-            .verify(lender, &lease_message(&rec.assignment), signature)
+            .verify(
+                lender,
+                &lease_message(&self.domain, &rec.assignment),
+                signature,
+            )
             .map_err(|_| proof("lease not signed by the stage's lender"))?;
         self.attempt_mut(job, attempt)?.accepted[s] = true;
         Ok(LedgerOutcome::Done)
@@ -118,7 +137,7 @@ impl LedgerService {
         job: u32,
         attempt: u32,
         stage: u32,
-        (restored, state): ([u32; 3], u64),
+        (restored, state, segments): ([u32; 3], u64, Vec<u64>),
         signature: &[u8; 64],
     ) -> ApiResult {
         let rec = self.attempt(job, attempt)?;
@@ -126,56 +145,89 @@ impl LedgerService {
         if !rec.accepted[s] || rec.ready[s] {
             return Err(invalid("ready without an accepted lease, or twice"));
         }
+        if rec.revoked.is_some() {
+            return Err(invalid("attempt revoked"));
+        }
+        if segments.len() > self.limits.max_segments {
+            return Err(LedgerApiError::LimitExceeded("too many recovery segments"));
+        }
+        let signed = Readiness {
+            job,
+            attempt,
+            lender,
+            restored,
+            state,
+            segments,
+        };
         self.keys
-            .verify(
-                lender,
-                &ready_message(job, attempt, lender, restored, state),
-                signature,
-            )
+            .verify(lender, &ready_message(&self.domain, &signed), signature)
             .map_err(|_| proof("readiness not signed by the stage's lender"))?;
         let rec = self.attempt_mut(job, attempt)?;
         rec.ready[s] = true;
         rec.restored[s] = restored;
         rec.state[s] = state;
+        rec.segments[s] = signed.segments;
         Ok(LedgerOutcome::Done)
     }
 
     /// JOB-R18: a lender's word that it restored its state is not enough to be paid for it. The
     /// account that receives its output must sign what it received: the stage and its layers,
-    /// the positions, the number of recovery segments and the commitment the lender signed. The
-    /// first corroboration of a stage is final; another one, identical or not, is refused.
+    /// the positions, the state commitment, and each recovery segment by number with the
+    /// commitment the lender signed for it. A segment it does not name is not covered. The first
+    /// corroboration of a stage is final; another one, identical or not, is refused. It must be
+    /// on record before the attempt's revocation (CE-03).
     pub(super) fn record_restore(
         &mut self,
         job: u32,
         attempt: u32,
         producer: u32,
-        segments: u32,
+        segments: Vec<u32>,
         signature: &[u8; 64],
     ) -> ApiResult {
         let rec = self.attempt(job, attempt)?;
         let s = rec
             .stage_of(producer)
             .ok_or(invalid("producer not in attempt"))?;
-        if !rec.ready[s] || rec.corroborated[s].is_some() || segments == 0 {
+        if !rec.ready[s] || rec.corroborated[s].is_some() || segments.is_empty() {
             return Err(invalid(
                 "restoration not signed by its lender, or corroborated twice",
             ));
         }
+        if rec.revoked.is_some() {
+            return Err(proof("corroboration after the attempt's revocation"));
+        }
+        if !segments.windows(2).all(|w| w[0] < w[1]) {
+            return Err(invalid("segments named once each, in increasing order"));
+        }
+        let named = segments
+            .iter()
+            .map(|k| {
+                let c = usize::try_from(*k)
+                    .ok()
+                    .and_then(|i| rec.segments[s].get(i));
+                c.map(|c| (*k, *c))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(proof("segment the lender never committed to"))?;
         let recipient = rec.recipient_of(s).ok_or(invalid("no recipient"))?;
         let start: u32 = rec.assignment.layout[..s].iter().sum();
-        let msg = restore_message(&Restoration {
-            job,
-            attempt,
-            producer,
-            layers: (start, start + rec.assignment.layout[s]),
-            restored: rec.restored[s],
-            segments,
-            state: rec.state[s],
-        });
+        let msg = restore_message(
+            &self.domain,
+            &Restoration {
+                job,
+                attempt,
+                producer,
+                layers: (start, start + rec.assignment.layout[s]),
+                restored: rec.restored[s],
+                state: rec.state[s],
+                segments: named,
+            },
+        );
         self.keys
             .verify(recipient, &msg, signature)
             .map_err(|_| proof("restoration not corroborated by the producer's recipient"))?;
-        self.attempt_mut(job, attempt)?.corroborated[s] = Some(segments);
+        let seq = self.seq;
+        self.attempt_mut(job, attempt)?.corroborated[s] = Some(Corroboration { segments, seq });
         Ok(LedgerOutcome::Done)
     }
 
@@ -197,7 +249,7 @@ impl LedgerService {
         if wt > 2 {
             return Err(invalid("unknown output type"));
         }
-        let msg = receipt_message(job, attempt, producer, wt, upto, digest);
+        let msg = receipt_message(&self.domain, job, attempt, producer, wt, upto, digest);
         self.keys
             .verify(recipient, &msg, signature)
             .map_err(|_| proof("receipt not signed by the producer's recipient"))?;

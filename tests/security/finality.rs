@@ -55,66 +55,74 @@ fn recovery(segment: u32, amount: Amount) -> ClaimItem {
     }
 }
 
-fn corroboration(lender: AccountId, segments: u32, signature: [u8; 64]) -> Command {
+fn corroboration(lender: AccountId, segments: &[u32], signature: [u8; 64]) -> Command {
     Command::CorroborateRestore {
         job: J1,
         attempt: 2,
         lender,
-        segments,
+        segments: segments.to_vec(),
         signature,
     }
 }
 
 /// Verification 1. The recipient signs the restoration itself: job, attempt, lender, layer
-/// range, positions, segments and the lender's commitment. Any other content is refused; the
-/// corroboration pays the segments it names and no other; it is written once.
+/// range, positions, the lender's state commitment and each segment with its own commitment.
+/// Any other content is refused; the corroboration pays the segments it names and no other; it
+/// is written once.
 #[test]
 fn r2_a_corroboration_covers_what_was_restored_and_nothing_else() {
     let mut sim = resumed();
     let attempt = sim.coord.jobs()[&J1].attempts[&2].clone();
-    let said = restoration_of(J1, &attempt, L[0], 1).unwrap();
+    let said = restoration_of(J1, &attempt, L[0], &[0]).unwrap();
     assert_eq!(said.layers, (0, 3), "stage 0 of job 1 holds layers 0..3");
     // L1 is L0's recipient. It signs a restoration that is not the one L0 committed to.
-    let sign =
-        |r: &more_identity::Restoration| user_key(L[1]).sign(&more_identity::restore_message(r));
+    let sign = |r: &more_identity::Restoration| {
+        user_key(L[1]).sign(&more_identity::restore_message(&sim_domain(), r))
+    };
     for altered in [
         more_identity::Restoration {
             state: said.state ^ 1,
-            ..said
+            ..said.clone()
         },
         more_identity::Restoration {
             layers: (0, 6),
-            ..said
+            ..said.clone()
         },
         more_identity::Restoration {
             restored: [0, 1, 0],
-            ..said
+            ..said.clone()
         },
-        more_identity::Restoration { attempt: 1, ..said },
+        more_identity::Restoration {
+            attempt: 1,
+            ..said.clone()
+        },
         more_identity::Restoration {
             producer: L[2].0,
-            ..said
+            ..said.clone()
         },
+        // Every segment, another segment, or another content for the same segment.
+        restoration_of(J1, &attempt, L[0], &all_segments()).unwrap(),
+        restoration_of(J1, &attempt, L[0], &[1]).unwrap(),
         more_identity::Restoration {
-            segments: 4,
-            ..said
+            segments: vec![(0, said.segments[0].1 ^ 1)],
+            ..said.clone()
         },
     ] {
         assert_eq!(
-            sim.exec(corroboration(L[0], 1, sign(&altered))),
+            sim.exec(corroboration(L[0], &[0], sign(&altered))),
             Err(DomainError::InadmissibleProof),
             "{altered:?}"
         );
     }
     // The true one: one segment received.
-    sim.exec(corroboration(L[0], 1, sign(&said))).unwrap();
+    sim.exec(corroboration(L[0], &[0], sign(&said))).unwrap();
     // Final: the same again changes nothing, a wider one is refused.
     assert_eq!(
-        sim.exec(corroboration(L[0], 1, UNSIGNED)),
+        sim.exec(corroboration(L[0], &[0], UNSIGNED)),
         Ok(Outcome::AlreadyApplied)
     );
     assert!(matches!(
-        sim.exec(corroboration(L[0], 4, UNSIGNED)),
+        sim.exec(corroboration(L[0], &all_segments(), UNSIGNED)),
         Err(DomainError::Precondition(_))
     ));
     // L0 claims two segments; L2, whose restoration nobody attested, claims one.
@@ -206,6 +214,50 @@ fn r2_a_payment_is_contestable_for_a_bounded_time_then_final() {
     sim.drain();
     clean(&sim);
     assert_eq!(sim.balance(Account::User(L[0].0)), 3);
+}
+
+/// Third review: the corroboration names segments 0 and 2. Segment 1, between them, is not
+/// covered: it is held, and neither evaluation nor a ruling pays it.
+#[test]
+fn r3_a_segment_the_recipient_did_not_name_is_not_paid() {
+    let mut sim = resumed();
+    // Out of order, twice the same or none at all: not a list of segments.
+    for bad in [&[2, 0][..], &[1, 1], &[]] {
+        assert!(
+            matches!(
+                sim.exec(corroboration(L[0], bad, UNSIGNED)),
+                Err(DomainError::InvalidInput(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    // A segment the lender never committed to cannot be attested.
+    assert_eq!(
+        sim.exec(corroboration(L[0], &[0, SEGMENTS], UNSIGNED)),
+        Err(DomainError::InadmissibleProof)
+    );
+    sim.exec(corroboration(L[0], &[0, 2], UNSIGNED)).unwrap();
+    sim.exec(Command::Claim {
+        slice: SLICE,
+        lender: L[0],
+        items: vec![recovery(0, 2), recovery(1, 2), recovery(2, 2)],
+    })
+    .unwrap();
+    sim.exec(Command::CloseSlice { slice: SLICE }).unwrap();
+    let deadline = sim.coord.config().evaluation_deadline;
+    sim.exec(Command::Tick { dt: deadline }).unwrap();
+    sim.exec(Command::Evaluate { slice: SLICE }).unwrap();
+    let l = sim.coord.slices()[&SLICE].lines[&L[0]].clone();
+    assert_eq!((l.paid, l.disputed), (4, 2));
+    let ruling = Command::Arbitrate {
+        slice: SLICE,
+        lender: L[0],
+        pay: true,
+    };
+    assert_eq!(sim.exec(ruling), Err(DomainError::InadmissibleProof));
+    sim.drain();
+    clean(&sim);
+    assert_eq!(sim.balance(Account::User(L[0].0)), 4);
 }
 
 /// Two jobs with everything due at once: an evaluation that pays recovery from the borrower's
@@ -414,4 +466,43 @@ fn r2_a_fault_at_any_entry_of_a_multi_job_reconciliation_leaves_nothing_half_don
     sim.drain();
     clean(&sim);
     assert_eq!(sim.balance(Account::PoolReserve(CREDIT_POOL.0)), 300 - 6);
+}
+
+/// LEDGER-018, LEDGER-019: a coordinator does not start on limits that could strand a payment
+/// (contest limit before the hold), nor on the ledger of another deployment.
+#[test]
+fn r3_a_coordinator_refuses_a_ledger_it_cannot_rely_on() {
+    use gpu_ledger::{LedgerLimits, LedgerService};
+    use more_identity::{IdentityAuthority, KeyDirectory, ServiceRole};
+    let mut auth = IdentityAuthority::new([5; 32]);
+    let cred = auth.issue(ServiceRole::Orchestrator);
+    let start = |ledger: LedgerService| {
+        Coordinator::new(sim_config(), ledger, cred.clone(), auth.verifier()).map(|_| ())
+    };
+    let ledger = |limits| LedgerService::new(auth.verifier(), KeyDirectory::new(), limits);
+    let hold = LedgerLimits::default().reward_hold;
+    let stuck = LedgerLimits {
+        contest_limit: hold - 1,
+        ..LedgerLimits::default()
+    };
+    assert_eq!(
+        start(ledger(stuck)),
+        Err(DomainError::InvalidInput(
+            "contest limit shorter than the reward hold"
+        ))
+    );
+    let edge = LedgerLimits {
+        contest_limit: hold,
+        ..LedgerLimits::default()
+    };
+    assert_eq!(start(ledger(edge)), Ok(()));
+    let elsewhere = IdentityAuthority::new([6; 32]).verifier();
+    let foreign = LedgerService::new(elsewhere, KeyDirectory::new(), LedgerLimits::default());
+    assert_eq!(
+        start(foreign),
+        Err(DomainError::InvalidInput(
+            "ledger and coordinator of different deployments"
+        ))
+    );
+    assert_eq!(start(ledger(LedgerLimits::default())), Ok(()));
 }

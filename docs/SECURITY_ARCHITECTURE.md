@@ -99,18 +99,19 @@ The Ledger exposes no generic transfer. Each operation has fixed source and dest
 | `Reserve` (work, recovery, top-up) | Orchestrator | — (covered by the mandate) | Source is the escrow owner's account; cumulative amount ≤ signed budget |
 | `FundRecovery` | Orchestrator | Pool admin | Signature over the new running total of the relay for this job; the job's own pool only |
 | `RegisterAttempt` | Orchestrator | — | Layout covers the signed model; lenders distinct; witness neither a lender nor the owner; earmark within the recovery budget not yet promised; attempts in increasing order |
-| `AcceptLease` | Orchestrator | Lender of the stage | Signature over the registered assignment |
-| `LeaseReady` | Orchestrator | Lender of the stage | Signature over (job, attempt, lender, restored positions); lease accepted first |
+| `AcceptLease` | Orchestrator | Lender of the stage | Signature over the registered assignment; attempt not revoked |
+| `LeaseReady` | Orchestrator | Lender of the stage | Signature over the job, attempt, lender, restored positions, state commitment and one commitment per recovery segment (at most 64); lease accepted first; attempt not revoked |
 | `Advance` | Clock | — | Time never goes back. The orchestrator cannot move it |
-| `RecordRestore` | Orchestrator | Recipient of the producer | Signature over the job, attempt, producer, layer range, positions, segments received and the commitment the producer signed; lease ready first; written once |
+| `RecordRestore` | Orchestrator | Recipient of the producer | Signature over the job, attempt, producer, layer range, positions, state commitment and each segment received with the commitment the producer signed for it; segments named once, in order; lease ready first; attempt not revoked; written once, with its position in the Ledger's records |
+| `RevokeAttempt` | Orchestrator | — | Once per attempt. Records the position of the revocation: no lease step and no corroboration is added to the attempt afterwards |
 | `RecordReceipt` | Orchestrator | Recipient of the producer (next stage, or witness) | Signature by the account the assignment names; the same coverage with another digest is refused |
 | `ChargeOutput`, `VoidOutput` | Orchestrator | — | Price from the signed terms; position within the signed maximum; one charge in force per output, billing generations in order; no void while a share is reserved or paid |
 | `ReserveContribution` | Orchestrator | — | The lender signed that stage of that attempt; the output is charged to that attempt at that generation; once per output, charge and stage; share computed by the Ledger |
 | `ReserveRecovery` | Orchestrator | — | Every lender of the attempt signed ready; within the attempt's earmark |
 | `PayLine` | Orchestrator | — | Item reserved on that line; for a contribution, charge still in force and a receipt from the recipient covering the output; for recovery, the restoration corroborated by the lender's recipient for that segment; split borrower first, then pool, computed by the Ledger. Starts the item's contest window |
 | `RefundLine` | Orchestrator | — | Back to where the Ledger recorded the reserve came from; no destination in the request |
-| `ReleaseReward` | Orchestrator | — | Held reward → its own lender + commission; commission rate set by the Ledger; not before 48 h after the line's latest payment, by the Ledger's clock |
-| `ContestReward` | Orchestrator | — | Held reward → the job's owner and pool; the pool's share is what the Ledger recorded; not later than 7 days after the line's oldest payment |
+| `ReleaseReward` | Orchestrator | — | Held reward → its own lender + commission; commission rate set by the Ledger; only the payments of the line that are at least 48 h old, by the Ledger's clock; the others stay held |
+| `ContestReward` | Orchestrator | — | Held reward → the job's owner and pool; the pool's share is what the Ledger recorded; only the payments of the line that are less than 7 days old; the others stay held |
 | `ReturnEarmark` | Orchestrator | — | No undecided recovery item on the attempt; closes its recovery budget |
 | `SettleJob` | Orchestrator | — | No undecided item; pool share computed by the Ledger; afterwards nothing is written to the job's escrow, hold or lines |
 | Read balances | Orchestrator (job accounts), Auditor (everything) | — | — |
@@ -145,6 +146,7 @@ There is no edge from a user account to another user account, from one job to an
 Residual risks, stated plainly:
 
 - **Orchestrator plus every recipient of a stage.** A receipt or a corroboration is what one account says it received from another. An attacker that also holds the next lender's key, or the witness's for the last stage, can have that stage's contributions paid, within what was charged to the borrower, and its recovery within the earmark. These signatures raise the number of accounts a fraud needs from one to two per stage; they do not prove that the computation happened. That takes a verification of the work itself, which More does not have yet. The borrower's contest and the anti-collusion cap bound it; the Ledger cannot.
+- **Revocation as seen by the Ledger.** The Ledger closes an attempt's proofs when the orchestrator records the revocation. It does not see lease deadlines or pool rights: refusing a corroboration on an expired lease, or after a right was withdrawn, is done by the coordinator on its own log. A compromised orchestrator can skip that and delay the revocation record. It gains nothing without the recipient's signature, which is the case above.
 - **Charges.** The Ledger does not see the delivery proof behind a charge. Without receipts an unproven charge pays nobody and goes back to the borrower at settlement, but it stays locked until then.
 - **Liveness.** A compromised orchestrator can refuse to settle or to release. Nothing here prevents that; it is visible in the audit view.
 
@@ -172,6 +174,8 @@ What each boundary is made of today. "In-process" means it holds against bugs an
 | Issuance only by Treasury | Ledger permission matrix | Enforced now |
 | Borrower consent to spending and to the job's terms | Ed25519 mandate verified by the Ledger | Enforced now |
 | Lender, recipient and pool admin consent | Ed25519 statements verified by the Ledger (lease, readiness, receipt, relay) | Enforced now |
+| Statements bound to one deployment | Every signed statement and every envelope carries the public key of the deployment's identity authority; the Ledger and the protocol edge compare it with their own verifier's | Enforced now |
+| Proofs recorded before the revocation | The Ledger numbers its records and takes no lease step or corroboration once `RevokeAttempt` is recorded | Enforced now for attempt revocation; lease expiry and pool rights are checked by the coordinator only |
 | Provenance of reserves, closure with no open item | Ledger records and checks, independent of the coordinator's | Enforced now (tests, TEST-P30 under a hostile orchestrator) |
 | Final proofs, bounded contest cycle | Write-once records in the Ledger; its own clock, moved by the Clock credential only | Enforced now (TEST-P33, TEST-P30) |
 | One lease per node | Per-stage state and expiry, authorized per sender | Enforced now (TEST-P24, TEST-P31) |

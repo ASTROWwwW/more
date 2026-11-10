@@ -18,7 +18,7 @@ pub struct SimIdentity {
 
 impl SimIdentity {
     pub(super) fn new() -> (Self, ServiceCredential) {
-        let mut authority = IdentityAuthority::new([0x42; 32]);
+        let mut authority = IdentityAuthority::new(AUTHORITY_SEED);
         let keys = KeyDirectory::new();
         for a in BORROWERS
             .iter()
@@ -194,6 +194,15 @@ impl Sim {
     }
 }
 
+/// Seed of the simulated deployment's identity authority.
+const AUTHORITY_SEED: [u8; 32] = [0x42; 32];
+
+/// The simulated deployment, as named in every statement its accounts sign (LEDGER-019).
+pub fn sim_domain() -> Domain {
+    static DOMAIN: std::sync::OnceLock<Domain> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(|| IdentityAuthority::new(AUTHORITY_SEED).domain())
+}
+
 /// Signature left for the sending client to fill in (see [`Sim::signed`]).
 pub const UNSIGNED: [u8; 64] = [0; 64];
 
@@ -203,8 +212,39 @@ pub const UNSET_CONFIG: u64 = 0;
 /// State commitment left for the restoring lender to fill in (see [`Sim::signed`]).
 pub const UNSET_STATE: u64 = 0;
 
-/// Recovery segments an honest recipient attests by default: all the simulated ones.
+/// Recovery segments an honest lender commits to, and an honest recipient attests by default.
 pub const SEGMENTS: u32 = 4;
+
+/// Every simulated segment, named.
+pub fn all_segments() -> Vec<u32> {
+    (0..SEGMENTS).collect()
+}
+
+/// What an honest lender commits to for each recovery segment, given its state commitment
+/// (symbolic).
+pub fn segment_commitments(state: u64) -> Vec<u64> {
+    (0..u64::from(SEGMENTS))
+        .map(|k| (state ^ (k + 1)).wrapping_mul(0x0100_0000_01b3))
+        .collect()
+}
+
+/// The readiness an honest lender signs for `restored`.
+pub fn readiness_of(
+    job: JobId,
+    attempt: u32,
+    lender: AccountId,
+    restored: PerType<u32>,
+) -> Readiness {
+    let state = state_commitment(job, attempt, lender, restored);
+    Readiness {
+        job: job.0,
+        attempt,
+        lender: lender.0,
+        restored,
+        state,
+        segments: segment_commitments(state),
+    }
+}
 
 /// What an honest lender commits to after restoring its state (symbolic, never 0).
 pub fn state_commitment(
@@ -227,24 +267,25 @@ pub fn state_commitment(
     h | 1
 }
 
-/// The statement a recipient signs about `lender`'s restoration on `a`, as the ledger rebuilds
-/// it: `None` until the lender reported ready.
+/// The statement a recipient signs about `lender`'s restoration on `a` for the segments it
+/// names, as the ledger rebuilds it: `None` until the lender reported ready.
 pub fn restoration_of(
     job: JobId,
     a: &Attempt,
     lender: AccountId,
-    segments: u32,
+    segments: &[u32],
 ) -> Option<Restoration> {
     let stage = a.stage_of(lender)?;
-    let r = a.leases[stage].restored?;
+    let r = a.leases[stage].restored.as_ref()?;
+    let commitment = |k: &u32| r.segments.get(*k as usize).copied().unwrap_or(0);
     Some(Restoration {
         job: job.0,
         attempt: a.no,
         producer: lender.0,
         layers: a.layer_range(stage)?,
         restored: r.positions,
-        segments,
         state: r.state,
+        segments: segments.iter().map(|k| (*k, commitment(k))).collect(),
     })
 }
 
@@ -260,6 +301,7 @@ impl Sim {
             return cmd;
         };
         let c = &self.coord;
+        let d = &sim_domain();
         let att = |job: JobId, n: u32| c.jobs().get(&job).and_then(|j| j.attempts.get(&n));
         match &mut cmd {
             AcceptLease {
@@ -269,7 +311,7 @@ impl Sim {
                 ..
             } if *signature == UNSIGNED => {
                 if let Some(a) = att(*job, *attempt) {
-                    *signature = user_key(me).sign(&lease_message(&assignment_of(*job, a)));
+                    *signature = user_key(me).sign(&lease_message(d, &assignment_of(*job, a)));
                 }
             }
             CorroborateRestore {
@@ -281,9 +323,9 @@ impl Sim {
             } if *signature == UNSIGNED => {
                 // An honest recipient attests the restored state it received from the producer.
                 let r =
-                    att(*job, *attempt).and_then(|a| restoration_of(*job, a, *lender, *segments));
+                    att(*job, *attempt).and_then(|a| restoration_of(*job, a, *lender, segments));
                 if let Some(r) = r {
-                    *signature = user_key(me).sign(&restore_message(&r));
+                    *signature = user_key(me).sign(&restore_message(d, &r));
                 }
             }
             FundRecovery {
@@ -293,7 +335,7 @@ impl Sim {
             } if *signature == UNSIGNED => {
                 if let Some(j) = c.jobs().get(job) {
                     let total = j.pool_recovery_funded.saturating_add(*amount);
-                    *signature = user_key(me).sign(&relay_message(job.0, j.pool.0, total));
+                    *signature = user_key(me).sign(&relay_message(d, job.0, j.pool.0, total));
                 }
             }
             LeaseLoaded {
@@ -313,14 +355,26 @@ impl Sim {
                 lender,
                 restored,
                 state,
+                segments,
                 signature,
             } if *signature == UNSIGNED => {
-                // An honest lender commits to the state it really restored.
+                // An honest lender commits to the state it really restored, and to each segment
+                // it recomputed.
                 if *state == UNSET_STATE {
                     *state = state_commitment(*job, *attempt, *lender, *restored);
+                    if segments.is_empty() {
+                        *segments = segment_commitments(*state);
+                    }
                 }
-                let m = ready_message(job.0, *attempt, lender.0, *restored, *state);
-                *signature = user_key(me).sign(&m);
+                let r = Readiness {
+                    job: job.0,
+                    attempt: *attempt,
+                    lender: lender.0,
+                    restored: *restored,
+                    state: *state,
+                    segments: segments.clone(),
+                };
+                *signature = user_key(me).sign(&ready_message(d, &r));
             }
             CommitReceipts {
                 job,
@@ -331,7 +385,8 @@ impl Sim {
                 digest,
                 signature,
             } if *signature == UNSIGNED => {
-                let m = receipt_message(job.0, *attempt, lender.0, wt.idx() as u8, *upto, *digest);
+                let m =
+                    receipt_message(d, job.0, *attempt, lender.0, wt.idx() as u8, *upto, *digest);
                 *signature = user_key(me).sign(&m);
             }
             PresentReceipt {
@@ -349,8 +404,15 @@ impl Sim {
                     r.filter(|_| received)
                 });
                 if let Some(r) = recipient {
-                    let m =
-                        receipt_message(job.0, *attempt, lender.0, wt.idx() as u8, *upto, *digest);
+                    let m = receipt_message(
+                        d,
+                        job.0,
+                        *attempt,
+                        lender.0,
+                        wt.idx() as u8,
+                        *upto,
+                        *digest,
+                    );
                     *signature = user_key(r).sign(&m);
                 }
             }

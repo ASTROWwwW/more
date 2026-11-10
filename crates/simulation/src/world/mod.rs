@@ -9,8 +9,8 @@ use gpu_domain::*;
 use gpu_ledger::{LedgerLimits, LedgerService};
 use more_identity::{
     assume_account, lease_message, mandate_message, ready_message, receipt_message, relay_message,
-    restore_message, Assignment, IdentityAuthority, JobTerms, KeyDirectory, Restoration,
-    ServiceRole, UserKey,
+    restore_message, Assignment, Domain, IdentityAuthority, JobTerms, KeyDirectory, Readiness,
+    Restoration, ServiceRole, UserKey,
 };
 
 use crate::invariants::{check_state, check_step, Violation};
@@ -23,8 +23,8 @@ mod resolve;
 mod setup;
 
 pub use identity::{
-    assignment_of, restoration_of, state_commitment, SimIdentity, SEGMENTS, UNSET_CONFIG,
-    UNSET_STATE, UNSIGNED,
+    all_segments, assignment_of, readiness_of, restoration_of, segment_commitments, sim_domain,
+    state_commitment, SimIdentity, SEGMENTS, UNSET_CONFIG, UNSET_STATE, UNSIGNED,
 };
 pub use operations::{op_strategy, Op};
 use operations::{pick, wt_of};

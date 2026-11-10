@@ -15,7 +15,7 @@ mod common;
 
 use common::*;
 use gpu_ledger::*;
-use more_identity::{lease_message, ready_message, receipt_message};
+use more_identity::{lease_message, receipt_message, Readiness};
 use proptest::prelude::*;
 
 /// What the honest recipients really received on attempt 1.
@@ -100,6 +100,8 @@ enum Call {
         lender: u8,
     },
     ReturnEarmark(u8),
+    /// Records the revocation of an attempt: its set of proofs is closed from then on.
+    Revoke(u8),
     /// The honest clock service moves time forward: minutes, hours, or past the windows.
     Tick(u8),
     /// Settles on a few values only, so most sequences live long enough to pay.
@@ -125,6 +127,7 @@ fn calls() -> impl Strategy<Value = Call> {
         6 => (b(), b()).prop_map(|(attempt, lender)| Call::Release { attempt, lender }),
         3 => (b(), b()).prop_map(|(attempt, lender)| Call::Contest { attempt, lender }),
                 2 => b().prop_map(Call::ReturnEarmark),
+        1 => b().prop_map(Call::Revoke),
         6 => b().prop_map(Call::Tick),
         1 => b().prop_map(Call::Settle),
     ]
@@ -286,7 +289,7 @@ fn apply(w: &mut World, c: &Call) -> Res {
             };
             // An honest lender signs the assignment that names it.
             let honest = rec.assignment.lenders.get(stage as usize).copied();
-            let signature = key(signer(honest, s)).sign(&lease_message(&rec.assignment));
+            let signature = key(signer(honest, s)).sign(&lease_message(&dom(), &rec.assignment));
             w.run(LedgerOp::AcceptLease {
                 job: JOB,
                 attempt,
@@ -305,16 +308,15 @@ fn apply(w: &mut World, c: &Call) -> Res {
                 return Err(LedgerApiError::Invalid("test: unknown attempt"));
             };
             let honest = rec.assignment.lenders.get(stage as usize).copied();
-            let lender = honest.unwrap_or(MALLORY);
-            let m = ready_message(JOB, attempt, lender, [0; 3], STATE);
-            w.run(LedgerOp::LeaseReady {
+            let r = Readiness {
                 job: JOB,
                 attempt,
-                stage,
+                lender: honest.unwrap_or(MALLORY),
                 restored: [0; 3],
                 state: STATE,
-                signature: key(signer(honest, s)).sign(&m),
-            })
+                segments: SEGS.to_vec(),
+            };
+            w.ready_with(stage, &r, signer(honest, s))
         }
         Call::Corroborate {
             attempt,
@@ -336,9 +338,15 @@ fn apply(w: &mut World, c: &Call) -> Res {
             let Some(stage) = rec.stage_of(producer) else {
                 return Err(LedgerApiError::Invalid("test: not a lender"));
             };
-            // Sometimes only the first segment was received.
-            let segments = 1 + u32::from(s / 4 % 3);
-            let r = restoration(&rec.assignment, stage as u32, segments, STATE);
+            // The recipient names what it received: all segments, a prefix, or some of them.
+            let named: &[u32] = match s / 4 % 6 {
+                0 | 1 => &[0, 1, 2],
+                2 => &[0],
+                3 => &[0, 1],
+                4 => &[0, 2],
+                _ => &[1],
+            };
+            let r = restoration_of(&rec.assignment, stage as u32, named, STATE);
             w.corroborate_with(&r, signer(honest, s))
         }
         Call::Receipt {
@@ -360,7 +368,7 @@ fn apply(w: &mut World, c: &Call) -> Res {
             let digest = u64::from(s / 4 % 4 == 0);
             let honest = recipient
                 .filter(|_| attempt == 1 && upto <= RECEIVED && producer != MALLORY && digest == 0);
-            let m = receipt_message(JOB, attempt, producer, WT, upto, digest);
+            let m = receipt_message(&dom(), JOB, attempt, producer, WT, upto, digest);
             w.run(LedgerOp::RecordReceipt {
                 job: JOB,
                 attempt,
@@ -472,6 +480,16 @@ fn apply(w: &mut World, c: &Call) -> Res {
             job: JOB,
             attempt: att_of(w, a),
         }),
+        Call::Revoke(a) => {
+            // Mostly an older attempt, as the honest scheduler would when it places the next one.
+            let known: Vec<u32> = w.escrow().attempts.keys().copied().collect();
+            let older = known.len().checked_sub(2).and_then(|i| known.get(i));
+            match older {
+                _ if a % 8 == 0 => w.revoke(att_of(w, a)),
+                Some(older) => w.revoke(*older),
+                None => Err(LedgerApiError::Invalid("test: nothing older")),
+            }
+        }
         Call::Tick(sel) => {
             w.advance(match sel % 6 {
                 0 => 8 * 24 * HOUR,
@@ -548,7 +566,14 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
             }
             ItemId::Recovery { segment, .. } => {
                 prop_assert!(a.ready.iter().all(|r| *r), "{id:?} after {c:?}");
-                let proven = s.is_some_and(|s| a.corroborated[s].is_some_and(|n| *segment < n));
+                // Paid only for a segment the recipient named, in a corroboration recorded before
+                // the attempt's revocation.
+                let proven = s.is_some_and(|s| {
+                    a.corroborates(s, *segment)
+                        && a.corroborated[s]
+                            .as_ref()
+                            .is_some_and(|c| a.revoked.is_none_or(|r| c.seq < r))
+                });
                 prop_assert!(it.state != ItemState::Paid || proven, "{id:?} after {c:?}");
             }
             ItemId::Contribution { .. } => {}
@@ -557,8 +582,9 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// LEDGER-018: what was recorded stays recorded, and a held reward leaves through the cycle
-/// only: released after the hold, contested before the limit, on the ledger's own clock.
+/// LEDGER-018: what was recorded stays recorded, a revoked attempt takes no new proof, and a held
+/// payment leaves through its own cycle only: released after its hold, contested before its
+/// limit, each counted from that payment on the ledger's own clock.
 fn finality(before: &Escrow, now: u64, w: &World, c: &Call) -> Result<(), TestCaseError> {
     let after = w.escrow();
     let limits = w.ledger.limits();
@@ -579,6 +605,11 @@ fn finality(before: &Escrow, now: u64, w: &World, c: &Call) -> Result<(), TestCa
             let kept = a.corroborated[s].is_none() || b.corroborated[s] == a.corroborated[s];
             prop_assert!(kept, "corroboration replaced by {:?}", c);
         }
+        if a.revoked.is_some() {
+            let same = (&b.accepted, &b.ready, &b.corroborated, b.revoked)
+                == (&a.accepted, &a.ready, &a.corroborated, a.revoked);
+            prop_assert!(same, "{c:?} added a proof to a revoked attempt");
+        }
     }
     let mut left: Vec<u64> = Vec::new();
     for (id, old) in &before.items {
@@ -596,21 +627,31 @@ fn finality(before: &Escrow, now: u64, w: &World, c: &Call) -> Result<(), TestCa
             }
         }
     }
-    if let (Some(oldest), Some(latest)) = (left.iter().min(), left.iter().max()) {
+    for paid_at in left {
         match c {
             Call::Release { .. } => {
                 prop_assert!(
-                    now >= latest + limits.reward_hold,
-                    "released inside the window"
+                    now >= paid_at + limits.reward_hold,
+                    "a payment released inside its own window"
                 );
             }
             Call::Contest { .. } => {
                 prop_assert!(
-                    now < oldest + limits.contest_limit,
-                    "contested past the limit"
+                    now < paid_at + limits.contest_limit,
+                    "a payment contested past its own limit"
                 );
             }
             other => prop_assert!(false, "{other:?} closed a held reward"),
+        }
+    }
+    // No payment is ever stuck: while held, it can be contested, released, or both.
+    for it in after.items.values() {
+        if let (ItemState::Paid, false, Some(t)) = (it.state, it.rewarded, it.paid_at) {
+            let now = w.ledger.now();
+            prop_assert!(
+                now < t + limits.contest_limit || now >= t + limits.reward_hold,
+                "held payment with no way out"
+            );
         }
     }
     Ok(())
@@ -712,6 +753,7 @@ fn p30_generator_reaches_every_operation() {
         "Release",
         "Contest",
         "ReturnEarmark",
+        "Revoke",
         "Settle",
         "Tick",
         "paid contributions",

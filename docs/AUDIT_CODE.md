@@ -273,3 +273,65 @@ What the first row does not give: the commitment is a value two accounts agree o
 - The coverage thresholds of `generator_reaches_interesting_paths` are unchanged. Its traces went from 150 to 180 operations, because starting a cluster now takes three steps per lender and a corroboration per stage, and three generator weights were raised. Four thresholds were added (attempts revoked for an expired lease, for one silent node, restorations corroborated, recovery held).
 - Scenario and regression harnesses now have each stage's recipient corroborate the restoration when a cluster starts (a healthy cluster); `r2_recovery_split_and_contest…` and `r2_recovery_needs_readiness…` do it explicitly. No assertion on amounts was changed.
 
+## Third review (November 10, 2026)
+
+Review of the branch after the corroboration, finality and CE-08 changes. One defect and three hardening requests, all on the branch `hardening/ledger-authority`.
+
+| Id | Finding | Status |
+| --- | --- | --- |
+| R3-01 | LEDGER-018 gave a line one window for all its payments: release 48 h after the latest, contest until 7 days after the oldest. A payment on day 0 and another on day 6 left the line, on day 7, neither contestable nor releasable, and the second payment with one day of contest (CE-09) | **Fixed**: one window per payment |
+| R3-02 | A corroboration carried a count of segments and one commitment for the whole restored state. It covered segments `0..n` without naming them or binding their content | **Fixed**: one commitment per segment in the readiness, each segment named in the corroboration |
+| R3-03 | Signed statements were bound to business identifiers and a kind tag only. Two deployments with the same job and account numbers would accept each other's statements | **Fixed**: deployment identifier in every statement (LEDGER-019) |
+| R3-04 | A corroboration was accepted at any time until the job was settled, including after the lender or its recipient had been revoked | **Fixed**: recorded anteriority (LEDGER-020, JOB-R18) |
+
+### R3-01: staggered payments (CE-09)
+
+The two bounds of LEDGER-018 were counted from different payments of the same line. The reproduction is `ce09_staggered_payments_keep_their_own_contest_window` (coordinator) and `r3_staggered_payments_each_have_their_own_window` (Ledger API): pay on day 0, pay on day 6, try both operations on day 7.
+
+Each paid item now carries its own cycle, counted from its `paid_at`: releasable from 48 h, contestable until 7 days. `ReleaseReward` moves the items of the line whose hold has passed and leaves the others; `ContestReward` takes back the items still inside their limit and leaves the others. Amounts are the items' own, so the pool's share of a contest is the share of the contested items only. The Ledger test also walks every hour from day 6 to day 14 and checks that one of the two operations always applies: with `reward_hold ≤ contest_limit` a held payment is never stuck. That inequality is checked when the coordinator starts (`LedgerLimits::validate`).
+
+The coordinator keeps its own rule for a release (slice final, then the JOB-R22 window), which is never shorter than the Ledger's hold, and follows the Ledger item by item for a contest. A mismatch between the two computations is an internal error, not a silent adjustment.
+
+### R3-02: segments named one by one
+
+`Readiness` now carries one commitment per recovery segment the lender recomputed (at most 64). `Restoration` carries a list of `(segment, commitment)` pairs. The Ledger receives the list of segment numbers only, takes each commitment from the readiness it recorded, rebuilds the statement and verifies the recipient's signature over it. So:
+
+- a segment the lender did not commit to cannot be attested;
+- a segment named twice or out of order is refused;
+- a signature over segments 0 and 2 verifies for exactly that list: announcing 0, 1, 2 with it fails, and segment 1 is not paid;
+- another commitment for the same segment is another message.
+
+Tests: `r3_a_corroboration_pays_only_the_segments_it_names`, `r3_a_segment_the_recipient_did_not_name_is_not_paid`, `a_restoration_covers_exactly_the_segments_it_names`, and the altered statements added to `r2_a_corroboration_is_bound_to_what_was_restored` and `r2_a_corroboration_covers_what_was_restored_and_nothing_else`.
+
+### R3-03: deployment domain
+
+Every statement starts with its kind tag, then 32 bytes: the public key of the identity authority of the deployment. The Ledger reads that key from its own credential verifier. `r3_statements_signed_for_another_deployment_are_refused` signs each of the six kinds of statement with the right key and the right content for another authority, sees it refused, then signs it for this one and sees it accepted. Kind tags were bumped (`mandate/v3`, `relay/v2`, `lease/v2`, `ready/v3`, `restore/v2`, `receipt/v2`) and the protocol version is 4.
+
+The envelope got the same treatment, since most commands carry no statement of their own: it has a `domain` field, covered by the sender's signature. The protocol edge refuses an envelope for another deployment with `WRONG_DEPLOYMENT`; moving the field to the right value afterwards gives `BAD_SIGNATURE` (`unsigned_or_altered_messages_are_refused`). A coordinator also refuses to start on a ledger whose authority is not its own (`r3_a_coordinator_refuses_a_ledger_it_cannot_rely_on`).
+
+This is a domain separation, not a secret: the identifier is public. It stops cross-deployment replay; it does not authenticate the deployment to the signer.
+
+### R3-04: corroboration before the revocation
+
+The previous version said a corroboration "is about the past" and accepted it until settlement. A lender and a recipient could then agree on it after the attempt was gone. The rule is now the one CE-03 set for receipts: order is read from the log.
+
+- Ledger: `RevokeAttempt` records the position of the revocation among the Ledger's accepted operations. After it, `AcceptLease`, `LeaseReady` and `RecordRestore` are refused for that attempt. A corroboration keeps its own position.
+- Coordinator: `revoke_current` sends `RevokeAttempt` before it marks the attempt revoked. `CorroborateRestore` is refused on a revoked attempt, when the producer's or the recipient's own lease has expired by the coordinator's clock (before reconciliation revokes the attempt), and when either lost its right in the pool since the attempt was placed. The registry keeps the log position of each withdrawal; granting the right again does not erase it.
+
+| Case | Test | Result |
+| --- | --- | --- |
+| Lender's node revoked between its restoration signature and the corroboration | `r3_a_corroboration_after_the_lender_is_revoked_proves_nothing` | Refused by the coordinator without asking the Ledger; the Ledger's record shows the revocation and no corroboration; held, not payable by ruling, refunded |
+| Recipient's lease expired, attempt not yet revoked | `r3_a_corroboration_after_the_recipient_lease_expired_proves_nothing` | `LEASE_EXPIRED` for the stage it receives from and for its own stage; the other stage, attested by live nodes, is paid |
+| Witness (recipient of the last stage) expired | `r3_a_corroboration_by_an_expired_witness_proves_nothing` | `LEASE_EXPIRED` for the last stage only |
+| Lend right or witness right withdrawn, then granted again | `r3_a_right_withdrawn_before_the_corroboration_voids_it` | Refused both times; a right the place does not rely on changes nothing |
+| Ledger API, hostile orchestrator | `r3_no_proof_is_added_after_the_revocation`, TEST-P30 with revocations | Late corroboration, late lease step refused; earlier proof still pays |
+
+What it costs: an honest lender whose recipient disappears before corroborating is not paid for that recovery. What it does not cover: lease deadlines and pool rights are not visible to the Ledger (see "Residual risks" in `SECURITY_ARCHITECTURE.md`).
+
+### Test changes that need a justification (third review)
+
+- `r2_contests_follow_a_bounded_cycle` asserted that a later payment "restarts the hold for the line". That assertion described the defect of R3-01. It now asserts that the first payment is released on its own date and the second one on its own.
+- `r2_a_late_corroboration_lets_a_ruling_pay` waited for the evaluation deadline without heartbeats, then corroborated on expired leases. It now keeps the cluster alive while it waits. What it shows is unchanged: a corroboration recorded after the item was held lets a ruling pay it.
+- TEST-P30: the hostile generator gained `Revoke` (weight 1, mostly on an older attempt) and corroborations that name subsets of segments.
+- No regression test was removed. CE-09 was added.
+

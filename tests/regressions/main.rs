@@ -23,6 +23,7 @@ fn ready(job: JobId) -> Command {
         lender: AccountId(0),
         restored: [0; 3],
         state: UNSET_STATE,
+        segments: Vec::new(),
         signature: UNSIGNED,
     }
 }
@@ -725,4 +726,107 @@ fn ce08_reconciliation_reports_a_ledger_failure() {
     assert_eq!(sim.coord.slices()[&slice].lines[&l0].paid, 6);
     sim.drain();
     assert_clean(&sim);
+}
+
+/// CE-09, found in review, not by proptest. LEDGER-018 gave a line one window for all its
+/// payments: release at least 48 h after the latest payment still held, contest at most 7 days
+/// after the oldest. With a payment on day 0 and another on day 6 (here by a ruling), on day 7
+/// the line could be neither contested nor released, and the day-6 payment had one day of
+/// contest left instead of its own window. Fix (LEDGER-018, JOB-R22): each payment has its own
+/// hold and its own contest limit, counted from that payment; a contest takes back the payments
+/// still inside their limit and leaves the others held.
+#[test]
+fn ce09_staggered_payments_keep_their_own_contest_window() {
+    const DAY: u64 = 24 * 3600;
+    let mut sim = Sim::default();
+    let j = JobId(1);
+    let l0 = AccountId(10);
+    let place = |estimate| Command::Place {
+        job: j,
+        lenders: vec![l0, AccountId(11), AccountId(12)],
+        layout: layout_of(j),
+        recovery_estimate: estimate,
+        witness: WITNESS,
+        expected_version: None,
+    };
+    let slice = SliceId {
+        job: j,
+        attempt: 2,
+        slice: 1,
+    };
+    // Segment 0 is proven by a commitment and paid at evaluation. Segment 1, uncommitted and
+    // above the sliding cap, is held for a ruling (JOB-R19).
+    let recovery = |segment, amount, evidence| ClaimItem::Recovery {
+        segment,
+        amount,
+        evidence,
+    };
+    let claim = Command::Claim {
+        slice,
+        lender: l0,
+        items: vec![
+            recovery(0, 1, Evidence::Committed),
+            recovery(1, 5, Evidence::Uncommitted),
+        ],
+    };
+    let node_lost = Command::NodeLost {
+        job: j,
+        expected_version: None,
+    };
+    let ruling = Command::Arbitrate {
+        slice,
+        lender: l0,
+        pay: true,
+    };
+    sim.exec(Command::Reserve { job: j }).unwrap();
+    sim.exec(place(0)).unwrap();
+    sim.start_cluster(j, 1, [0; 3]).unwrap();
+    sim.exec(node_lost).unwrap();
+    sim.exec(place(6)).unwrap();
+    sim.start_cluster(j, 2, [0; 3]).unwrap();
+    for cmd in [
+        claim,
+        Command::CloseSlice { slice },
+        Command::Tick { dt: 600 },
+        Command::Evaluate { slice },
+    ] {
+        step(&mut sim, &cmd);
+    }
+    let line = |sim: &Sim| sim.coord.slices()[&slice].lines[&l0].clone();
+    assert_eq!((line(&sim).paid, line(&sim).disputed), (1, 5));
+    // Day 6: the ruling pays the second item and the slice becomes final.
+    step(&mut sim, &Command::Tick { dt: 6 * DAY });
+    step(&mut sim, &ruling);
+    assert_eq!(sim.coord.slices()[&slice].status, SliceStatus::Final);
+    assert_eq!(line(&sim).held, 6);
+    let release = Command::ReleaseReward { slice, lender: l0 };
+    let contest = Command::ContestReward { slice, lender: l0 };
+    // Day 7. The day-6 payment still has its contest window: the line is not released, and the
+    // borrower's contest takes back that payment only.
+    step(&mut sim, &Command::Tick { dt: DAY });
+    assert_eq!(
+        sim.exec(release.clone()),
+        Err(DomainError::Precondition("JOB-R22: contest window open"))
+    );
+    assert_eq!(sim.exec(contest.clone()), Ok(Outcome::Applied));
+    assert_eq!((line(&sim).held, line(&sim).contested), (1, 5));
+    // The day-0 payment is past its own limit: it can only be released.
+    assert_eq!(
+        sim.exec(contest.clone()),
+        Err(DomainError::Precondition("JOB-R22: contest limit reached"))
+    );
+    // Day 8: the window on the slice has passed and what is left is released.
+    step(&mut sim, &Command::Tick { dt: DAY });
+    assert_eq!(sim.exec(release.clone()), Ok(Outcome::Applied));
+    assert_eq!((line(&sim).held, line(&sim).released), (0, 1));
+    assert!(sim.exec(release).is_err());
+    assert!(sim.exec(contest).is_err());
+    sim.drain();
+    assert_clean(&sim);
+    assert_eq!(sim.balance(gpu_ledger::Account::User(l0.0)), 1);
+    // The borrower got the contested payment back: only the released credit left its account.
+    assert_eq!(
+        sim.balance(gpu_ledger::Account::User(BORROWERS[0].0)),
+        1_999
+    );
 }

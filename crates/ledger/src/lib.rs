@@ -19,9 +19,9 @@ mod service;
 pub use accounts::Account;
 pub use journal::{Entry, Ledger, LedgerError, LedgerViolation};
 pub use service::{
-    Assignment, AttemptRec, Denial, Escrow, EscrowBucket, IssueTo, ItemId, ItemRec, ItemState,
-    JobTerms, LedgerApiError, LedgerLimits, LedgerOp, LedgerOutcome, LedgerService, LineRef,
-    OutputRec, OutputRef,
+    Assignment, AttemptRec, Corroboration, Denial, Escrow, EscrowBucket, IssueTo, ItemId, ItemRec,
+    ItemState, JobTerms, LedgerApiError, LedgerLimits, LedgerOp, LedgerOutcome, LedgerService,
+    LineRef, OutputRec, OutputRef,
 };
 
 /// Amount in the smallest credit unit. Never floats (LEDGER-009).

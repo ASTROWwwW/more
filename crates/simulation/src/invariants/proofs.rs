@@ -1,6 +1,7 @@
 //! What the Ledger holds against the orchestrator (TEST-P30; LEDGER-013 to LEDGER-016): every
 //! reserve has a provenance and a lessee who signed, every paid contribution a recipient's receipt,
-//! every recovery a lender that signed ready, and a settled job leaves nothing behind.
+//! every recovery a lender that signed ready, and a settled job leaves nothing behind. Recovery is
+//! paid segment by segment, on corroborations recorded before the revocation (TEST-P32, TEST-P34).
 
 use gpu_ledger::{Escrow, ItemId, ItemState};
 
@@ -154,7 +155,13 @@ fn items(job: u32, e: &Escrow, out: &mut Vec<Violation>) {
                         ),
                     );
                 }
-                if it.state == ItemState::Paid && !a.corroborated[s].is_some_and(|n| *segment < n) {
+                // Paid only for a segment its recipient named, in a corroboration the ledger
+                // recorded before the attempt's revocation.
+                let proven = a.corroborates(s, *segment)
+                    && a.corroborated[s]
+                        .as_ref()
+                        .is_some_and(|c| a.revoked.is_none_or(|r| c.seq < r));
+                if it.state == ItemState::Paid && !proven {
                     p30(
                         out,
                         format!("job {job}: {id:?} paid without a corroborated restoration"),
@@ -184,7 +191,10 @@ pub(super) fn recovery(c: &Coordinator, out: &mut Vec<Violation>) {
             .and_then(|j| j.attempts.get(&rid.attempt))
             .and_then(|a| {
                 let s = a.lenders.iter().position(|l| l == lender)?;
-                Some(a.ready && a.leases[s].corroborated.is_some_and(|n| rid.segment < n))
+                let c = a.leases[s].corroborated.as_ref()?;
+                // CE-03: on record before the attempt's revocation, for this very segment.
+                let before = a.revoked_seq.is_none_or(|r| c.seq < r);
+                Some(a.ready && before && c.segments.contains(&rid.segment))
             })
             .unwrap_or(false);
         if !corroborated {
@@ -236,8 +246,8 @@ pub(super) fn receipts_step(before: &Coordinator, after: &Coordinator) -> Vec<Vi
 }
 
 /// TEST-P33 (LEDGER-018), on the ledger's records before and after one command: a recorded proof
-/// is never replaced, a payment never undone, and a held reward leaves only through the cycle:
-/// released after the hold, contested before the limit, by the ledger's own clock.
+/// is never replaced, a payment never undone, and a held payment leaves only through its own
+/// cycle: released after its hold, contested before its limit, by the ledger's own clock.
 pub(super) fn finality_step(
     before: &Coordinator,
     cmd: &Command,
@@ -306,21 +316,101 @@ pub(super) fn finality_step(
                 p33(format!("job {job}: decided {id:?} changed by {cmd:?}"));
             }
         }
-        if let (Some(oldest), Some(latest)) = (left.iter().min(), left.iter().max()) {
+        // Each payment leaves on its own window, counted from that payment.
+        for paid_at in left {
             match cmd {
                 Command::ReleaseReward { .. } | Command::Reconcile => {
-                    if now < latest + limits.reward_hold {
+                    if now < paid_at + limits.reward_hold {
                         p33(format!(
-                            "job {job}: reward released inside the contest window"
+                            "job {job}: a payment released inside its own contest window"
                         ));
                     }
                 }
                 Command::ContestReward { .. } => {
-                    if now >= oldest + limits.contest_limit {
-                        p33(format!("job {job}: reward contested past the limit"));
+                    if now >= paid_at + limits.contest_limit {
+                        p33(format!("job {job}: a payment contested past its own limit"));
                     }
                 }
                 other => p33(format!("job {job}: {other:?} closed a held reward")),
+            }
+        }
+        // A revoked attempt takes no new signed statement.
+        for (n, x) in &a.attempts {
+            let Some(y) = b.attempts.get(n).filter(|_| x.revoked.is_some()) else {
+                continue;
+            };
+            if (&y.accepted, &y.ready, &y.corroborated, y.revoked)
+                != (&x.accepted, &x.ready, &x.corroborated, x.revoked)
+            {
+                p33(format!(
+                    "job {job}: {cmd:?} added a proof to revoked attempt {n}"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// TEST-P34 (JOB-R18, CE-03), judged on the state before the command: a corroboration is taken on
+/// record only while the attempt is not revoked, the producer's and the recipient's own leases
+/// are in force, both still hold the right their place relies on, and for segments the producer
+/// committed to. Whatever is recorded afterwards on a revoked attempt is not a corroboration.
+pub(super) fn anteriority_step(
+    before: &Coordinator,
+    cmd: &Command,
+    after: &Coordinator,
+) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let mut p34 = |detail: String| out.push(v("TEST-P34", detail));
+    for (id, j) in after.jobs() {
+        for (n, a) in &j.attempts {
+            let old = before.jobs().get(id).and_then(|j| j.attempts.get(n));
+            for (s, lease) in a.leases.iter().enumerate() {
+                let was = old.and_then(|o| o.leases.get(s)?.corroborated.as_ref());
+                let (Some(c), None) = (lease.corroborated.as_ref(), was) else {
+                    continue;
+                };
+                let Some(o) = old else {
+                    p34(format!("{id:?}/{n}: corroborated as it was placed"));
+                    continue;
+                };
+                if !matches!(cmd, Command::CorroborateRestore { .. }) {
+                    p34(format!("{id:?}/{n}/{s}: corroborated by {cmd:?}"));
+                }
+                if o.revoked_seq.is_some() || a.revoked_seq.is_some_and(|r| r <= c.seq) {
+                    p34(format!("{id:?}/{n}/{s}: corroborated after the revocation"));
+                }
+                let now = before.now();
+                let recipient_expiry = o
+                    .leases
+                    .get(s + 1)
+                    .map_or(o.witness_expires_at, |l| l.expires_at);
+                if now >= o.leases[s].expires_at || now >= recipient_expiry {
+                    p34(format!("{id:?}/{n}/{s}: corroborated on an expired lease"));
+                }
+                let lost = |who, witness| {
+                    before
+                        .registry()
+                        .right_lost_since(j.pool, who, witness, o.placed_seq)
+                };
+                let last = s + 1 == o.lenders.len();
+                let recipient = o.lenders.get(s + 1).copied().unwrap_or(o.witness);
+                if lost(o.lenders[s], false) || lost(recipient, last) {
+                    p34(format!(
+                        "{id:?}/{n}/{s}: corroborated after a right was withdrawn"
+                    ));
+                }
+                let committed = o.leases[s]
+                    .restored
+                    .as_ref()
+                    .map_or(0, |r| r.segments.len());
+                let named = c.segments.windows(2).all(|w| w[0] < w[1])
+                    && c.segments.iter().all(|k| (*k as usize) < committed);
+                if c.segments.is_empty() || !named {
+                    p34(format!(
+                        "{id:?}/{n}/{s}: corroborated segments nobody committed to"
+                    ));
+                }
             }
         }
     }

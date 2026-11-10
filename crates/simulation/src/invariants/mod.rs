@@ -170,6 +170,7 @@ pub fn check_step(
     out.extend(leases::step(before, cmd, result, after));
     out.extend(proofs::receipts_step(before, after));
     out.extend(proofs::finality_step(before, cmd, after, auditor));
+    out.extend(proofs::anteriority_step(before, cmd, after));
     // TEST-P04: production and acks only on the live attempt.
     if result.is_ok() {
         if let Command::Produce { job, attempt, .. } | Command::Ack { job, attempt, .. } = cmd {

@@ -58,7 +58,7 @@ impl Edge {
 
     fn envelope(&mut self, from: AccountId, body: Message) -> Envelope {
         self.seq += 1;
-        Envelope::signed(from, 1, self.seq, body, &user_key(from))
+        Envelope::signed(sim_domain(), from, 1, self.seq, body, &user_key(from))
     }
 
     fn send_env(&mut self, env: &Envelope) -> Answer {

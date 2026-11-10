@@ -20,12 +20,25 @@ pub struct LedgerLimits {
     /// Commission taken on release, in basis points (LEDGER-008). Set here so the orchestrator
     /// cannot change what lenders receive.
     pub commission_bps: u64,
-    /// A held reward cannot be released before this long after its last payment: the least
-    /// contest window a borrower always gets (JOB-R22).
+    /// A paid item cannot be released before this long after its own payment: the least contest
+    /// window a borrower always gets on every payment (JOB-R22).
     pub reward_hold: u64,
-    /// A held reward cannot be contested later than this after its oldest payment: after it, a
-    /// payment can only become final.
+    /// A paid item cannot be contested later than this after its own payment: after it, that
+    /// payment can only become final. Never below `reward_hold`, or an item could be stuck.
     pub contest_limit: u64,
+    /// Most recovery segments a lender may commit to in one readiness.
+    pub max_segments: usize,
+}
+
+impl LedgerLimits {
+    /// A held payment must always have a way out: it is releasable from `reward_hold` and
+    /// contestable until `contest_limit`, so the limit cannot come before the hold.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.contest_limit < self.reward_hold {
+            return Err("contest limit shorter than the reward hold");
+        }
+        Ok(())
+    }
 }
 
 impl Default for LedgerLimits {
@@ -37,6 +50,7 @@ impl Default for LedgerLimits {
             commission_bps: 1_000,
             reward_hold: 48 * 3600,
             contest_limit: 7 * 24 * 3600,
+            max_segments: 64,
         }
     }
 }
@@ -158,6 +172,8 @@ pub enum LedgerOp {
         restored: [u32; 3],
         /// Commitment to the restored state.
         state: u64,
+        /// Commitment to each recovery segment the lender recomputed, by segment number.
+        segments: Vec<u64>,
         signature: [u8; 64],
     },
     /// The recipient of `producer`'s output signed that it received `producer`'s restored state
@@ -166,10 +182,14 @@ pub enum LedgerOp {
         job: u32,
         attempt: u32,
         producer: u32,
-        /// Recovery segments `0..segments` were received.
-        segments: u32,
+        /// The segments the recipient attests, each named, in increasing order. The ledger
+        /// takes their commitments from the producer's signed readiness.
+        segments: Vec<u32>,
         signature: [u8; 64],
     },
+    /// The attempt is revoked: from this record on, no lease step and no corroboration is added
+    /// to it (JOB-R18, CE-03). What was recorded before stays.
+    RevokeAttempt { job: u32, attempt: u32 },
     /// Receipt signed by the recipient of `producer`'s output (LEDGER-016).
     RecordReceipt {
         job: u32,
@@ -233,6 +253,7 @@ impl LedgerOp {
             LedgerOp::AcceptLease { .. } => "AcceptLease",
             LedgerOp::LeaseReady { .. } => "LeaseReady",
             LedgerOp::RecordRestore { .. } => "RecordRestore",
+            LedgerOp::RevokeAttempt { .. } => "RevokeAttempt",
             LedgerOp::RecordReceipt { .. } => "RecordReceipt",
             LedgerOp::ChargeOutput { .. } => "ChargeOutput",
             LedgerOp::VoidOutput { .. } => "VoidOutput",

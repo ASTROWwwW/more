@@ -88,14 +88,16 @@ pub enum Command {
     /// JOB-R18: the recipient of `lender`'s output (next stage, or the witness) attests that it
     /// received `lender`'s restored state. `signature` is the recipient's over `restore_message`,
     /// checked by the ledger.
-    /// `segments`: recovery segments `0..segments` were received. The signature binds the job,
-    /// the attempt, the lender, its layer range, the restored positions, the segments and the
-    /// commitment the lender signed, so it cannot serve another recovery.
+    /// `segments`: the recovery segments received, each named, in increasing order. The
+    /// signature binds the deployment, the job, the attempt, the lender, its layer range, the
+    /// restored positions, the state commitment and each named segment with the commitment the
+    /// lender signed for it, so it serves no other recovery and no other segment. Admissible
+    /// only before the attempt's revocation, while both leases are in force (CE-03).
     CorroborateRestore {
         job: JobId,
         attempt: u32,
         lender: AccountId,
-        segments: u32,
+        segments: Vec<u32>,
         signature: [u8; 64],
     },
     /// Renews the sender's own lease (JOB-R31, JOB-R39).
@@ -158,14 +160,15 @@ pub enum Command {
     /// JOB-T06.
     PlacementFailed { job: JobId },
     /// JOB-T05, JOB-R38: the lender's state is restored to `restored`; `state` commits to that
-    /// restored state. Both are signed for the ledger (`ready_message`). The attempt starts when
-    /// every lease is ready.
+    /// restored state and `segments` to each recovery segment it recomputed. All are signed for
+    /// the ledger (`ready_message`). The attempt starts when every lease is ready.
     AttemptReady {
         job: JobId,
         attempt: u32,
         lender: AccountId,
         restored: PerType<u32>,
         state: u64,
+        segments: Vec<u64>,
         signature: [u8; 64],
     },
     /// Units produced by the cluster (JOB-R11, JOB-R13, JOB-R25).

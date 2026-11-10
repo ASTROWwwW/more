@@ -63,11 +63,15 @@ impl Sim {
                 let Ok(j) = c.job(id) else { return vec![] };
                 let Some(a) = j.current() else { return vec![] };
                 let lender = pick(&a.lenders, stage);
-                // Sometimes the recipient only received the first segment.
-                let segments = if stage % 5 == 4 { 1 } else { SEGMENTS };
+                // Sometimes the recipient only received the first segment, or all but one.
+                let segments = match stage % 5 {
+                    4 => vec![0],
+                    3 => vec![0, 2, 3],
+                    _ => all_segments(),
+                };
                 // Forged: the producer vouches for itself, under its own key.
-                let signature = match restoration_of(id, a, lender, segments) {
-                    Some(r) if forged => user_key(lender).sign(&restore_message(&r)),
+                let signature = match restoration_of(id, a, lender, &segments) {
+                    Some(r) if forged => user_key(lender).sign(&restore_message(&sim_domain(), &r)),
                     _ => UNSIGNED,
                 };
                 vec![Command::CorroborateRestore {

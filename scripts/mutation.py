@@ -3,8 +3,9 @@
 
 Each mutation puts a known (or plausible) bug back into the model. The suite must fail;
 if it passes, the checker has a blind spot.
-Usage: python3 scripts/mutation.py [--check] [M07 M12 ...]   (from the workspace root)
-`--check` only verifies that every anchor still matches; ids restrict the run.
+Usage: python3 scripts/mutation.py [--check] [--shard=K/N] [M07 M12 ...]   (from the workspace root)
+`--check` only verifies that every anchor still matches; ids restrict the run; `--shard=K/N`
+runs every N-th mutation starting at the K-th (K from 0), so N machines cover the table.
 """
 import os
 import re
@@ -79,7 +80,7 @@ MUTATIONS = [
     ("M26", "Reconciliation does not revoke expired leases", COORD,
      [("                        if j.current().is_some_and(|a| a.any_expired(now)) {\n                            todo.push(Command::NodeLost {", "                        if false {\n                            todo.push(Command::NodeLost {")]),
     ("M27", "Heartbeat renews an expired lease", COORD,
-     [("        if now >= lease.expires_at {\n            return Err(DomainError::LeaseExpired);\n        }", "")]),
+     [("if now >= expires_at {\n return Err(DomainError::LeaseExpired);\n }", "")]),
     ("M28", "Delivery window closed without waiting for revocation", COORD,
      [(".revoked_at\n                    .is_some_and(|r| now >= r + w);", ".revoked_at\n                    .is_none_or(|r| now >= r + w);")]),
     ("M29", "Client may confirm beyond delivered", COORD,
@@ -205,42 +206,97 @@ MUTATIONS = [
     ("M87", "CE-08 back: reconciliation skips a transition the ledger failed", COORD,
      [("Err(DomainError::Ledger(e)) => {\n return Err(DomainError::Internal(format!(\n \"reconcile {cmd:?}: ledger {e:?}\"\n )))\n }", "Err(DomainError::Ledger(_)) => {}")]),
     ("M88", "Ledger pays recovery without a corroborated restoration", COORD,
-     [("if !rec.corroborated[s].is_some_and(|n| segment < n) {", "if false && !rec.corroborated[s].is_some_and(|n| segment < n) {")]),
+     [("if !rec.corroborates(s, segment) {", "if false && !rec.corroborates(s, segment) {")]),
     ("M89", "Restoration corroborated by any signer", COORD,
      [(".map_err(|_| proof(\"restoration not corroborated by the producer's recipient\"))?;", ".ok();")]),
     ("M90", "A ruling pays recovery nobody corroborated", COORD,
      [("ItemKind::Recovery(rid) => self.restore_corroborated(rid, lender),\n ItemKind::Contribution(_) => true,", "ItemKind::Recovery(_) => true,\n ItemKind::Contribution(_) => true,")]),
     ("M91", "Evaluation pays recovery on the lender's word alone", COORD,
      [("if attempt_ready && !self.restore_corroborated(rid, lender) =>", "if false && attempt_ready && !self.restore_corroborated(rid, lender) =>")]),
-    ("M92", "Restoration corroborated for a lender that never reported ready", COORD,
-     [("if lease.state != LeaseState::Ready {\n return Err(DomainError::Precondition(\n \"JOB-R18: nothing restored to corroborate\",", "if false && lease.state != LeaseState::Ready {\n return Err(DomainError::Precondition(\n \"JOB-R18: nothing restored to corroborate\",")]),
+    ("M92", "Corroboration accepted for a segment the lender never committed to", COORD,
+     [("c.map(|c| (*k, *c))", "Some((*k, c.copied().unwrap_or(0)))")]),
     ("M93", "Recovery held before the deadline instead of waiting for its corroboration", COORD,
      [("if before_deadline {\n Decision::Defer\n } else {\n Decision::Dispute", "if false && before_deadline {\n Decision::Defer\n } else {\n Decision::Dispute")]),
     # ---- verifications asked before validating: content binding, finality, bounded contests
     ("M94", "A corroboration can be replaced by another one", COORD,
-     [("if !rec.ready[s] || rec.corroborated[s].is_some() || segments == 0 {", "if !rec.ready[s] || segments == 0 {")]),
+     [("if !rec.ready[s] || rec.corroborated[s].is_some() || segments.is_empty() {", "if !rec.ready[s] || segments.is_empty() {")]),
     ("M95", "Recovery paid for a segment the corroboration does not cover", COORD,
-     [("if !rec.corroborated[s].is_some_and(|n| segment < n) {", "if rec.corroborated[s].is_none() {")]),
+     [("if !rec.corroborates(s, segment) {", "if rec.corroborated[s].is_none() {")]),
     ("M96", "A recorded receipt replaced by a contradictory one", COORD,
      [(".is_some_and(|d| *d != digest)", ".is_some_and(|d| false && *d != digest)")]),
-    ("M97", "Reward released inside the contest window", COORD,
-     [("if self.now < open_until {", "if false && self.now < open_until {")]),
-    ("M98", "Reward contested past the ledger's limit", COORD,
-     [("if self.now >= limit {", "if false && self.now >= limit {")]),
+    ("M97", "A payment released inside its own contest window", COORD,
+     [("let due = |paid_at: u64| paid_at.checked_add(hold).is_some_and(|t| now >= t);", "let due = |paid_at: u64| paid_at.checked_add(hold).is_some_and(|t| now >= t) || now >= paid_at;")]),
+    ("M98", "A payment contested past its own limit", COORD,
+     [("let open = |paid_at: u64| paid_at.checked_add(limit).is_none_or(|t| now < t);", "let open = |paid_at: u64| paid_at.checked_add(limit).is_none_or(|t| now < t) || now >= paid_at;")]),
     ("M99", "The ledger's clock can go back", COORD,
      [("if now < self.now {", "if false && now < self.now {")]),
     ("M100", "Coordinator lets a second corroboration through", COORD,
-     [("Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {\n return Err(DomainError::Precondition(\n \"JOB-R18: restoration already corroborated\",\n ))\n }", "Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {}")]),
+     [("Some(c) if c.segments == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {\n return Err(DomainError::Precondition(\n \"JOB-R18: restoration already corroborated\",\n ))\n }", "Some(c) if c.segments == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {}")]),
     ("M101", "Corroboration signature does not cover the state commitment", COORD,
-     [(".u32(r.segments)\n .u64(r.state)\n .0", ".u32(r.segments)\n .0")]),
+     [("let e = r.restored.iter().fold(e, |e, x| e.u32(*x)).u64(r.state);", "let e = r.restored.iter().fold(e, |e, x| e.u32(*x));")]),
     ("M102", "Corroboration signature does not cover the layer range", COORD,
      [(".u32(r.producer)\n .u32(r.layers.0)\n .u32(r.layers.1);", ".u32(r.producer);")]),
     ("M103", "Corroboration signature does not cover the segments", COORD,
-     [(".fold(e, |e, x| e.u32(*x))\n .u32(r.segments)", ".fold(e, |e, x| e.u32(*x))")]),
+     [(".fold(e.len(r.segments.len()), |e, (k, c)| e.u32(*k).u64(*c))", ".fold(e, |e, _| e)")]),
     ("M104", "Coordinator ignores the contest limit", COORD,
-     [("if oldest.is_some_and(|t| self.now >= t + limit) {", "if false && oldest.is_some_and(|t| self.now >= t + limit) {")]),
+     [("let open = |paid_at: Time| paid_at.checked_add(limit).is_none_or(|t| now < t);", "let open = |paid_at: Time| paid_at.checked_add(limit).is_none_or(|t| now < t) || now >= paid_at;")]),
     ("M105", "Coordinator pays recovery beyond the corroborated segments", COORD,
-     [(".is_some_and(|n| rid.segment < n)", ".is_some()")]),
+     [(".is_some_and(|c| c.segments.contains(&rid.segment))", ".is_some()")]),
+    # ---- third review: per-payment windows, named segments, deployment domain, anteriority
+    ("M106", "Ledger closes every payment of the line on a release or a contest", COORD,
+     [("for id in ids {\n if let Some(i) = e.items.get_mut(id) {\n i.rewarded = true;\n }\n }", "let _ = ids;\n for i in e.items.values_mut() {\n if i.state == ItemState::Paid {\n i.rewarded = true;\n }\n }")]),
+    ("M107", "Coordinator closes every payment of the line on a contest", COORD,
+     [("l.contested = add(l.contested, amount, \"contested\")?;\n for k in idxs {\n l.items[k].reward_done = true;\n }", "l.contested = add(l.contested, amount, \"contested\")?;\n let _ = idxs;\n for it in l.items.iter_mut() {\n it.reward_done = true;\n }")]),
+    ("M108", "Ledger records a corroboration after the attempt's revocation", COORD,
+     [("if rec.revoked.is_some() {\n return Err(proof(\"corroboration after the attempt's revocation\"));\n }", "")]),
+    ("M109", "Ledger records a lease acceptance on a revoked attempt", COORD,
+     [("if rec.accepted[s] || rec.revoked.is_some() {", "if rec.accepted[s] {")]),
+    ("M110", "Ledger records a readiness on a revoked attempt", COORD,
+     [("if rec.revoked.is_some() {\n return Err(invalid(\"attempt revoked\"));\n }", "")]),
+    ("M111", "Coordinator takes a corroboration after the revocation", COORD,
+     [("if a.revoked_seq.is_some() {\n return Err(DomainError::InadmissibleProof);\n }", "")]),
+    ("M112", "Revocation not recorded at the ledger", COORD,
+     [("self.ledger_op(LedgerOp::RevokeAttempt {\n job: job_acct(job),\n attempt,\n })?;", "")]),
+    ("M113", "Corroboration taken on the producer's expired lease", COORD,
+     [("if self.now >= lease.expires_at || self.now >= recipient_expiry {", "if self.now >= recipient_expiry {")]),
+    ("M114", "Corroboration taken on the recipient's expired lease", COORD,
+     [("if self.now >= lease.expires_at || self.now >= recipient_expiry {", "if self.now >= lease.expires_at {")]),
+    ("M115", "Witness's expiry ignored when it is the recipient", COORD,
+     [("None => a.witness_expires_at,", "None => u64::MAX,")]),
+    ("M116", "Producer's withdrawn right ignored", COORD,
+     [("if lost(lender, false) || lost(recipient, last) {", "if lost(recipient, last) {")]),
+    ("M117", "Recipient's withdrawn right ignored", COORD,
+     [("if lost(lender, false) || lost(recipient, last) {", "if lost(lender, false) {")]),
+    ("M118", "Granting a right again erases its withdrawal", COORD,
+     [("if had && !has {\n self.lost.insert((pool, account, witness), seq);\n }", "if had && !has {\n self.lost.insert((pool, account, witness), seq);\n } else if has {\n self.lost.remove(&(pool, account, witness));\n }")]),
+    ("M119", "Any withdrawn right of the producer voids its restoration", COORD,
+     [("if lost(lender, false) || lost(recipient, last) {", "if lost(lender, false) || lost(lender, true) || lost(recipient, last) {")]),
+    ("M120", "Statements not bound to the deployment", COORD,
+     [("v.extend_from_slice(&d.0);", "let _ = d;")]),
+    ("M121", "Corroboration does not bind each segment's commitment", COORD,
+     [(".fold(e.len(r.segments.len()), |e, (k, c)| e.u32(*k).u64(*c))", ".fold(e.len(r.segments.len()), |e, (k, _)| e.u32(*k))")]),
+    ("M122", "Readiness does not bind the segment commitments", COORD,
+     [(".u64(r.state)\n .list64(&r.segments)\n .0", ".u64(r.state)\n .0")]),
+    ("M123", "Ledger takes a segment named twice or out of order", COORD,
+     [("if !segments.windows(2).all(|w| w[0] < w[1]) {\n return Err(invalid(\"segments named once each, in increasing order\"));\n }", "")]),
+    ("M124", "No limit on the segments a lender commits to", COORD,
+     [("if segments.len() > self.limits.max_segments {\n return Err(LedgerApiError::LimitExceeded(\"too many recovery segments\"));\n }", "")]),
+    ("M125", "A revocation can be recorded twice", COORD,
+     [("if rec.revoked.is_some() {\n return Err(invalid(\"attempt already revoked\"));\n }", "")]),
+    ("M126", "Ledger records carry no order", COORD,
+     [("Ok(out) => {\n self.seq += 1;", "Ok(out) => {")]),
+    ("M127", "Coordinator lets an unordered segment list through", COORD,
+     [("if segments.is_empty() || !segments.windows(2).all(|w| w[0] < w[1]) {", "if segments.is_empty() {")]),
+    ("M128", "Witness's withdrawn right looked up as a right to lend", COORD,
+     [("if lost(lender, false) || lost(recipient, last) {", "if lost(lender, false) || lost(recipient, false) {")]),
+    ("M129", "Envelope signed for another deployment accepted", COORD,
+     [("if env.domain != coord.domain() {\n return Err(ProtoError::WrongDeployment);\n }", "")]),
+    ("M130", "Envelope signature does not cover the deployment", COORD,
+     [("out.extend_from_slice(self.domain.as_bytes());", "")]),
+    ("M131", "Limits that can strand a payment accepted", COORD,
+     [("if self.contest_limit < self.reward_hold {", "if false && self.contest_limit < self.reward_hold {")]),
+    ("M132", "Coordinator runs on another deployment's ledger", COORD,
+     [("if verifier.domain() != ledger.domain() {", "if false && verifier.domain() != ledger.domain() {")]),
 ]
 
 EXTRA = {
@@ -321,12 +377,16 @@ def main():
     if "--check" in sys.argv:
         return check_anchors()
     only = [a for a in sys.argv[1:] if not a.startswith("--")]
+    shard = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--shard=")), None)
+    if shard:
+        k, n = (int(x) for x in shard.split("/"))
+        only = [m[0] for i, m in enumerate(MUTATIONS) if i % n == k and (not only or m[0] in only)]
     # The campaign is only worth what it was run on: say which commit, and refuse a dirty tree.
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     if dirty:
         raise SystemExit(f"working tree not clean, refusing to mutate it:\n{dirty}")
-    print(f"commit {head}", flush=True)
+    print(f"commit {head}" + (f", shard {shard}" if shard else ""), flush=True)
     results = []
     for mid, desc, path, reps in MUTATIONS:
         if only and mid not in only:
