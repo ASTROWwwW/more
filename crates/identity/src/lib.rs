@@ -511,7 +511,7 @@ impl VerifiedAccount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
     Account(AccountNo),
-        Service(Box<ServiceCredential>),
+    Service(Box<ServiceCredential>),
 }
 
 /// Verified caller identity handed to the domains. Built only from a [`VerifiedAccount`] or a

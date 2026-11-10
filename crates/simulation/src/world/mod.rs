@@ -45,6 +45,8 @@ pub struct Sim {
     pub refusal_counts: std::collections::BTreeMap<String, u64>,
     /// Where the time goes: copying the state for the checker, running the command, checking.
     pub time: [std::time::Duration; 3],
+    /// A second coordinator, with its ledger behind the link, sent every command too.
+    pub shadow: Option<crate::remote::RemoteRig>,
 }
 
 impl Default for Sim {
@@ -55,9 +57,23 @@ impl Default for Sim {
 
 impl Sim {
     pub fn new(cfg: Config) -> Self {
+        Self::build(cfg, |_| None)
+    }
+
+    /// The default simulation, shadowed from its first setup command by a coordinator whose
+    /// ledger is behind the link `shadow` builds for these identities.
+    pub fn shadowed(shadow: impl FnOnce(&SimIdentity) -> crate::remote::RemoteRig) -> Self {
+        Self::build(sim_config(), |ids| Some(shadow(ids)))
+    }
+
+    fn build(
+        cfg: Config,
+        shadow: impl FnOnce(&SimIdentity) -> Option<crate::remote::RemoteRig>,
+    ) -> Self {
         let (ids, orchestrator) = SimIdentity::new();
         let coord = Coordinator::new(cfg, ids.verifier_ledger(), orchestrator, ids.verifier())
             .expect("valid simulation config");
+        let shadow = shadow(&ids);
         let mut sim = Sim {
             coord,
             ids: Arc::new(ids),
@@ -68,6 +84,7 @@ impl Sim {
             structural_claims: Vec::new(),
             refusal_counts: Default::default(),
             time: Default::default(),
+            shadow,
         };
         for c in setup_commands() {
             sim.exec(c).expect("setup must succeed");
@@ -87,6 +104,7 @@ impl Sim {
             structural_claims: Vec::new(),
             refusal_counts: Default::default(),
             time: Default::default(),
+            shadow: None,
         }
     }
 
@@ -100,7 +118,15 @@ impl Sim {
     fn quiet(&mut self, cmd: &Command) {
         let ctx = self.actor(cmd);
         let cmd = self.signed(&ctx, cmd.clone());
-        let _ = self.coord.execute(&ctx, &cmd);
+        let res = self.coord.execute(&ctx, &cmd);
+        self.follow(&ctx, &cmd, &res);
+    }
+
+    fn follow(&mut self, ctx: &AuthContext, cmd: &Command, res: &Result<Outcome, DomainError>) {
+        if let Some(mut rig) = self.shadow.take() {
+            rig.follow(ctx, cmd, res, &self.coord, self.ledger());
+            self.shadow = Some(rig);
+        }
     }
 
     /// Registers the key of an account that is not in the default set.
@@ -159,6 +185,7 @@ impl Sim {
         let t1 = std::time::Instant::now();
         let res = self.coord.execute(ctx, &cmd);
         let t2 = std::time::Instant::now();
+        self.follow(ctx, &cmd, &res);
         if let (
             Ok(Outcome::Applied),
             Command::Claim {

@@ -56,9 +56,10 @@ impl Coordinator {
                 Ok(Outcome::AlreadyApplied)
             }
             Some(Err(e)) => Err(e.into()),
-            None => Err(DomainError::Precondition(
-                "LEDGER-003: the treasury issues at the ledger itself",
-            )),
+            // The ledger is in its own process: the treasury issues there, with its own key. The
+            // command is only a notice here. It takes its place in the log, so that positions
+            // mean the same in one process or two, and changes nothing else.
+            None => Ok(Outcome::Applied),
         }
     }
 

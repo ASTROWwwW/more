@@ -2,10 +2,12 @@
 //! no database.
 
 pub mod invariants;
+pub mod remote;
 pub mod stats;
 pub mod world;
 
 pub use invariants::{check_fairness, check_state, check_step, Violation};
+pub use remote::RemoteRig;
 pub use stats::Stats;
 pub use world::{
     all_segments, assignment_of, bring_up, catalog, corroborate, layout_of, mandate, op_strategy,

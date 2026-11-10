@@ -13,6 +13,12 @@ pub struct SimIdentity {
     pub auditor: ServiceCredential,
     /// Valid credential with no right in the domain, for compromise tests.
     pub delivery: ServiceCredential,
+    /// The orchestrator's own identity towards the ledger.
+    pub(crate) orchestrator: ServiceCredential,
+    /// The ledger's identity, for a ledger behind the link.
+    pub ledger: ServiceCredential,
+    /// Registers account keys with a ledger that runs in its own process.
+    pub registrar: ServiceCredential,
     authority: IdentityAuthority,
 }
 
@@ -38,6 +44,9 @@ impl SimIdentity {
             reconciler: authority.issue(ServiceRole::Reconciler),
             auditor: authority.issue(ServiceRole::Auditor),
             delivery: authority.issue(ServiceRole::Delivery),
+            orchestrator: orchestrator.clone(),
+            ledger: authority.issue(ServiceRole::Ledger),
+            registrar: authority.issue(ServiceRole::Identity),
             authority,
         };
         (ids, orchestrator)

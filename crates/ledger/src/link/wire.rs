@@ -862,7 +862,8 @@ pub struct LedgerSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Execute(LedgerOp),
-    /// Opens a transaction: what follows is applied entirely at `Commit` or not at all.
+    /// Opens a transaction: what follows is applied entirely at `Commit` or not at all. Inside
+    /// a transaction it opens a nested one, which `Abort` undoes alone.
     Begin,
     Commit,
     Abort,
@@ -890,7 +891,8 @@ pub enum Refusal {
     /// Another connection holds a transaction: try again.
     Busy,
     NoTransaction,
-    TransactionOpen,
+    /// More transactions nested than allowed.
+    TransactionTooDeep,
     /// The transaction held more operations than allowed and was rolled back.
     TransactionTooLarge,
 }
@@ -1099,7 +1101,7 @@ fn get_request(r: &mut R) -> Res<Request> {
 const REFUSALS: [Refusal; 4] = [
     Refusal::Busy,
     Refusal::NoTransaction,
-    Refusal::TransactionOpen,
+    Refusal::TransactionTooDeep,
     Refusal::TransactionTooLarge,
 ];
 

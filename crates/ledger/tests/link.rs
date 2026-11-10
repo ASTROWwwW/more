@@ -281,7 +281,7 @@ fn sample_messages(w: &World) -> Vec<Message> {
     for r in [
         Refusal::Busy,
         Refusal::NoTransaction,
-        Refusal::TransactionOpen,
+        Refusal::TransactionTooDeep,
         Refusal::TransactionTooLarge,
     ] {
         answers.push(Response::Refused(r));
@@ -890,11 +890,32 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
     let before = state(&w);
     // Aborted: two reserves and a refused operation leave no trace at all.
     orch.begin().unwrap().unwrap();
-    refused(orch.begin(), Refusal::TransactionOpen);
     orch.execute(reserve(1)).unwrap().unwrap();
     orch.execute(reserve(2)).unwrap().unwrap();
     assert!(orch.execute(reserve(2)).unwrap().is_err(), "duplicate key");
     assert!(state(&w) != before);
+    // A nested transaction is undone alone, or kept until the outer one decides.
+    let outer = state(&w);
+    orch.begin().unwrap().unwrap();
+    orch.execute(reserve(6)).unwrap().unwrap();
+    orch.abort().unwrap().unwrap();
+    assert!(
+        state(&w) == outer,
+        "the nested abort undoes its own part only"
+    );
+    orch.begin().unwrap().unwrap();
+    orch.execute(reserve(7)).unwrap().unwrap();
+    orch.commit().unwrap().unwrap();
+    assert!(state(&w) != outer, "kept, for now");
+    // Nesting is bounded.
+    let depth = HostLimits::default().max_tx_depth;
+    for _ in 1..depth {
+        orch.begin().unwrap().unwrap();
+    }
+    refused(orch.begin(), Refusal::TransactionTooDeep);
+    for _ in 1..depth {
+        orch.commit().unwrap().unwrap();
+    }
     // Meanwhile the others wait: they neither write nor read uncommitted state.
     assert_eq!(
         clock.execute(LedgerOp::Advance { now: 9 }),

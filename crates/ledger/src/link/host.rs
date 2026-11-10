@@ -25,8 +25,10 @@ pub trait HostEnv {
 /// Bounds on what one connection can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostLimits {
-    /// Most operations in one transaction.
+    /// Most operations in one transaction, nested ones included.
     pub max_tx_ops: u32,
+    /// Most transactions nested in one another.
+    pub max_tx_depth: usize,
     /// A transaction older than this is rolled back as soon as another connection needs the
     /// ledger.
     pub tx_timeout_ms: u64,
@@ -36,6 +38,7 @@ impl Default for HostLimits {
     fn default() -> Self {
         HostLimits {
             max_tx_ops: 4096,
+            max_tx_depth: 4,
             tx_timeout_ms: 5_000,
         }
     }
@@ -77,8 +80,8 @@ pub struct Reply {
 
 struct Tx {
     conn: u64,
-    /// The ledger as it was at `Begin`.
-    snapshot: LedgerService,
+    /// The ledger as it was at each `Begin` still open, outermost first. Never empty.
+    snapshots: Vec<LedgerService>,
     ops: u32,
     opened_ms: u64,
 }
@@ -143,10 +146,31 @@ impl LedgerHost {
         }
     }
 
+    /// Undoes the whole transaction, nested ones included.
     fn rollback(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            self.service = tx.snapshot;
+        if let Some(first) = self
+            .tx
+            .take()
+            .and_then(|tx| tx.snapshots.into_iter().next())
+        {
+            self.service = first;
         }
+    }
+
+    /// Closes the innermost transaction, keeping what it did or undoing it.
+    fn end(&mut self, keep: bool) -> Response {
+        let Some(tx) = self.tx.as_mut() else {
+            return Response::Refused(Refusal::NoTransaction);
+        };
+        let inner = tx.snapshots.pop();
+        if tx.snapshots.is_empty() {
+            self.tx = None;
+        }
+        match inner {
+            Some(before) if !keep => self.service = before,
+            _ => {}
+        }
+        Response::Done
     }
 
     fn fault(&mut self, conn: &mut Conn, fault: Fault) -> Reply {
@@ -257,27 +281,26 @@ impl LedgerHost {
                 }
             }
             Request::Begin if role != ServiceRole::Orchestrator => forbidden("Begin"),
-            Request::Begin if self.tx.is_some() => Response::Refused(Refusal::TransactionOpen),
             Request::Begin => {
-                self.tx = Some(Tx {
-                    conn,
-                    snapshot: self.service.clone(),
-                    ops: 0,
-                    opened_ms: now_ms,
-                });
+                let now = self.service.clone();
+                match self.tx.as_mut() {
+                    Some(tx) if tx.snapshots.len() >= self.limits.max_tx_depth => {
+                        return Response::Refused(Refusal::TransactionTooDeep);
+                    }
+                    Some(tx) => tx.snapshots.push(now),
+                    None => {
+                        self.tx = Some(Tx {
+                            conn,
+                            snapshots: vec![now],
+                            ops: 0,
+                            opened_ms: now_ms,
+                        });
+                    }
+                }
                 Response::Done
             }
-            Request::Commit | Request::Abort if self.tx.is_none() => {
-                Response::Refused(Refusal::NoTransaction)
-            }
-            Request::Commit => {
-                self.tx = None;
-                Response::Done
-            }
-            Request::Abort => {
-                self.rollback();
-                Response::Done
-            }
+            Request::Commit => self.end(true),
+            Request::Abort => self.end(false),
             Request::Info => Response::Info(LedgerInfo {
                 limits: self.service.limits().clone(),
                 domain: self.service.domain(),
