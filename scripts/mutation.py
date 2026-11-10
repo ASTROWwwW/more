@@ -15,7 +15,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Mutation anchors are searched in these trees; each anchor must match exactly once.
-SOURCES = ["crates/domain/src", "crates/ledger/src", "crates/protocol/src", "crates/identity/src"]
+SOURCES = ["crates/domain/src", "crates/ledger/src", "crates/ledgerd/src", "crates/protocol/src", "crates/identity/src"]
 COORD = MODEL = None  # kept for readability of the table: the file is found by its anchor
 REGRESSIONS = "tests/properties/proptest-regressions.txt"
 
@@ -152,7 +152,7 @@ MUTATIONS = [
     ("M61", "Coordinator accepts revoked or forged service credentials", COORD,
      [(".map_err(|_| DomainError::Unauthorized(\"invalid or revoked service credential\"))?;", ".ok();")]),
     ("M62", "Service credential accepted without checking the authority's signature", COORD,
-     [(".map_err(|_| AuthError::InvalidCredential)?;", ".ok();")]),
+     [("&Signature::from_bytes(&cred.tag),\n )\n .map_err(|_| AuthError::InvalidCredential)?;", "&Signature::from_bytes(&cred.tag),\n )\n .ok();")]),
     # ---- second audit: what the ledger holds against the orchestrator, per-node leases
     ("M63", "Finding 1: a recovery reserve refunded to the output hold", COORD,
      [("source(line.job, item),\n it.amount,\n \"JOB-S04 refund\",", "Account::OutputHold(line.job),\n it.amount,\n \"JOB-S04 refund\",")]),
@@ -297,6 +297,77 @@ MUTATIONS = [
      [("if self.contest_limit < self.reward_hold {", "if false && self.contest_limit < self.reward_hold {")]),
     ("M132", "Coordinator runs on another deployment's ledger", COORD,
      [("if verifier.domain() != ledger.domain() {", "if false && verifier.domain() != ledger.domain() {")]),
+    # ---- the ledger in its own process: identities with keys, the link, transactions, the daemon
+    ("M133", "A checked certificate vouches for another key", COORD,
+     [("let key = (cred.id.0, cred.role as u8, cred.key, cred.tag);", "let key = (cred.id.0, cred.role as u8, [0u8; 32], cred.tag);")]),
+    ("M134", "The authority's signature does not cover the service's key", COORD,
+     [("msg.push(role as u8);\n msg.extend_from_slice(key);", "msg.push(role as u8);\n let _ = key;")]),
+    ("M135", "An identity file may carry a key that is not the certified one", COORD,
+     [("(key.verifying_key().to_bytes() == cert.key).then_some(ServiceCredential { cert, key })", "Some(ServiceCredential { cert, key })")]),
+    ("M136", "A revocation is accepted without the authority's signature", COORD,
+     [(".verify(&revocation_message(id), &Signature::from_bytes(signature))\n .map_err(|_| AuthError::BadSignature)?;", ".verify(&revocation_message(id), &Signature::from_bytes(signature))\n .ok();")]),
+    ("M137", "Link: a certificate opens a connection without proof of its key", COORD,
+     [("if cert.verify(&expected, &signature).is_err() {", "if false && cert.verify(&expected, &signature).is_err() {")]),
+    ("M138", "Link: any certificate is accepted at hello", COORD,
+     [("if self.verifier.verify_certificate(&cert).is_err() {\n return self.fault(conn, Fault::Unauthenticated);\n }\n let mine", "let mine")]),
+    ("M139", "Link: a hello for another deployment is accepted", COORD,
+     [("if domain != self.service.domain() {\n return self.fault(conn, Fault::WrongDeployment);\n }", "")]),
+    ("M140", "Link: any protocol version is accepted", COORD,
+     [("if version != LINK_VERSION {\n return self.fault(conn, Fault::UnsupportedVersion);\n }", "")]),
+    ("M141", "Link: a revoked service keeps its open connection", COORD,
+     [("if self.verifier.verify_certificate(&cert).is_err() {\n return self.fault(conn, Fault::Unauthenticated);\n }\n conn.state = State::Ready(cert);", "conn.state = State::Ready(cert);")]),
+    ("M142", "Link: request numbers are not checked", COORD,
+     [("if conn.seq.checked_add(1) != Some(seq) {\n return self.fault(conn, Fault::OutOfOrder);\n }", "")]),
+    ("M143", "Link: others act on a ledger held by a transaction", COORD,
+     [("if age.is_none_or(|a| a < self.limits.tx_timeout_ms) {\n return Response::Refused(Refusal::Busy);\n }\n self.rollback();", "let _ = age;")]),
+    ("M144", "Link: a transaction never times out", COORD,
+     [("if age.is_none_or(|a| a < self.limits.tx_timeout_ms) {", "if age.is_none_or(|a| a < u64::MAX) {")]),
+    ("M145", "Link: any service may open a transaction", COORD,
+     [("Request::Begin if role != ServiceRole::Orchestrator => forbidden(\"Begin\"),", "")]),
+    ("M146", "Link: an aborted transaction is not undone", COORD,
+     [("Some(before) if !keep => self.service = before,", "Some(_) if false => {}")]),
+    ("M147", "Link: a closed connection keeps its uncommitted work", COORD,
+     [("if self.tx.as_ref().is_some_and(|tx| tx.conn == conn.id) {\n self.rollback();\n }", "")]),
+    ("M148", "Link: no limit on the size of a transaction", COORD,
+     [("if tx.ops > self.limits.max_tx_ops {", "if false && tx.ops > self.limits.max_tx_ops {")]),
+    ("M149", "Link: no limit on nested transactions", COORD,
+     [("Some(tx) if tx.snapshots.len() >= self.limits.max_tx_depth => {\n return Response::Refused(Refusal::TransactionTooDeep);\n }", "")]),
+    ("M150", "Link: any service may register account keys", COORD,
+     [("Request::RegisterKey { .. } if role != ServiceRole::Identity => {\n forbidden(\"RegisterKey\")\n }", "")]),
+    ("M151", "Link: a full rollback stops at the innermost transaction", COORD,
+     [("self.tx.take().and_then(|tx| tx.snapshots.into_iter().next())", "self.tx.take().and_then(|tx| tx.snapshots.into_iter().last())")]),
+    ("M152", "Link: the proof does not depend on the ledger's nonce (replay)", COORD,
+     [("w.bytes(client_nonce);\n w.bytes(ledger_nonce);", "w.bytes(client_nonce);\n let _ = ledger_nonce;")]),
+    ("M153", "Link: the client accepts a peer that is not a ledger", COORD,
+     [("if verifier.verify_certificate(&ledger) != Ok(ServiceRole::Ledger)\n || ledger.verify(&sign(true), &signature).is_err()", "if verifier.verify_certificate(&ledger).is_err()\n || ledger.verify(&sign(true), &signature).is_err()")]),
+    ("M154", "Link: the client does not check the ledger's proof", COORD,
+     [("if verifier.verify_certificate(&ledger) != Ok(ServiceRole::Ledger)\n || ledger.verify(&sign(true), &signature).is_err()", "if verifier.verify_certificate(&ledger) != Ok(ServiceRole::Ledger)")]),
+    ("M155", "Link: bytes after a message are ignored", COORD,
+     [("r.end()?;\n Ok(m)", "Ok(m)")]),
+    ("M156", "Link: a list length is trusted before the bytes are there", COORD,
+     [("Some(bytes) if bytes <= self.buf.len() => Ok(n),", "Some(_) => Ok(n),")]),
+    ("M157", "Link: no limit on the length of a text", COORD,
+     [("if n > MAX_TEXT {\n return Err(Malformed);\n }", "")]),
+    ("M158", "Coordinator: no transaction around a command", COORD,
+     [("LedgerLink::Remote(port, _) => with(port, |p| p.begin()),", "LedgerLink::Remote(..) => Ok(()),")]),
+    ("M159", "Coordinator: a refused command is not rolled back at the ledger", COORD,
+     [("if self.ledger.abort().is_err() {\n return Err(e);\n }\n Err(e)", "Err(e)")]),
+    ("M160", "Coordinator: an applied command is never committed", COORD,
+     [("next.ledger.commit()?;", "")]),
+    ("M161", "Coordinator: a repeated command leaves its transaction open", COORD,
+     [("Ok(out) => {\n self.ledger.abort()?;\n Ok(out)\n }", "Ok(out) => Ok(out),")]),
+    ("M162", "Daemon: memory left readable by the same user", COORD,
+     [("seal_memory().map_err(|e| format!(\"cannot seal the process memory: {e}\"))?;", "")]),
+    ("M163", "Daemon: socket left with the default permissions", COORD,
+     [("fs::set_permissions(&cfg.socket, fs::Permissions::from_mode(0o600))\n .map_err(|e| format!(\"{}: {e}\", cfg.socket.display()))?;", "")]),
+    ("M164", "Daemon: key file readable by others accepted", COORD,
+     [("if mode & 0o077 != 0 {", "if false && mode & 0o077 != 0 {")]),
+    ("M165", "Daemon: a dead connection keeps its transaction", COORD,
+     [("host.lock()\n .unwrap_or_else(|e| e.into_inner())\n .close(&mut conn);", "let _ = &mut conn;")]),
+    ("M166", "Daemon: a frame of any length is read", COORD,
+     [("if n > MAX_FRAME {\n return Err(std::io::Error::other(\"frame above the limit\"));\n }", "")]),
+    ("M167", "Ledger: an operation runs under another role than the connection's", COORD,
+     [("if role != op.required_role() {", "if false && role != op.required_role() {")]),
 ]
 
 EXTRA = {
@@ -319,6 +390,10 @@ def run_suite():
     real = [f for f in failed if f != "generator_reaches_interesting_paths"]
     props = sorted(set(re.findall(r"\[(TEST-P\d+)\]", out)))
     compile_error = "error[E" in out or "could not compile" in out
+    # A test binary that dies (abort, stack overflow, out of memory) fails the run without
+    # listing a test: that is a detection too, reported as such.
+    if p.returncode != 0 and not failed and not compile_error:
+        real = failed = ["(a test binary died)"]
     return not real, failed, props, compile_error
 
 
