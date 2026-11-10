@@ -196,8 +196,13 @@ fn r2_settlement_waits_for_every_item_and_is_final() {
             assignment: assignment(2, &[L1, L2], &[3, 1], 0),
         },
     ];
+    // Each is refused because the job is settled, whatever else would also have stopped it.
     for op in late {
-        assert!(w.run(op.clone()).is_err(), "{op:?} accepted after closure");
+        assert_eq!(
+            w.run(op.clone()),
+            Err(LedgerApiError::EscrowSettled(JOB)),
+            "{op:?} after closure"
+        );
     }
     assert!(w.accept(&a, 0, L1).is_err());
     assert_eq!(closed, w.balances());
@@ -403,7 +408,23 @@ fn r2_charges_and_voids_follow_the_ledgers_records() {
         output: out(0),
         gen: 0,
     };
-    assert!(w.run(void.clone()).is_err(), "void with a live share");
+    // A second charged output keeps enough in the hold to cover the void, so the refusal below
+    // comes from the live share and not from a short balance.
+    w.charge(1, 1).unwrap();
+    let before = w.balances();
+    assert_eq!(
+        w.run(void.clone()),
+        Err(LedgerApiError::Invalid(
+            "void of an output with live shares"
+        ))
+    );
+    assert_eq!(before, w.balances());
+    let other = LedgerOp::VoidOutput {
+        job: JOB,
+        output: out(1),
+        gen: 0,
+    };
+    assert_eq!(w.run(other), Ok(LedgerOutcome::Moved(8)));
     w.run(LedgerOp::RefundLine {
         line: line(1, L1),
         item: contribution(0, 0),

@@ -556,6 +556,17 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
         let a = &e.attempts[&it.line.attempt];
         let s = a.stage_of(it.line.lender);
         prop_assert!(s.is_some_and(|s| a.accepted[s]), "{id:?} after {c:?}");
+        // A share that holds or took money keeps its output charged: no void under it.
+        if let ItemId::Contribution { output, gen, .. } = id {
+            let charged = e.outputs.get(output).and_then(|o| o.charged);
+            prop_assert_eq!(
+                charged,
+                Some((it.line.attempt, *gen)),
+                "{:?} after {:?}",
+                id,
+                c
+            );
+        }
         match id {
             ItemId::Contribution { output, .. } if it.state == ItemState::Paid => {
                 let r = e
