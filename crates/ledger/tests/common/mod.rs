@@ -36,6 +36,17 @@ pub const STATE: u64 = 0xabc;
 pub const SEGS: [u64; 3] = [0xa0, 0xa1, 0xa2];
 /// Recovery segments an honest recipient attests by default: all of them.
 pub const SEGMENTS: u32 = 3;
+/// Incarnation of the ledgers the tests host themselves.
+pub const INCARNATION: u64 = 0x1ed6e5;
+
+/// Name of the `n`-th transaction of the tests' orchestrator.
+pub fn tx(n: u64) -> gpu_ledger::link::TxId {
+    gpu_ledger::link::TxId {
+        node: 1,
+        counter: n,
+    }
+}
+
 /// Seed of the identity authority of the tests' deployment.
 pub const AUTHORITY: [u8; 32] = [3; 32];
 
@@ -162,6 +173,7 @@ pub fn mirrored_world() -> World {
         w.auth.verifier(),
         w.ledger_id.clone(),
         HostLimits::default(),
+        INCARNATION,
     )
     .unwrap();
     let host = Arc::new(Mutex::new(host));

@@ -799,11 +799,58 @@ pub(crate) fn get_error(r: &mut R) -> Res<LedgerApiError> {
     })
 }
 
+/// Name of a transaction, chosen by the orchestrator and never used twice: its incarnation and
+/// a counter. The ledger remembers what became of it (`TxStatus`), so a lost answer to `Commit`
+/// can be asked again instead of guessed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TxId {
+    /// The orchestrator instance that opened it.
+    pub node: u64,
+    pub counter: u64,
+}
+
+/// Why a transaction ended without being committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rollback {
+    /// Its owner asked.
+    Asked,
+    /// It outlived its deadline.
+    Expired,
+    /// Its connection ended, faulted or was revoked.
+    Disconnected,
+    TooLarge,
+}
+
+const ROLLBACKS: [Rollback; 4] = [
+    Rollback::Asked,
+    Rollback::Expired,
+    Rollback::Disconnected,
+    Rollback::TooLarge,
+];
+
+/// What the ledger knows of a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxState {
+    /// Never seen by this incarnation of the ledger, or seen too long ago to be remembered.
+    /// Nothing can be concluded from it.
+    Unknown,
+    Open,
+    /// Applied. `seq` is the ledger's count of accepted operations at that point.
+    Committed {
+        seq: u64,
+    },
+    /// Not applied, and it never will be: the name cannot be reused.
+    RolledBack(Rollback),
+}
+
 /// What a connected service may know about the ledger it talks to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerInfo {
     pub limits: LedgerLimits,
     pub domain: Domain,
+    /// Drawn when the ledger process starts. A different value later means the ledger
+    /// restarted, and until it persists its state, that it lost it.
+    pub incarnation: u64,
     /// Ledger time.
     pub now: u64,
     /// Operations accepted so far.
@@ -824,6 +871,7 @@ pub(crate) fn put_info(w: &mut W, i: &LedgerInfo) {
     }
     w.len(l.max_segments);
     w.bytes(i.domain.as_bytes());
+    w.u64(i.incarnation);
     w.u64(i.now);
     w.u64(i.seq);
 }
@@ -840,6 +888,7 @@ pub(crate) fn get_info(r: &mut R) -> Res<LedgerInfo> {
             max_segments: usize::try_from(r.u32()?).map_err(|_| Malformed)?,
         },
         domain: Domain::from_bytes(r.array()?),
+        incarnation: r.u64()?,
         now: r.u64()?,
         seq: r.u64()?,
     })
@@ -862,11 +911,21 @@ pub struct LedgerSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Execute(LedgerOp),
-    /// Opens a transaction: what follows is applied entirely at `Commit` or not at all. Inside
-    /// a transaction it opens a nested one, which `Abort` undoes alone.
-    Begin,
+    /// Opens a transaction under a name never used before: what follows is applied entirely at
+    /// `Commit` or not at all.
+    Begin {
+        id: TxId,
+    },
+    /// Inside a transaction, opens a nested one that `Abort` undoes alone.
+    Savepoint,
+    /// Closes the innermost transaction, keeping what it did.
     Commit,
+    /// Closes the innermost transaction, undoing what it did.
     Abort,
+    /// What became of a transaction (orchestrator). Answered even while a transaction is open.
+    TxStatus {
+        id: TxId,
+    },
     Info,
     /// Balance of one of a job's accounts (orchestrator).
     Balance(Account),
@@ -895,6 +954,13 @@ pub enum Refusal {
     TransactionTooDeep,
     /// The transaction held more operations than allowed and was rolled back.
     TransactionTooLarge,
+    /// This connection already has a transaction: nest with `Savepoint`.
+    TransactionOpen,
+    /// The name was already used. Ask `TxStatus` what became of it; it is never run again.
+    TransactionKnown,
+    /// The connection's transaction outlived its deadline and was rolled back. Nothing sent
+    /// since was applied, this request included.
+    TransactionExpired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -907,6 +973,11 @@ pub enum Response {
     Balances(Vec<(Account, i128)>),
     Summary(LedgerSummary),
     Refused(Refusal),
+    /// Answer to `TxStatus`, with the ledger's incarnation.
+    Tx {
+        state: TxState,
+        incarnation: u64,
+    },
 }
 
 /// Why the ledger ends a connection.
@@ -1053,7 +1124,15 @@ fn put_request(w: &mut W, q: &Request) {
             w.u8(0);
             put_op(w, op);
         }
-        Request::Begin => w.u8(1),
+        Request::Begin { id } => {
+            w.u8(1);
+            put_tx(w, id);
+        }
+        Request::Savepoint => w.u8(10),
+        Request::TxStatus { id } => {
+            w.u8(11);
+            put_tx(w, id);
+        }
         Request::Commit => w.u8(2),
         Request::Abort => w.u8(3),
         Request::Info => w.u8(4),
@@ -1079,7 +1158,9 @@ fn put_request(w: &mut W, q: &Request) {
 fn get_request(r: &mut R) -> Res<Request> {
     Ok(match r.u8()? {
         0 => Request::Execute(get_op(r)?),
-        1 => Request::Begin,
+        1 => Request::Begin { id: get_tx(r)? },
+        10 => Request::Savepoint,
+        11 => Request::TxStatus { id: get_tx(r)? },
         2 => Request::Commit,
         3 => Request::Abort,
         4 => Request::Info,
@@ -1098,12 +1179,27 @@ fn get_request(r: &mut R) -> Res<Request> {
     })
 }
 
-const REFUSALS: [Refusal; 4] = [
+const REFUSALS: [Refusal; 7] = [
     Refusal::Busy,
     Refusal::NoTransaction,
     Refusal::TransactionTooDeep,
     Refusal::TransactionTooLarge,
+    Refusal::TransactionOpen,
+    Refusal::TransactionKnown,
+    Refusal::TransactionExpired,
 ];
+
+fn put_tx(w: &mut W, id: &TxId) {
+    w.u64(id.node);
+    w.u64(id.counter);
+}
+
+fn get_tx(r: &mut R) -> Res<TxId> {
+    Ok(TxId {
+        node: r.u64()?,
+        counter: r.u64()?,
+    })
+}
 
 fn put_response(w: &mut W, p: &Response) {
     match p {
@@ -1142,6 +1238,25 @@ fn put_response(w: &mut W, p: &Response) {
             w.u8(7);
             w.u8(REFUSALS.iter().position(|y| y == x).map_or(0, |i| i as u8));
         }
+        Response::Tx { state, incarnation } => {
+            w.u8(8);
+            match state {
+                TxState::Unknown => w.u8(0),
+                TxState::Open => w.u8(1),
+                TxState::Committed { seq } => {
+                    w.u8(2);
+                    w.u64(*seq);
+                }
+                TxState::RolledBack(why) => {
+                    w.u8(3);
+                    w.u8(ROLLBACKS
+                        .iter()
+                        .position(|y| y == why)
+                        .map_or(0, |i| i as u8));
+                }
+            }
+            w.u64(*incarnation);
+        }
     }
 }
 
@@ -1169,6 +1284,19 @@ fn get_response(r: &mut R) -> Res<Response> {
             denied: r.u64()?,
         }),
         7 => Response::Refused(*REFUSALS.get(usize::from(r.u8()?)).ok_or(Malformed)?),
+        8 => {
+            let state = match r.u8()? {
+                0 => TxState::Unknown,
+                1 => TxState::Open,
+                2 => TxState::Committed { seq: r.u64()? },
+                3 => TxState::RolledBack(*ROLLBACKS.get(usize::from(r.u8()?)).ok_or(Malformed)?),
+                _ => return Err(Malformed),
+            };
+            Response::Tx {
+                state,
+                incarnation: r.u64()?,
+            }
+        }
         _ => return Err(Malformed),
     })
 }

@@ -9,8 +9,8 @@ use more_identity::{CredentialVerifier, ServiceCertificate, ServiceCredential, S
 
 use super::host::{Conn, HostEnv, LedgerHost};
 use super::wire::{
-    transcript, Fault, LedgerInfo, LedgerSummary, Message, Refusal, Request, Response,
-    LINK_VERSION, MAX_FRAME,
+    transcript, Fault, LedgerInfo, LedgerSummary, Message, Refusal, Request, Response, TxId,
+    TxState, LINK_VERSION, MAX_FRAME,
 };
 use crate::service::{LedgerApiError, LedgerOp, LedgerOutcome};
 use crate::{Account, Amount};
@@ -57,6 +57,15 @@ pub fn read_frame(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
     let mut payload = vec![0u8; n];
     r.read_exact(&mut payload)?;
     Ok(payload)
+}
+
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn send(&mut self, payload: &[u8]) -> Result<(), LinkError> {
+        (**self).send(payload)
+    }
+    fn recv(&mut self) -> Result<Vec<u8>, LinkError> {
+        (**self).recv()
+    }
 }
 
 /// Length-prefixed frames over a byte stream (a local socket).
@@ -124,6 +133,9 @@ pub struct LedgerClient<T> {
     transport: T,
     seq: u64,
     ledger: ServiceCertificate,
+    /// An answer did not come or could not be read. Where the connection stands is then
+    /// unknown, and it is not used again.
+    failed: bool,
 }
 
 impl<T: Transport> LedgerClient<T> {
@@ -168,6 +180,7 @@ impl<T: Transport> LedgerClient<T> {
                 transport,
                 seq: 0,
                 ledger,
+                failed: false,
             }),
             Message::Fault(f) => Err(LinkError::Fault(f)),
             _ => Err(LinkError::Protocol("expected ready")),
@@ -188,7 +201,20 @@ impl<T: Transport> LedgerClient<T> {
         &mut self.transport
     }
 
+    /// One request, one answer. After a failure of the link itself the connection is dead:
+    /// a late answer to the failed request would otherwise be read as the answer to the next.
     pub fn call(&mut self, body: Request) -> Result<Response, LinkError> {
+        if self.failed {
+            return Err(LinkError::Io("the connection failed earlier".into()));
+        }
+        let answer = self.exchange(body);
+        if !matches!(answer, Ok(_) | Err(LinkError::Refused(_))) {
+            self.failed = true;
+        }
+        answer
+    }
+
+    fn exchange(&mut self, body: Request) -> Result<Response, LinkError> {
         self.seq += 1;
         let request = Message::Request {
             seq: self.seq,
@@ -225,8 +251,24 @@ impl<T: Transport> LedgerClient<T> {
         }
     }
 
-    pub fn begin(&mut self) -> Result<Result<(), LedgerApiError>, LinkError> {
-        self.done(Request::Begin)
+    pub fn begin(&mut self, id: TxId) -> Result<Result<(), LedgerApiError>, LinkError> {
+        self.done(Request::Begin { id })
+    }
+
+    pub fn savepoint(&mut self) -> Result<Result<(), LedgerApiError>, LinkError> {
+        self.done(Request::Savepoint)
+    }
+
+    /// What became of transaction `id`, and the incarnation of the ledger that says so.
+    pub fn tx_status(
+        &mut self,
+        id: TxId,
+    ) -> Result<Result<(TxState, u64), LedgerApiError>, LinkError> {
+        match self.call(Request::TxStatus { id })? {
+            Response::Tx { state, incarnation } => Ok(Ok((state, incarnation))),
+            Response::Denied(e) => Ok(Err(e)),
+            _ => Err(LinkError::Protocol("unexpected answer")),
+        }
     }
 
     pub fn commit(&mut self) -> Result<Result<(), LedgerApiError>, LinkError> {
@@ -290,15 +332,28 @@ impl<T: Transport> LedgerClient<T> {
     }
 }
 
+/// Why a `Commit` did not come back as done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitFailure {
+    /// The ledger answered: the transaction is not committed and will not be.
+    NotApplied(LedgerApiError),
+    /// No answer. The transaction may have been committed or not: only `status` can tell, and
+    /// sending its operations again could apply them twice.
+    Unknown,
+}
+
 /// The ledger as the orchestrator uses it when it runs in another process: its own operations,
 /// and a transaction around each command so that a command is applied entirely or not at all.
 pub trait RemoteLedger: Send {
     fn execute(&mut self, op: LedgerOp) -> Result<LedgerOutcome, LedgerApiError>;
     /// Balance of one of the orchestrator's job accounts.
     fn balance(&mut self, account: Account) -> Result<Amount, LedgerApiError>;
-    fn begin(&mut self) -> Result<(), LedgerApiError>;
-    fn commit(&mut self) -> Result<(), LedgerApiError>;
+    fn begin(&mut self, id: TxId) -> Result<(), LedgerApiError>;
+    fn savepoint(&mut self) -> Result<(), LedgerApiError>;
+    fn commit(&mut self) -> Result<(), CommitFailure>;
     fn abort(&mut self) -> Result<(), LedgerApiError>;
+    /// What became of a transaction, and the ledger's incarnation.
+    fn status(&mut self, id: TxId) -> Result<(TxState, u64), LedgerApiError>;
 }
 
 fn unavailable<V>(r: Result<Result<V, LedgerApiError>, LinkError>) -> Result<V, LedgerApiError> {
@@ -307,6 +362,9 @@ fn unavailable<V>(r: Result<Result<V, LedgerApiError>, LinkError>) -> Result<V, 
         Err(LinkError::Refused(Refusal::Busy)) => {
             Err(LedgerApiError::Unavailable("the ledger is busy"))
         }
+        Err(LinkError::Refused(Refusal::TransactionExpired)) => Err(LedgerApiError::Unavailable(
+            "the transaction expired and was rolled back",
+        )),
         Err(LinkError::Refused(_)) => Err(LedgerApiError::Unavailable(
             "the ledger refused the transaction",
         )),
@@ -321,13 +379,34 @@ impl<T: Transport + Send> RemoteLedger for LedgerClient<T> {
     fn balance(&mut self, account: Account) -> Result<Amount, LedgerApiError> {
         unavailable(LedgerClient::balance(self, account))
     }
-    fn begin(&mut self) -> Result<(), LedgerApiError> {
-        unavailable(LedgerClient::begin(self))
+    fn begin(&mut self, id: TxId) -> Result<(), LedgerApiError> {
+        unavailable(LedgerClient::begin(self, id))
     }
-    fn commit(&mut self) -> Result<(), LedgerApiError> {
-        unavailable(LedgerClient::commit(self))
+    fn savepoint(&mut self) -> Result<(), LedgerApiError> {
+        unavailable(LedgerClient::savepoint(self))
+    }
+    fn commit(&mut self) -> Result<(), CommitFailure> {
+        match LedgerClient::commit(self) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CommitFailure::NotApplied(e)),
+            // The ledger answered, or ended the connection itself, which rolls back: either
+            // way it did not commit.
+            refused @ Err(LinkError::Refused(_) | LinkError::Fault(_)) => {
+                match unavailable(refused) {
+                    Err(e) => Err(CommitFailure::NotApplied(e)),
+                    Ok(()) => Ok(()),
+                }
+            }
+            // Sent, and nothing came back that can be read.
+            Err(LinkError::Io(_) | LinkError::Protocol(_) | LinkError::NotTheLedger) => {
+                Err(CommitFailure::Unknown)
+            }
+        }
     }
     fn abort(&mut self) -> Result<(), LedgerApiError> {
         unavailable(LedgerClient::abort(self))
+    }
+    fn status(&mut self, id: TxId) -> Result<(TxState, u64), LedgerApiError> {
+        unavailable(LedgerClient::tx_status(self, id))
     }
 }

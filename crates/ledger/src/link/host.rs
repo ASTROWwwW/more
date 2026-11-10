@@ -5,12 +5,15 @@
 //! proved it holds the certified key, over nonces both sides chose. After that every request
 //! runs as that service and no other: there is no field in a request to say who is asking.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use more_identity::{
     CredentialVerifier, KeyDirectory, ServiceCertificate, ServiceCredential, ServiceId, ServiceRole,
 };
 
 use super::wire::{
-    transcript, Fault, LedgerInfo, LedgerSummary, Message, Refusal, Request, Response, LINK_VERSION,
+    transcript, Fault, LedgerInfo, LedgerSummary, Message, Refusal, Request, Response, Rollback,
+    TxId, TxState, LINK_VERSION,
 };
 use crate::service::{LedgerApiError, LedgerService};
 
@@ -29,9 +32,11 @@ pub struct HostLimits {
     pub max_tx_ops: u32,
     /// Most transactions nested in one another.
     pub max_tx_depth: usize,
-    /// A transaction older than this is rolled back as soon as another connection needs the
-    /// ledger.
+    /// A transaction older than this is rolled back: at its owner's next request, at anyone
+    /// else's, or by `sweep`. Counted from the outermost `Begin`.
     pub tx_timeout_ms: u64,
+    /// How many finished transactions the ledger remembers the outcome of.
+    pub tx_log: usize,
 }
 
 impl Default for HostLimits {
@@ -40,6 +45,7 @@ impl Default for HostLimits {
             max_tx_ops: 4096,
             max_tx_depth: 4,
             tx_timeout_ms: 5_000,
+            tx_log: 1024,
         }
     }
 }
@@ -80,7 +86,9 @@ pub struct Reply {
 
 struct Tx {
     conn: u64,
-    /// The ledger as it was at each `Begin` still open, outermost first. Never empty.
+    id: TxId,
+    /// The ledger as it was at `Begin` and at each `Savepoint` still open, outermost first.
+    /// Never empty.
     snapshots: Vec<LedgerService>,
     ops: u32,
     opened_ms: u64,
@@ -92,19 +100,28 @@ pub struct LedgerHost {
     verifier: CredentialVerifier,
     identity: ServiceCredential,
     limits: HostLimits,
+    incarnation: u64,
     tx: Option<Tx>,
+    /// What became of the last transactions, by name, oldest first in `order`.
+    outcomes: BTreeMap<TxId, TxState>,
+    order: VecDeque<TxId>,
+    /// Connections whose transaction the host rolled back behind their back. Their next request
+    /// is refused, so that what they meant for the transaction is never applied outside it.
+    expired: BTreeSet<u64>,
     next_conn: u64,
 }
 
 impl LedgerHost {
     /// `keys` must be the directory `service` verifies statements with, and `identity` a
-    /// credential of role `Ledger` from the same authority as `verifier`.
+    /// credential of role `Ledger` from the same authority as `verifier`. `incarnation` is
+    /// drawn afresh each time the ledger starts.
     pub fn new(
         service: LedgerService,
         keys: KeyDirectory,
         verifier: CredentialVerifier,
         identity: ServiceCredential,
         limits: HostLimits,
+        incarnation: u64,
     ) -> Result<Self, &'static str> {
         if verifier.verify(&identity) != Ok(ServiceRole::Ledger) {
             return Err("the host needs a valid credential of role Ledger");
@@ -119,7 +136,11 @@ impl LedgerHost {
             verifier,
             identity,
             limits,
+            incarnation,
             tx: None,
+            outcomes: BTreeMap::new(),
+            order: VecDeque::new(),
+            expired: BTreeSet::new(),
             next_conn: 0,
         })
     }
@@ -127,6 +148,12 @@ impl LedgerHost {
     /// The ledger behind the link, for the process that hosts it.
     pub fn service(&self) -> &LedgerService {
         &self.service
+    }
+
+    /// Connections the host still has something to say to, and outcomes it remembers: what a
+    /// test checks to see that nothing is kept for ever.
+    pub fn retained(&self) -> (usize, usize) {
+        (self.expired.len(), self.outcomes.len())
     }
 
     pub fn open(&mut self) -> Conn {
@@ -138,23 +165,53 @@ impl LedgerHost {
         }
     }
 
-    /// The connection is gone: what it left uncommitted is rolled back.
+    /// The connection is gone: what it left uncommitted is rolled back, and nothing is kept
+    /// about it.
     pub fn close(&mut self, conn: &mut Conn) {
         conn.state = State::Closed;
+        self.expired.remove(&conn.id);
         if self.tx.as_ref().is_some_and(|tx| tx.conn == conn.id) {
-            self.rollback();
+            self.rollback(Rollback::Disconnected);
+        }
+    }
+
+    /// Rolls back a transaction that outlived its deadline, whoever is or is not asking. A
+    /// daemon calls it on a timer, so that an idle transaction does not hold the ledger until
+    /// someone else shows up. Returns whether one was rolled back.
+    pub fn sweep(&mut self, now_ms: u64) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        // A clock that went back proves nothing: the transaction is kept.
+        let age = now_ms.checked_sub(tx.opened_ms);
+        if age.is_none_or(|a| a < self.limits.tx_timeout_ms) {
+            return false;
+        }
+        self.expired.insert(tx.conn);
+        self.rollback(Rollback::Expired);
+        true
+    }
+
+    /// Remembers what became of a transaction, forgetting the oldest past the limit.
+    fn record(&mut self, id: TxId, state: TxState) {
+        if self.outcomes.insert(id, state).is_none() {
+            self.order.push_back(id);
+        }
+        while self.order.len() > self.limits.tx_log {
+            if let Some(old) = self.order.pop_front() {
+                self.outcomes.remove(&old);
+            }
         }
     }
 
     /// Undoes the whole transaction, nested ones included.
-    fn rollback(&mut self) {
-        if let Some(first) = self
-            .tx
-            .take()
-            .and_then(|tx| tx.snapshots.into_iter().next())
-        {
+    fn rollback(&mut self, why: Rollback) {
+        let Some(tx) = self.tx.take() else { return };
+        let id = tx.id;
+        if let Some(first) = tx.snapshots.into_iter().next() {
             self.service = first;
         }
+        self.record(id, TxState::RolledBack(why));
     }
 
     /// Closes the innermost transaction, keeping what it did or undoing it.
@@ -162,13 +219,25 @@ impl LedgerHost {
         let Some(tx) = self.tx.as_mut() else {
             return Response::Refused(Refusal::NoTransaction);
         };
+        let id = tx.id;
         let inner = tx.snapshots.pop();
-        if tx.snapshots.is_empty() {
+        let outermost = tx.snapshots.is_empty();
+        if outermost {
             self.tx = None;
         }
         match inner {
             Some(before) if !keep => self.service = before,
             _ => {}
+        }
+        if outermost {
+            let state = if keep {
+                TxState::Committed {
+                    seq: self.service.seq(),
+                }
+            } else {
+                TxState::RolledBack(Rollback::Asked)
+            };
+            self.record(id, state);
         }
         Response::Done
     }
@@ -254,24 +323,44 @@ impl LedgerHost {
         body: Request,
         now_ms: u64,
     ) -> Response {
-        // Someone else's open transaction: its uncommitted state is nobody's business. Wait, or
-        // roll it back if its owner has held the ledger for too long.
-        if let Some(tx) = self.tx.as_ref().filter(|tx| tx.conn != conn) {
-            let age = now_ms.checked_sub(tx.opened_ms);
-            if age.is_none_or(|a| a < self.limits.tx_timeout_ms) {
-                return Response::Refused(Refusal::Busy);
-            }
-            self.rollback();
-        }
         let role = cert.role();
         let forbidden = |op| Response::Denied(LedgerApiError::Forbidden { role, op });
         let denied = |e| Response::Denied(e);
+        // A deadline binds its owner as much as the others, and is checked on every request.
+        self.sweep(now_ms);
+        // The one question that is answered whatever the ledger is doing: it reads the outcome
+        // log, never uncommitted state.
+        if let Request::TxStatus { id } = body {
+            if role != ServiceRole::Orchestrator {
+                return forbidden("TxStatus");
+            }
+            let open = self.tx.as_ref().is_some_and(|tx| tx.id == id);
+            let state = match self.outcomes.get(&id) {
+                _ if open => TxState::Open,
+                Some(known) => *known,
+                None => TxState::Unknown,
+            };
+            return Response::Tx {
+                state,
+                incarnation: self.incarnation,
+            };
+        }
+        // The host rolled this connection's transaction back. Whatever it sends next was meant
+        // for that transaction: it is refused, once, so the client learns of it.
+        if self.expired.remove(&conn) {
+            return Response::Refused(Refusal::TransactionExpired);
+        }
+        // Someone else's open transaction: its uncommitted state is nobody's business.
+        if self.tx.as_ref().is_some_and(|tx| tx.conn != conn) {
+            return Response::Refused(Refusal::Busy);
+        }
         match body {
+            Request::TxStatus { .. } => Response::Refused(Refusal::NoTransaction),
             Request::Execute(op) => {
                 if let Some(tx) = self.tx.as_mut() {
                     tx.ops += 1;
                     if tx.ops > self.limits.max_tx_ops {
-                        self.rollback();
+                        self.rollback(Rollback::TooLarge);
                         return Response::Refused(Refusal::TransactionTooLarge);
                     }
                 }
@@ -280,30 +369,45 @@ impl LedgerHost {
                     Err(e) => denied(e),
                 }
             }
-            Request::Begin if role != ServiceRole::Orchestrator => forbidden("Begin"),
-            Request::Begin => {
+            Request::Begin { .. } | Request::Savepoint if role != ServiceRole::Orchestrator => {
+                forbidden("Begin")
+            }
+            Request::Begin { .. } if self.tx.is_some() => {
+                Response::Refused(Refusal::TransactionOpen)
+            }
+            // A name is used once. Committed or not, the transaction is never run again.
+            Request::Begin { id } if self.outcomes.contains_key(&id) => {
+                Response::Refused(Refusal::TransactionKnown)
+            }
+            Request::Begin { id } => {
+                self.tx = Some(Tx {
+                    conn,
+                    id,
+                    snapshots: vec![self.service.clone()],
+                    ops: 0,
+                    opened_ms: now_ms,
+                });
+                Response::Done
+            }
+            Request::Savepoint => {
                 let now = self.service.clone();
                 match self.tx.as_mut() {
+                    None => Response::Refused(Refusal::NoTransaction),
                     Some(tx) if tx.snapshots.len() >= self.limits.max_tx_depth => {
-                        return Response::Refused(Refusal::TransactionTooDeep);
+                        Response::Refused(Refusal::TransactionTooDeep)
                     }
-                    Some(tx) => tx.snapshots.push(now),
-                    None => {
-                        self.tx = Some(Tx {
-                            conn,
-                            snapshots: vec![now],
-                            ops: 0,
-                            opened_ms: now_ms,
-                        });
+                    Some(tx) => {
+                        tx.snapshots.push(now);
+                        Response::Done
                     }
                 }
-                Response::Done
             }
             Request::Commit => self.end(true),
             Request::Abort => self.end(false),
             Request::Info => Response::Info(LedgerInfo {
                 limits: self.service.limits().clone(),
                 domain: self.service.domain(),
+                incarnation: self.incarnation,
                 now: self.service.now(),
                 seq: self.service.seq(),
             }),

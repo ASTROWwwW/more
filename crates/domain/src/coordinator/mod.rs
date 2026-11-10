@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use gpu_ledger::link::{LedgerInfo, RemoteLedger};
+use gpu_ledger::link::{LedgerInfo, RemoteLedger, TxId, TxState};
 use gpu_ledger::{
     Account, Amount, Assignment, EscrowBucket, IssueTo, ItemId, JobTerms, Ledger, LedgerApiError,
     LedgerError, LedgerOp, LedgerOutcome, LedgerService, LineRef, OutputRef,
@@ -24,7 +24,7 @@ use crate::error::DomainError;
 use crate::ids::*;
 use crate::model::*;
 use crate::registry::{PoolMode, Registry};
-use link::LedgerLink;
+use link::{Committed, LedgerLink};
 
 mod audit;
 mod claims;
@@ -74,6 +74,18 @@ pub struct Coordinator {
     /// Logical sequence number: total order of applied commands (CE-03).
     seq: u64,
     audit: Vec<AuditEvent>,
+    /// Why the coordinator accepts nothing for now (ledger in another process only).
+    halted: Option<Halt>,
+}
+
+/// A coordinator stops when it no longer knows what its ledger holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Halt {
+    /// The answer to the commit of transaction `tx` was lost. `pending` is the state the
+    /// coordinator takes if the ledger did commit; otherwise it keeps the one it has.
+    CommitUnknown { tx: TxId, pending: Box<Coordinator> },
+    /// The ledger restarted and lost its state.
+    LedgerLost,
 }
 
 type R<T = ()> = Result<T, DomainError>;
@@ -134,14 +146,80 @@ impl Coordinator {
     /// The coordinator then sends the ledger its own operations only. Issuance, the ledger's
     /// clock and the registration of pool admins belong to other services, which hold their own
     /// keys and talk to the ledger themselves.
+    ///
+    /// `node` names this coordinator instance in its transactions. It must not be reused by
+    /// another instance talking to the same ledger incarnation.
     pub fn with_remote_ledger(
         cfg: Config,
         port: Arc<Mutex<dyn RemoteLedger>>,
         info: LedgerInfo,
+        node: u64,
         cred: ServiceCredential,
         verifier: CredentialVerifier,
     ) -> R<Self> {
-        Self::start(cfg, LedgerLink::Remote(port, info), cred, verifier)
+        Self::start(cfg, LedgerLink::remote(port, info, node), cred, verifier)
+    }
+
+    /// The transaction whose commit got no answer, if the coordinator is stopped on one.
+    pub fn unknown_commit(&self) -> Option<TxId> {
+        match &self.halted {
+            Some(Halt::CommitUnknown { tx, .. }) => Some(*tx),
+            _ => None,
+        }
+    }
+
+    /// Replaces a failed connection to the ledger. The connection must have authenticated this
+    /// deployment's ledger, as `LedgerClient::connect` checks. The failed one is dropped, which
+    /// tells the ledger to roll back what was still open on it. If the ledger at the other end
+    /// has another incarnation, it restarted and lost its state: the coordinator stops for good.
+    pub fn reconnect_ledger(&mut self, port: Arc<Mutex<dyn RemoteLedger>>) -> R {
+        let Some(known) = self.ledger.incarnation() else {
+            return Err(DomainError::Precondition("the ledger is in this process"));
+        };
+        if self.halted == Some(Halt::LedgerLost) {
+            return Err(DomainError::LedgerStateLost);
+        }
+        let incarnation = self.ledger.reconnect(port.clone())?;
+        if let Some(Halt::CommitUnknown { pending, .. }) = &mut self.halted {
+            pending.ledger.replace(port);
+        }
+        if incarnation != known {
+            self.halted = Some(Halt::LedgerLost);
+            return Err(DomainError::LedgerStateLost);
+        }
+        Ok(())
+    }
+
+    /// Asks the ledger what became of the transaction whose commit got no answer, and acts on
+    /// the answer. Committed: the coordinator takes the state that goes with it. Rolled back:
+    /// it keeps the state it had, and the command can be sent again by its sender. Still open
+    /// or unknown: it stays stopped. Nothing is ever sent again on its own.
+    pub fn resolve_commit(&mut self) -> R<TxState> {
+        let Some(Halt::CommitUnknown { tx, .. }) = &self.halted else {
+            return Err(match self.halted {
+                Some(Halt::LedgerLost) => DomainError::LedgerStateLost,
+                _ => DomainError::Precondition("no commit to resolve"),
+            });
+        };
+        // A connection ends with the process at its other end: the ledger that answers here is
+        // the incarnation `reconnect_ledger` checked.
+        let (state, _) = self.ledger.status(*tx)?;
+        match state {
+            TxState::Committed { .. } => {
+                if let Some(Halt::CommitUnknown { pending, .. }) = self.halted.take() {
+                    // The connection in use now is the one to keep.
+                    let link = self.ledger.clone();
+                    *self = *pending;
+                    self.ledger = link;
+                    self.halted = None;
+                }
+            }
+            TxState::RolledBack(_) => self.halted = None,
+            // Open: its deadline will settle it. Unknown: the ledger no longer remembers, an
+            // operator has to compare both sides.
+            TxState::Open | TxState::Unknown => {}
+        }
+        Ok(state)
     }
 
     fn start(
@@ -189,6 +267,7 @@ impl Coordinator {
             presented: BTreeMap::new(),
             seq: 0,
             audit: Vec::new(),
+            halted: None,
         })
     }
 
@@ -202,19 +281,40 @@ impl Coordinator {
                 .verify(c)
                 .map_err(|_| DomainError::Unauthorized("invalid or revoked service credential"))?;
         }
+        match self.halted {
+            Some(Halt::CommitUnknown { .. }) => return Err(DomainError::LedgerOutcomeUnknown),
+            Some(Halt::LedgerLost) => return Err(DomainError::LedgerStateLost),
+            None => {}
+        }
         authorize(self, ctx, cmd)?;
         // With the ledger in another process, its part of the transition is a transaction there:
         // committed with the coordinator's copy, or rolled back with it.
         self.ledger.begin()?;
         let mut next = self.clone();
         match next.step(ctx, cmd) {
-            Ok(Outcome::Applied) => {
-                // If the commit fails nothing is kept here either. Whether the ledger applied
-                // it is then unknown: the coordinator must be reconciled before it goes on.
-                next.ledger.commit()?;
-                *self = next;
-                Ok(Outcome::Applied)
-            }
+            Ok(Outcome::Applied) => match next.ledger.commit() {
+                Committed::Yes => {
+                    *self = next;
+                    Ok(Outcome::Applied)
+                }
+                Committed::No(e) => {
+                    // Nothing of the command is kept, but the transaction is closed on the
+                    // link all the same.
+                    self.ledger = next.ledger;
+                    Err(e.into())
+                }
+                // The commit was sent and no answer came. Sending the command again could apply
+                // it twice, and dropping it could forget something the ledger holds: the
+                // coordinator stops until the ledger has been asked (`resolve_commit`).
+                Committed::Unknown(tx) => {
+                    self.ledger = next.ledger.clone();
+                    self.halted = Some(Halt::CommitUnknown {
+                        tx,
+                        pending: Box::new(next),
+                    });
+                    Err(DomainError::LedgerOutcomeUnknown)
+                }
+            },
             // An already applied command changes nothing, not even the sequence (JOB-R04).
             Ok(out) => {
                 self.ledger.abort()?;
@@ -223,9 +323,7 @@ impl Coordinator {
             Err(e) => {
                 // The command's own error is the one to report. If the abort does not get
                 // through, the ledger rolls back when the connection ends or times out.
-                if self.ledger.abort().is_err() {
-                    return Err(e);
-                }
+                let _undone_there_anyway = self.ledger.abort();
                 Err(e)
             }
         }

@@ -10,9 +10,12 @@
 use std::sync::{Arc, Mutex};
 
 use gpu_domain::*;
-use gpu_ledger::link::{LedgerClient, RemoteLedger, Transport};
+use gpu_ledger::link::{
+    HostLimits, LedgerClient, LedgerHost, LinkError, Loopback, Message, RemoteLedger, Request,
+    Transport,
+};
 use gpu_ledger::{Account, IssueTo, LedgerOp};
-use more_identity::{AuthContext, ServiceCredential};
+use more_identity::{AuthContext, CredentialVerifier, ServiceCredential};
 
 use crate::world::{sim_config, SimIdentity};
 
@@ -51,14 +54,31 @@ pub struct RemoteRig {
     treasury: Box<dyn Service>,
     platform: Box<dyn Service>,
     auditor: Box<dyn Service>,
+    orchestrator: ServiceCredential,
+    verifier: CredentialVerifier,
+    connections: u8,
     /// Commands followed so far.
     pub followed: u64,
 }
 
+/// A connection of the orchestrator, as `Coordinator` takes it.
+pub type Port = Arc<Mutex<dyn RemoteLedger>>;
+
+fn dial<T: Transport + Send + 'static>(
+    transport: T,
+    me: &ServiceCredential,
+    verifier: &CredentialVerifier,
+    n: u8,
+) -> LedgerClient<T> {
+    let mut nonce = [0x33; 32];
+    nonce[0] = n;
+    LedgerClient::connect(transport, me, verifier, nonce).expect("ledger link")
+}
+
 impl RemoteRig {
     /// Connects every service of `ids` through `transport`, each with its own key, and starts
-    /// the coordinator on the orchestrator's connection. Account keys must already be known to
-    /// the ledger behind the link.
+    /// the coordinator on the orchestrator's connection, which is the first one asked for.
+    /// Account keys must already be known to the ledger behind the link.
     pub fn new<T: Transport + Send + 'static>(
         ids: &SimIdentity,
         mut transport: impl FnMut() -> T,
@@ -67,9 +87,7 @@ impl RemoteRig {
         let mut n = 0u8;
         let mut connect = |me: &ServiceCredential| {
             n += 1;
-            let mut nonce = [0x33; 32];
-            nonce[0] = n;
-            LedgerClient::connect(transport(), me, &verifier, nonce).expect("ledger link")
+            dial(transport(), me, &verifier, n)
         };
         let mut orchestrator = connect(&ids.orchestrator);
         let info = orchestrator.info().expect("ledger link");
@@ -78,6 +96,7 @@ impl RemoteRig {
             sim_config(),
             port,
             info,
+            1,
             ids.orchestrator.clone(),
             ids.verifier(),
         )
@@ -88,8 +107,32 @@ impl RemoteRig {
             treasury: Box::new(connect(&ids.treasury)),
             platform: Box::new(connect(&ids.platform)),
             auditor: Box::new(connect(&ids.auditor)),
+            orchestrator: ids.orchestrator.clone(),
+            verifier,
+            connections: 5,
             followed: 0,
         }
+    }
+
+    /// A new connection of the orchestrator over `transport`, not yet given to the coordinator.
+    pub fn dial<T: Transport + Send + 'static>(&mut self, transport: T) -> Port {
+        self.connections += 1;
+        let n = self.connections;
+        Arc::new(Mutex::new(dial(
+            transport,
+            &self.orchestrator,
+            &self.verifier,
+            n,
+        )))
+    }
+
+    /// Replaces the coordinator's connection to the ledger, as after a failure of the link.
+    pub fn reconnect<T: Transport + Send + 'static>(
+        &mut self,
+        transport: T,
+    ) -> Result<(), DomainError> {
+        let port = self.dial(transport);
+        self.coord.reconnect_ledger(port)
     }
 
     /// Sends `cmd` to the coordinator behind the link as `ctx` did in process, and compares.
@@ -102,6 +145,19 @@ impl RemoteRig {
         reference: &Coordinator,
         ledger: &gpu_ledger::Ledger,
     ) {
+        let remote = self.send(ctx, cmd, local, reference);
+        assert_eq!(*local, remote, "answers differ for {cmd:?}");
+        self.compare(cmd, reference, ledger);
+    }
+
+    /// The sending half of `follow`: what the coordinator behind the link answers, unchecked.
+    pub fn send(
+        &mut self,
+        ctx: &AuthContext,
+        cmd: &Command,
+        local: &Result<Outcome, DomainError>,
+        reference: &Coordinator,
+    ) -> Result<Outcome, DomainError> {
         self.followed += 1;
         let applied = *local == Ok(Outcome::Applied);
         // The part of a command that is another service's business at the ledger. In process the
@@ -115,7 +171,7 @@ impl RemoteRig {
                 let by_the_ledger = matches!(local, Err(DomainError::Ledger(_)))
                     || *local == Ok(Outcome::AlreadyApplied);
                 if by_the_ledger {
-                    return;
+                    return local.clone();
                 }
                 if applied {
                     let to = match to {
@@ -140,9 +196,19 @@ impl RemoteRig {
             }
             _ => {}
         }
-        let remote = self.coord.execute(ctx, cmd);
-        assert_eq!(*local, remote, "answers differ for {cmd:?}");
-        self.compare(cmd, reference, ledger);
+        self.coord.execute(ctx, cmd)
+    }
+
+    /// The checking half of `follow`: the coordinator behind the link and its ledger hold what
+    /// `reference` and `ledger` hold.
+    pub fn check(&mut self, reference: &Coordinator, ledger: &gpu_ledger::Ledger) {
+        self.compare(&Command::Reconcile, reference, ledger);
+    }
+
+    /// Journal length, hash of its last entry, operations accepted and time of the ledger
+    /// behind the link.
+    pub fn ledger_summary(&mut self) -> (u64, u64, u64, u64) {
+        self.auditor.summary()
     }
 
     fn compare(&mut self, cmd: &Command, reference: &Coordinator, ledger: &gpu_ledger::Ledger) {
@@ -207,16 +273,32 @@ impl gpu_ledger::link::HostEnv for Counter {
 }
 
 /// A ledger of its own for `ids`, behind the link, in this process.
-pub fn host_in_process(ids: &SimIdentity) -> Arc<Mutex<gpu_ledger::link::LedgerHost>> {
-    let host = gpu_ledger::link::LedgerHost::new(
+pub fn host_in_process(ids: &SimIdentity) -> Arc<Mutex<LedgerHost>> {
+    host_with(ids, HostLimits::default(), 1)
+}
+
+/// As `host_in_process`, with its own limits and incarnation.
+pub fn host_with(
+    ids: &SimIdentity,
+    limits: HostLimits,
+    incarnation: u64,
+) -> Arc<Mutex<LedgerHost>> {
+    let host = LedgerHost::new(
         ids.verifier_ledger(),
         ids.keys.clone(),
         ids.verifier(),
         ids.ledger.clone(),
-        gpu_ledger::link::HostLimits::default(),
+        limits,
+        incarnation,
     )
     .expect("a ledger identity of this deployment");
     Arc::new(Mutex::new(host))
+}
+
+/// The `n`-th connection to a host in this process. Its clock stays at zero: a test ends a
+/// transaction's time by calling `LedgerHost::sweep` itself.
+pub fn loopback(host: &Arc<Mutex<LedgerHost>>, n: u64) -> Loopback {
+    Loopback::new(host.clone(), Box::new(Counter(n << 32)))
 }
 
 impl crate::world::Sim {
@@ -228,8 +310,133 @@ impl crate::world::Sim {
             let mut n = 0u64;
             RemoteRig::new(ids, move || {
                 n += 1;
-                gpu_ledger::link::Loopback::new(host.clone(), Box::new(Counter(n << 32)))
+                loopback(&host, n)
             })
         })
+    }
+}
+
+/// Where a failing link loses a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// The request never reaches the ledger.
+    Before,
+    /// The ledger handles the request. Its answer never comes back.
+    After,
+}
+
+type Plan = Box<dyn FnMut(&Request) -> Option<Cut> + Send>;
+
+#[derive(Default)]
+struct FaultState {
+    plan: Option<Plan>,
+    hold: bool,
+    held: Vec<Box<dyn Send>>,
+}
+
+/// The switch of a `Flaky` link, kept by the test.
+#[derive(Clone, Default)]
+pub struct Faults(Arc<Mutex<FaultState>>);
+
+impl Faults {
+    /// The link fails once, at the first request for which `plan` says so. A link that failed
+    /// stays dead, as a cut connection does.
+    pub fn arm(&self, plan: impl FnMut(&Request) -> Option<Cut> + Send + 'static) {
+        self.0.lock().expect("faults").plan = Some(Box::new(plan));
+    }
+
+    /// The link fails at the commit that closes the next command's transaction, not at the
+    /// commits nested in it.
+    pub fn at_outer_commit(&self, cut: Cut) {
+        let mut depth = 0u32;
+        self.arm(move |r| match r {
+            Request::Begin { .. } | Request::Savepoint => {
+                depth += 1;
+                None
+            }
+            Request::Abort => {
+                depth -= 1;
+                None
+            }
+            Request::Commit => {
+                depth -= 1;
+                (depth == 0).then_some(cut)
+            }
+            _ => None,
+        });
+    }
+
+    /// From now on a dead link is not closed when its owner drops it: the ledger goes on
+    /// believing the connection open, as with a peer that vanished without a word.
+    pub fn hold_dead_links(&self) {
+        self.0.lock().expect("faults").hold = true;
+    }
+
+    /// Closes the dead links held so far.
+    pub fn release(&self) {
+        let held = std::mem::take(&mut self.0.lock().expect("faults").held);
+        drop(held);
+    }
+}
+
+/// A link that fails where its `Faults` say.
+pub struct Flaky<T: Send + 'static> {
+    inner: Option<T>,
+    faults: Faults,
+    dead: bool,
+}
+
+impl<T: Send + 'static> Flaky<T> {
+    pub fn new(inner: T, faults: &Faults) -> Self {
+        Flaky {
+            inner: Some(inner),
+            faults: faults.clone(),
+            dead: false,
+        }
+    }
+}
+
+impl<T: Transport + Send + 'static> Transport for Flaky<T> {
+    fn send(&mut self, payload: &[u8]) -> Result<(), LinkError> {
+        let cut = match Message::decode(payload) {
+            Ok(Message::Request { body, .. }) if !self.dead => {
+                let mut state = self.faults.0.lock().expect("faults");
+                let cut = state.plan.as_mut().and_then(|plan| plan(&body));
+                if cut.is_some() {
+                    state.plan = None;
+                }
+                cut
+            }
+            _ => None,
+        };
+        let inner = self.inner.as_mut().expect("until dropped");
+        match cut {
+            _ if self.dead => Err(LinkError::Io("the link is cut".into())),
+            Some(Cut::Before) => {
+                self.dead = true;
+                Err(LinkError::Io("the request was lost".into()))
+            }
+            Some(Cut::After) => {
+                self.dead = true;
+                inner.send(payload)
+            }
+            None => inner.send(payload),
+        }
+    }
+
+    fn recv(&mut self) -> Result<Vec<u8>, LinkError> {
+        if self.dead {
+            return Err(LinkError::Io("the answer was lost".into()));
+        }
+        self.inner.as_mut().expect("until dropped").recv()
+    }
+}
+
+impl<T: Send + 'static> Drop for Flaky<T> {
+    fn drop(&mut self) {
+        let mut state = self.faults.0.lock().expect("faults");
+        if let (true, true, Some(inner)) = (self.dead, state.hold, self.inner.take()) {
+            state.held.push(Box::new(inner));
+        }
     }
 }

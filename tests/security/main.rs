@@ -10,6 +10,7 @@ mod attacks;
 mod compromise;
 mod finality;
 mod leases;
+mod link_faults;
 mod protocol;
 mod recovery;
 

@@ -58,6 +58,30 @@ jobs:
           name: coverage
           path: target/coverage/
 
+  isolation:
+    name: Ledger under its own user (three users, as root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the process tests as the runner's user
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p more-ledgerd --test process --no-run --message-format=json \
+            | python3 -c "import sys, json
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get('executable') and m.get('target', {}).get('name') == 'process':
+                  print(m['executable'])" > process-test-path
+          test -s process-test-path
+      - name: Ledger, orchestrator and a third user, each under its own user
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo "$(cat process-test-path)" --ignored --nocapture --test-threads 1 | tee two-users.log
+          grep -q "two users:" two-users.log
+
   reference:
     name: Reference run (5,000 traces per generator)
     if: github.event_name == 'workflow_dispatch' && inputs.heavy

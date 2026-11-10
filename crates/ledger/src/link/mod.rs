@@ -11,11 +11,11 @@ mod host;
 mod wire;
 
 pub use client::{
-    read_frame, write_frame, LedgerClient, LinkError, Loopback, RemoteLedger, StreamTransport,
-    Transport,
+    read_frame, write_frame, CommitFailure, LedgerClient, LinkError, Loopback, RemoteLedger,
+    StreamTransport, Transport,
 };
 pub use host::{Conn, HostEnv, HostLimits, LedgerHost, Reply};
 pub use wire::{
     transcript, Fault, LedgerInfo, LedgerSummary, Malformed, Message, Refusal, Request, Response,
-    LINK_VERSION, MAX_FRAME,
+    Rollback, TxId, TxState, LINK_VERSION, MAX_FRAME,
 };

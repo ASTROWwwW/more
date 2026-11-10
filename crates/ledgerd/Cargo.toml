@@ -13,7 +13,15 @@ gpu-ledger.workspace = true
 getrandom = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", default-features = false, features = ["std", "process"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "net"] }
+
+[[bin]]
+name = "more-ledgerd"
+path = "src/main.rs"
+
+[[bin]]
+name = "more-ledger-ping"
+path = "src/bin/more-ledger-ping.rs"
 
 [dev-dependencies]
 gpu-ledger = { workspace = true }

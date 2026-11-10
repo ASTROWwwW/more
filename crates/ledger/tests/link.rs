@@ -240,6 +240,7 @@ fn sample_messages(w: &World) -> Vec<Message> {
     let info = LedgerInfo {
         limits: LedgerLimits::default(),
         domain: dom(),
+        incarnation: 9,
         now: 5,
         seq: 6,
     };
@@ -251,7 +252,9 @@ fn sample_messages(w: &World) -> Vec<Message> {
         denied: 5,
     };
     let mut bodies = vec![
-        Request::Begin,
+        Request::Begin { id: tx(7) },
+        Request::Savepoint,
+        Request::TxStatus { id: tx(8) },
         Request::Commit,
         Request::Abort,
         Request::Info,
@@ -283,8 +286,25 @@ fn sample_messages(w: &World) -> Vec<Message> {
         Refusal::NoTransaction,
         Refusal::TransactionTooDeep,
         Refusal::TransactionTooLarge,
+        Refusal::TransactionOpen,
+        Refusal::TransactionKnown,
+        Refusal::TransactionExpired,
     ] {
         answers.push(Response::Refused(r));
+    }
+    for state in [
+        TxState::Unknown,
+        TxState::Open,
+        TxState::Committed { seq: 4 },
+        TxState::RolledBack(Rollback::Asked),
+        TxState::RolledBack(Rollback::Expired),
+        TxState::RolledBack(Rollback::Disconnected),
+        TxState::RolledBack(Rollback::TooLarge),
+    ] {
+        answers.push(Response::Tx {
+            state,
+            incarnation: 3,
+        });
     }
     let mut all = vec![
         Message::Hello {
@@ -716,7 +736,7 @@ fn a_revoked_service_is_cut_off_on_its_next_request() {
     );
     orch.info().unwrap();
     // Revoked in the middle of a transaction: the transaction is rolled back with it.
-    orch.begin().unwrap().unwrap();
+    orch.begin(tx(1)).unwrap().unwrap();
     let before = state(&w);
     w.auth.revoke(w.orch.id());
     let reserve = LedgerOp::Reserve {
@@ -758,6 +778,7 @@ fn a_signed_revocation_reaches_a_ledger_that_only_knows_the_authoritys_key() {
         verifier,
         w.ledger_id.clone(),
         HostLimits::default(),
+        INCARNATION,
     )
     .unwrap();
     let host = Arc::new(Mutex::new(host));
@@ -851,7 +872,9 @@ fn a_connection_has_its_own_rights_and_no_other() {
     ] {
         let mut c = connect(&w, &env, me).unwrap();
         forbidden(c.call(Request::Execute(reserve.clone())), role, "Reserve");
-        forbidden(c.call(Request::Begin), role, "Begin");
+        forbidden(c.call(Request::Begin { id: tx(1) }), role, "Begin");
+        forbidden(c.call(Request::Savepoint), role, "Begin");
+        forbidden(c.call(Request::TxStatus { id: tx(1) }), role, "TxStatus");
         if role != Treasury {
             forbidden(c.call(Request::Execute(issue.clone())), role, "Issue");
         }
@@ -899,6 +922,12 @@ fn reserve(n: u32) -> LedgerOp {
     }
 }
 
+fn status(c: &mut LedgerClient<Loopback>, n: u64) -> TxState {
+    let (state, incarnation) = c.tx_status(tx(n)).unwrap().unwrap();
+    assert_eq!(incarnation, INCARNATION);
+    state
+}
+
 /// LEDGER-023: what the orchestrator does between `Begin` and `Commit` is applied entirely or
 /// not at all, nobody else sees it meanwhile, and it cannot hold the ledger for ever.
 #[test]
@@ -913,32 +942,34 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
     };
     refused(orch.commit(), Refusal::NoTransaction);
     refused(orch.abort(), Refusal::NoTransaction);
+    refused(orch.savepoint(), Refusal::NoTransaction);
     let before = state(&w);
     // Aborted: two reserves and a refused operation leave no trace at all.
-    orch.begin().unwrap().unwrap();
+    orch.begin(tx(1)).unwrap().unwrap();
+    refused(orch.begin(tx(2)), Refusal::TransactionOpen);
     orch.execute(reserve(1)).unwrap().unwrap();
     orch.execute(reserve(2)).unwrap().unwrap();
     assert!(orch.execute(reserve(2)).unwrap().is_err(), "duplicate key");
     assert!(state(&w) != before);
     // A nested transaction is undone alone, or kept until the outer one decides.
     let outer = state(&w);
-    orch.begin().unwrap().unwrap();
+    orch.savepoint().unwrap().unwrap();
     orch.execute(reserve(6)).unwrap().unwrap();
     orch.abort().unwrap().unwrap();
     assert!(
         state(&w) == outer,
         "the nested abort undoes its own part only"
     );
-    orch.begin().unwrap().unwrap();
+    orch.savepoint().unwrap().unwrap();
     orch.execute(reserve(7)).unwrap().unwrap();
     orch.commit().unwrap().unwrap();
     assert!(state(&w) != outer, "kept, for now");
     // Nesting is bounded.
     let depth = HostLimits::default().max_tx_depth;
     for _ in 1..depth {
-        orch.begin().unwrap().unwrap();
+        orch.savepoint().unwrap().unwrap();
     }
-    refused(orch.begin(), Refusal::TransactionTooDeep);
+    refused(orch.savepoint(), Refusal::TransactionTooDeep);
     for _ in 1..depth {
         orch.commit().unwrap().unwrap();
     }
@@ -956,21 +987,25 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
     assert!(state(&w) == before, "abort restores the ledger exactly");
     refused(orch.commit(), Refusal::NoTransaction);
     // Committed: kept, and visible to the others from then on.
-    orch.begin().unwrap().unwrap();
+    orch.begin(tx(2)).unwrap().unwrap();
     orch.execute(reserve(1)).unwrap().unwrap();
     orch.commit().unwrap().unwrap();
     assert_eq!(orch.balance(Account::EscrowWork(JOB)).unwrap(), Ok(10));
     assert!(auditor.audit_balances().unwrap().is_ok());
     // A connection that goes away takes its uncommitted work with it.
-    let kept = state(&w);
     // Nested or not, everything back to its first `Begin`.
+    let kept = state(&w);
     let mut gone = connect(&w, &env, &w.orch).unwrap();
-    gone.begin().unwrap().unwrap();
+    gone.begin(tx(3)).unwrap().unwrap();
     gone.execute(reserve(3)).unwrap().unwrap();
-    gone.begin().unwrap().unwrap();
+    gone.savepoint().unwrap().unwrap();
     gone.execute(reserve(8)).unwrap().unwrap();
     drop(gone);
     assert!(state(&w) == kept);
+    assert_eq!(
+        status(&mut orch, 3),
+        TxState::RolledBack(Rollback::Disconnected)
+    );
     // So does one that sends garbage in the middle.
     let mut link = raw(&w, &env);
     let me = &w.orch;
@@ -994,7 +1029,10 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
         signature: me.sign(&signed),
     };
     assert_eq!(say(&mut link, &proof), Message::Ready);
-    for (seq, body) in [(1, Request::Begin), (2, Request::Execute(reserve(4)))] {
+    for (seq, body) in [
+        (1, Request::Begin { id: tx(4) }),
+        (2, Request::Execute(reserve(4))),
+    ] {
         let m = Message::Request { seq, body };
         assert!(matches!(say(&mut link, &m), Message::Response { .. }));
     }
@@ -1004,24 +1042,329 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
         Ok(Message::Fault(Fault::Malformed))
     );
     assert!(state(&w) == kept);
-    // A transaction held too long is rolled back as soon as someone else needs the ledger.
-    orch.begin().unwrap().unwrap();
-    orch.execute(reserve(5)).unwrap().unwrap();
+    assert_eq!(
+        status(&mut orch, 4),
+        TxState::RolledBack(Rollback::Disconnected)
+    );
+}
+
+/// Third review of the isolation, timeouts. A deadline runs from the outermost `Begin` and
+/// binds everyone: the owner that keeps working past it, the owner that went idle, and a
+/// nested transaction, which does not extend it. What the owner sends after the rollback was
+/// meant for the transaction: it is refused, never applied on its own.
+#[test]
+fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
+    let (mut w, env) = wired();
+    w.open(JOB, 500).unwrap();
     let limit = HostLimits::default().tx_timeout_ms;
-    env.now_ms.store(limit - 1, Ordering::Relaxed);
+    let at = |ms: u64| env.now_ms.store(ms, Ordering::Relaxed);
+    let mut orch = connect(&w, &env, &w.orch).unwrap();
+    let mut clock = connect(&w, &env, &w.clock).unwrap();
+    let before = state(&w);
+    let expired = Err(LinkError::Refused(Refusal::TransactionExpired));
+    let late = Err(LinkError::Refused(Refusal::TransactionExpired));
+
+    // 1. Active past its deadline: the owner keeps sending, nobody else is there.
+    orch.begin(tx(1)).unwrap().unwrap();
+    orch.execute(reserve(1)).unwrap().unwrap();
+    at(limit - 1);
+    orch.execute(reserve(2)).unwrap().unwrap();
+    at(limit);
+    assert_eq!(orch.execute(reserve(3)), expired);
+    assert!(
+        state(&w) == before,
+        "rolled back, and the late reserve was not applied alone"
+    );
+    assert_eq!(status(&mut orch, 1), TxState::RolledBack(Rollback::Expired));
+    // Told once: the connection works again, outside any transaction.
+    assert_eq!(
+        orch.commit(),
+        Err(LinkError::Refused(Refusal::NoTransaction))
+    );
+    assert_eq!(host_of(&w).lock().unwrap().retained().0, 0);
+
+    // 2. Idle: the owner sends nothing more and nobody else asks. The sweep ends it.
+    at(10 * limit);
+    orch.begin(tx(2)).unwrap().unwrap();
+    orch.execute(reserve(4)).unwrap().unwrap();
+    {
+        let host = host_of(&w);
+        let mut host = host.lock().unwrap();
+        assert!(!host.sweep(11 * limit - 1), "not yet");
+        assert!(host.sweep(11 * limit), "rolled back by the sweep alone");
+        assert!(!host.sweep(11 * limit), "once");
+    }
+    assert!(state(&w) == before);
+    at(11 * limit);
+    // The ledger is free for the others at once.
+    clock
+        .execute(LedgerOp::Advance { now: 5 })
+        .unwrap()
+        .unwrap();
+    let advanced = state(&w);
+    // The owner comes back unaware and goes on with "its" transaction: refused, not applied.
+    assert_eq!(orch.execute(reserve(5)), expired);
+    assert!(
+        state(&w) == advanced,
+        "a reserve meant for the transaction did not land"
+    );
+    assert_eq!(status(&mut orch, 2), TxState::RolledBack(Rollback::Expired));
+    assert_eq!(
+        orch.commit(),
+        Err(LinkError::Refused(Refusal::NoTransaction))
+    );
+
+    // 3. Nested: the deadline is the outermost one's.
+    at(20 * limit);
+    orch.begin(tx(3)).unwrap().unwrap();
+    at(21 * limit - 1);
+    orch.savepoint().unwrap().unwrap();
+    orch.execute(reserve(6)).unwrap().unwrap();
+    at(21 * limit);
+    assert_eq!(orch.commit(), late, "a late nested commit");
+    assert!(state(&w) == advanced);
+    assert_eq!(status(&mut orch, 3), TxState::RolledBack(Rollback::Expired));
+
+    // 4. A commit that arrives after the deadline is refused like the rest.
+    at(30 * limit);
+    orch.begin(tx(4)).unwrap().unwrap();
+    orch.execute(reserve(7)).unwrap().unwrap();
+    at(31 * limit);
+    assert_eq!(orch.commit(), late);
+    assert!(state(&w) == advanced);
+
+    // 5. Another client showing up after the deadline ends it too, and the owner still learns.
+    at(40 * limit);
+    orch.begin(tx(5)).unwrap().unwrap();
+    orch.execute(reserve(8)).unwrap().unwrap();
+    at(41 * limit - 1);
     assert_eq!(
         clock.execute(LedgerOp::Advance { now: 9 }),
         Err(LinkError::Refused(Refusal::Busy))
     );
-    env.now_ms.store(limit, Ordering::Relaxed);
+    at(41 * limit);
     clock
         .execute(LedgerOp::Advance { now: 9 })
         .unwrap()
         .unwrap();
-    refused(orch.commit(), Refusal::NoTransaction);
-    let after = state(&w);
-    assert_eq!(after.now(), 9);
-    assert_eq!(orch.balance(Account::EscrowWork(JOB)).unwrap(), Ok(10));
+    assert_eq!(orch.execute(reserve(8)), expired);
+    assert_eq!(state(&w).now(), 9);
+    assert_eq!(orch.balance(Account::EscrowWork(JOB)).unwrap(), Ok(0));
+
+    // 6. A connection that goes away after its transaction expired leaves nothing behind.
+    at(50 * limit);
+    let mut gone = connect(&w, &env, &w.orch).unwrap();
+    gone.begin(tx(6)).unwrap().unwrap();
+    host_of(&w).lock().unwrap().sweep(51 * limit);
+    assert_eq!(host_of(&w).lock().unwrap().retained().0, 1);
+    drop(gone);
+    assert_eq!(host_of(&w).lock().unwrap().retained().0, 0);
+    // A clock that goes back never ends a transaction.
+    at(60 * limit);
+    orch.begin(tx(7)).unwrap().unwrap();
+    assert!(!host_of(&w).lock().unwrap().sweep(0));
+    orch.abort().unwrap().unwrap();
+}
+
+/// Third review of the isolation, unknown outcomes. A transaction has a name the ledger
+/// remembers: what became of it can be asked, by the orchestrator, at any time, and a name is
+/// never run twice.
+#[test]
+fn r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once() {
+    let w = bare_world();
+    let limits = HostLimits {
+        tx_log: 3,
+        ..HostLimits::default()
+    };
+    let service = LedgerService::new(w.auth.verifier(), w.keys.clone(), LedgerLimits::default());
+    let host = LedgerHost::new(
+        service,
+        w.keys.clone(),
+        w.auth.verifier(),
+        w.ledger_id.clone(),
+        limits,
+        INCARNATION,
+    )
+    .unwrap();
+    let host = Arc::new(Mutex::new(host));
+    let env = TestEnv::default();
+    let dial = |me: &ServiceCredential| {
+        let link = Loopback::new(host.clone(), Box::new(env.clone()));
+        LedgerClient::connect(link, me, &w.auth.verifier(), [1; 32]).unwrap()
+    };
+    let mut orch = dial(&w.orch);
+    let mut other = dial(&w.orch);
+    assert_eq!(orch.info().unwrap().incarnation, INCARNATION);
+    assert_eq!(status(&mut orch, 1), TxState::Unknown);
+    orch.begin(tx(1)).unwrap().unwrap();
+    // Asked from another connection while it is open: answered, not "busy".
+    assert_eq!(status(&mut other, 1), TxState::Open);
+    assert_eq!(other.info(), Err(LinkError::Refused(Refusal::Busy)));
+    let _ = orch.execute(reserve(1)).unwrap();
+    orch.commit().unwrap().unwrap();
+    let seq = host.lock().unwrap().service().seq();
+    assert_eq!(status(&mut other, 1), TxState::Committed { seq });
+    // Committed or not, a name is not run again.
+    let known = Err(LinkError::Refused(Refusal::TransactionKnown));
+    assert_eq!(orch.begin(tx(1)), known);
+    orch.begin(tx(2)).unwrap().unwrap();
+    orch.abort().unwrap().unwrap();
+    assert_eq!(status(&mut orch, 2), TxState::RolledBack(Rollback::Asked));
+    assert_eq!(orch.begin(tx(2)), known);
+    // A nested commit or abort is not an outcome.
+    orch.begin(tx(3)).unwrap().unwrap();
+    orch.savepoint().unwrap().unwrap();
+    orch.commit().unwrap().unwrap();
+    assert_eq!(status(&mut orch, 3), TxState::Open);
+    orch.savepoint().unwrap().unwrap();
+    orch.abort().unwrap().unwrap();
+    assert_eq!(status(&mut orch, 3), TxState::Open);
+    orch.commit().unwrap().unwrap();
+    assert!(matches!(status(&mut orch, 3), TxState::Committed { .. }));
+    // Only the orchestrator asks.
+    for me in [&w.treasury, &w.auditor, &w.clock] {
+        let mut c = dial(me);
+        let role = me.role();
+        assert_eq!(
+            c.tx_status(tx(1)).unwrap(),
+            Err(LedgerApiError::Forbidden {
+                role,
+                op: "TxStatus"
+            })
+        );
+    }
+    // The log is bounded: the oldest outcome is forgotten, and then nothing can be said of it.
+    assert_eq!(host.lock().unwrap().retained().1, 3);
+    orch.begin(tx(4)).unwrap().unwrap();
+    orch.commit().unwrap().unwrap();
+    assert_eq!(host.lock().unwrap().retained().1, 3);
+    assert_eq!(status(&mut orch, 1), TxState::Unknown);
+    assert!(matches!(status(&mut orch, 4), TxState::Committed { .. }));
+    // Too large: rolled back, and remembered as such.
+    let small = HostLimits {
+        max_tx_ops: 1,
+        ..HostLimits::default()
+    };
+    let service = LedgerService::new(w.auth.verifier(), w.keys.clone(), LedgerLimits::default());
+    let host = LedgerHost::new(
+        service,
+        w.keys.clone(),
+        w.auth.verifier(),
+        w.ledger_id.clone(),
+        small,
+        INCARNATION + 1,
+    )
+    .unwrap();
+    let host = Arc::new(Mutex::new(host));
+    let link = Loopback::new(host.clone(), Box::new(env.clone()));
+    let mut orch = LedgerClient::connect(link, &w.orch, &w.auth.verifier(), [2; 32]).unwrap();
+    orch.begin(tx(1)).unwrap().unwrap();
+    let _ = orch.execute(reserve(1)).unwrap();
+    assert_eq!(
+        orch.execute(reserve(2)),
+        Err(LinkError::Refused(Refusal::TransactionTooLarge))
+    );
+    // Another incarnation: a ledger that restarted says so in every answer.
+    assert_eq!(
+        orch.tx_status(tx(1)).unwrap(),
+        Ok((TxState::RolledBack(Rollback::TooLarge), INCARNATION + 1))
+    );
+}
+
+/// A link that loses the answers it is told to lose, and otherwise works.
+struct Lossy {
+    inner: Loopback,
+    lose: Arc<std::sync::atomic::AtomicBool>,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Transport for Lossy {
+    fn send(&mut self, payload: &[u8]) -> Result<(), LinkError> {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        self.inner.send(payload)
+    }
+    fn recv(&mut self) -> Result<Vec<u8>, LinkError> {
+        let answer = self.inner.recv();
+        if self.lose.swap(false, Ordering::Relaxed) {
+            return Err(LinkError::Io("the answer was lost".into()));
+        }
+        answer
+    }
+}
+
+/// Third review of the isolation, unknown outcomes, on the client's side. A commit ends in one
+/// of three ways and the orchestrator is told which: done, not applied (the ledger said so, or
+/// ended the connection, which rolls back), or unknown (no answer). After an answer that did
+/// not come the connection is dead: nothing more is sent on it, so no late answer is ever read
+/// as the answer to another request.
+#[test]
+fn r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead() {
+    let (mut w, env) = wired();
+    w.open(JOB, 500).unwrap();
+    let lose = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let lossy = |w: &World| {
+        let link = Lossy {
+            inner: raw(w, &env),
+            lose: lose.clone(),
+            sent: sent.clone(),
+        };
+        LedgerClient::connect(link, &w.orch, &w.auth.verifier(), [8; 32]).unwrap()
+    };
+    let mut asking = connect(&w, &env, &w.orch).unwrap();
+    let before = state(&w);
+    let not_applied = |r: Result<(), CommitFailure>| match r {
+        Err(CommitFailure::NotApplied(LedgerApiError::Unavailable(why))) => why,
+        other => panic!("{other:?}"),
+    };
+
+    // Done.
+    let mut orch = lossy(&w);
+    RemoteLedger::begin(&mut orch, tx(1)).unwrap();
+    assert_eq!(RemoteLedger::commit(&mut orch), Ok(()));
+    // Not applied: there was nothing to commit.
+    not_applied(RemoteLedger::commit(&mut orch));
+    // Not applied: the transaction had expired, and the ledger says so.
+    RemoteLedger::begin(&mut orch, tx(2)).unwrap();
+    RemoteLedger::execute(&mut orch, reserve(1)).unwrap();
+    host_of(&w).lock().unwrap().sweep(u64::MAX);
+    let why = not_applied(RemoteLedger::commit(&mut orch));
+    assert!(why.contains("expired"), "{why}");
+    assert!(state(&w) == before);
+    // The connection is still good after a refusal.
+    RemoteLedger::begin(&mut orch, tx(3)).unwrap();
+    RemoteLedger::execute(&mut orch, reserve(1)).unwrap();
+
+    // Unknown: the ledger commits, the answer is lost.
+    lose.store(true, Ordering::Relaxed);
+    assert_eq!(RemoteLedger::commit(&mut orch), Err(CommitFailure::Unknown));
+    assert!(matches!(status(&mut asking, 3), TxState::Committed { .. }));
+    let kept = state(&w);
+    assert!(kept != before);
+    // Dead from then on, though the link itself works again: nothing is sent.
+    let frames = sent.load(Ordering::Relaxed);
+    assert!(matches!(orch.info(), Err(LinkError::Io(_))));
+    assert!(matches!(orch.tx_status(tx(3)), Err(LinkError::Io(_))));
+    assert!(RemoteLedger::begin(&mut orch, tx(4)).is_err());
+    assert!(RemoteLedger::execute(&mut orch, reserve(2)).is_err());
+    assert!(RemoteLedger::status(&mut orch, tx(3)).is_err());
+    // A commit that could not even be sent is unknown too: only the ledger can tell.
+    assert_eq!(RemoteLedger::commit(&mut orch), Err(CommitFailure::Unknown));
+    assert_eq!(sent.load(Ordering::Relaxed), frames, "nothing was sent");
+    assert_eq!(status(&mut asking, 4), TxState::Unknown);
+    assert!(state(&w) == kept);
+
+    // Not applied: the ledger ended the connection itself, which rolls back.
+    let mut orch = lossy(&w);
+    RemoteLedger::begin(&mut orch, tx(5)).unwrap();
+    RemoteLedger::execute(&mut orch, reserve(3)).unwrap();
+    w.auth.revoke(w.orch.id());
+    not_applied(RemoteLedger::commit(&mut orch));
+    assert!(state(&w) == kept);
+    // And that connection is dead as well.
+    let frames = sent.load(Ordering::Relaxed);
+    assert!(matches!(orch.info(), Err(LinkError::Io(_))));
+    assert_eq!(sent.load(Ordering::Relaxed), frames);
 }
 
 /// A transaction has a size limit; past it, it is rolled back, not cut.
@@ -1039,13 +1382,14 @@ fn a_transaction_too_large_is_rolled_back() {
         w.auth.verifier(),
         w.ledger_id.clone(),
         limits,
+        INCARNATION,
     )
     .unwrap();
     let host = Arc::new(Mutex::new(host));
     let link = Loopback::new(host.clone(), Box::new(TestEnv::default()));
     let mut orch = LedgerClient::connect(link, &w.orch, &w.auth.verifier(), [1; 32]).unwrap();
     let before = host.lock().unwrap().service().clone();
-    orch.begin().unwrap().unwrap();
+    orch.begin(tx(1)).unwrap().unwrap();
     for n in 0..3 {
         // Refused or not, an operation counts.
         let _ = orch.execute(reserve(n)).unwrap();
@@ -1074,6 +1418,7 @@ fn a_host_checks_what_it_is_given() {
             verifier,
             id.clone(),
             HostLimits::default(),
+            INCARNATION,
         )
         .map(|_| ())
     };
@@ -1125,10 +1470,10 @@ proptest! {
     ) {
         let mut w = mirrored_world();
         w.open(JOB, 500).unwrap();
-        for (group, commit) in &groups {
+        for (n, (group, commit)) in groups.iter().enumerate() {
             let copy = w.ledger.clone();
-                        let m = w.mirror.as_mut().unwrap();
-            m.orch.tx(Request::Begin);
+            let m = w.mirror.as_mut().unwrap();
+            m.orch.tx(Request::Begin { id: tx(n as u64 + 1) });
             m.in_tx = true;
             // Only the orchestrator's own calls belong in its transaction: the clock waits.
             let own = group.iter().filter(|c| !matches!(c, Call::Tick(_)));
