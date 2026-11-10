@@ -90,6 +90,16 @@ pub fn ready_message(job: u32, attempt: u32, lender: AccountNo, restored: [u32; 
     restored.iter().fold(e, |e, r| e.u32(*r)).0
 }
 
+/// Signed by the recipient of `producer`'s output once it has received `producer`'s state replayed
+/// up to `restored`: the restoration is corroborated by a second account (JOB-R18).
+pub fn restore_message(job: u32, attempt: u32, producer: AccountNo, restored: [u32; 3]) -> Vec<u8> {
+    let e = Enc::new(b"more/restore/v1")
+        .u32(job)
+        .u32(attempt)
+        .u32(producer);
+    restored.iter().fold(e, |e, r| e.u32(*r)).0
+}
+
 /// Signed by the recipient of `producer`'s output (next stage, or the witness after the last
 /// stage): "I received positions `0..upto` of type `wt`, with chained digest `digest`".
 pub fn receipt_message(
@@ -136,6 +146,7 @@ mod tests {
             mandate_message(1, 2, 3, &t),
             lease_message(&a),
             ready_message(1, 1, 10, [0; 3]),
+            restore_message(1, 1, 10, [0; 3]),
             receipt_message(1, 1, 10, 1, 4, 9),
         ];
         for (i, x) in msgs.iter().enumerate() {

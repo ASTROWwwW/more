@@ -9,7 +9,7 @@ use gpu_domain::*;
 use gpu_ledger::{LedgerLimits, LedgerService};
 use more_identity::{
     assume_account, lease_message, mandate_message, ready_message, receipt_message, relay_message,
-    Assignment, IdentityAuthority, JobTerms, KeyDirectory, ServiceRole, UserKey,
+    restore_message, Assignment, IdentityAuthority, JobTerms, KeyDirectory, ServiceRole, UserKey,
 };
 
 use crate::invariants::{check_state, check_step, Violation};
@@ -117,8 +117,9 @@ impl Sim {
         self.exec_as(&ctx, cmd)
     }
 
-    /// JOB-R38: every lender of `attempt` accepts, loads and reports ready, each as itself, with
-    /// every property checked. Returns the first refusal, or the last outcome.
+    /// JOB-R38: every lender of `attempt` accepts, loads and reports ready, each as itself, then
+    /// each stage's recipient corroborates the restoration (JOB-R18): a healthy cluster. Every
+    /// property is checked. Returns the first refusal, or the outcome of the last readiness.
     pub fn start_cluster(
         &mut self,
         job: JobId,
@@ -135,6 +136,9 @@ impl Sim {
         let mut last = Outcome::AlreadyApplied;
         for cmd in bring_up(job, attempt, &lenders, restored) {
             last = self.exec(cmd)?;
+        }
+        for cmd in corroborate(job, attempt, &lenders) {
+            self.exec(cmd)?;
         }
         Ok(last)
     }

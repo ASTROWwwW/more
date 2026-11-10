@@ -247,6 +247,7 @@ impl Sim {
             },
         ];
         v.extend(start);
+        v.extend(corroborate(id, j.attempt + 1, &a.lenders));
         v.push(Command::ConfirmDelivery {
             job: id,
             wt,

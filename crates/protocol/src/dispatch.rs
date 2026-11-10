@@ -92,6 +92,17 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             lender: sender,
             config: *config,
         },
+        M::RestoreCorroboration {
+            job,
+            attempt,
+            producer,
+            signature,
+        } => Command::CorroborateRestore {
+            job: *job,
+            attempt: *attempt,
+            lender: *producer,
+            signature: *signature,
+        },
         M::WitnessHeartbeat { job, attempt } => Command::WitnessHeartbeat {
             job: *job,
             attempt: *attempt,

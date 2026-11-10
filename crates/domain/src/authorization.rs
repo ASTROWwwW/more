@@ -252,13 +252,19 @@ pub(crate) fn authorize(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> R 
             attempt,
             lender,
             ..
+        }
+        | CorroborateRestore {
+            job: id,
+            attempt,
+            lender,
+            ..
         } => {
             let j = job(id)?;
             let Some(a) = j.attempts.get(attempt) else {
                 return Ok(());
             };
-            // SEC-004: only the recipient of the producer's output commits its receipts; the
-            // producer never commits for itself. An unknown producer is refused by the transition.
+            // SEC-004, JOB-R18: only the recipient of the producer's output commits its receipts
+            // or corroborates its restoration; the producer never does it for itself. An unknown producer is refused by the transition.
             let Some(stage) = a.stage_of(*lender) else {
                 return Ok(());
             };

@@ -10,6 +10,7 @@ mod attacks;
 mod compromise;
 mod leases;
 mod protocol;
+mod recovery;
 
 const J1: JobId = JobId(1);
 const J2: JobId = JobId(2);

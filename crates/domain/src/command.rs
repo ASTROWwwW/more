@@ -85,6 +85,15 @@ pub enum Command {
         lender: AccountId,
         config: u64,
     },
+    /// JOB-R18: the recipient of `lender`'s output (next stage, or the witness) attests that it
+    /// received `lender`'s restored state. `signature` is the recipient's over `restore_message`,
+    /// checked by the ledger.
+    CorroborateRestore {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        signature: [u8; 64],
+    },
     /// Renews the sender's own lease (JOB-R31, JOB-R39).
     Heartbeat {
         job: JobId,

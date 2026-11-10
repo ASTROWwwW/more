@@ -147,6 +147,14 @@ pub enum LedgerOp {
         restored: [u32; 3],
         signature: [u8; 64],
     },
+    /// The recipient of `producer`'s output signed that it received `producer`'s restored state
+    /// (JOB-R18, LEDGER-016).
+    RecordRestore {
+        job: u32,
+        attempt: u32,
+        producer: u32,
+        signature: [u8; 64],
+    },
     /// Receipt signed by the recipient of `producer`'s output (LEDGER-016).
     RecordReceipt {
         job: u32,
@@ -208,6 +216,7 @@ impl LedgerOp {
             LedgerOp::RegisterAttempt { .. } => "RegisterAttempt",
             LedgerOp::AcceptLease { .. } => "AcceptLease",
             LedgerOp::LeaseReady { .. } => "LeaseReady",
+            LedgerOp::RecordRestore { .. } => "RecordRestore",
             LedgerOp::RecordReceipt { .. } => "RecordReceipt",
             LedgerOp::ChargeOutput { .. } => "ChargeOutput",
             LedgerOp::VoidOutput { .. } => "VoidOutput",

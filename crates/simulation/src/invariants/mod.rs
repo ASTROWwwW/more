@@ -114,6 +114,7 @@ pub fn check_state(c: &Coordinator, auditor: &ServiceCredential) -> Vec<Violatio
     lifecycle::attempts(c, &mut out);
     leases::state(c, &mut out);
     proofs::state(c, ledger, auditor, &mut out);
+    proofs::recovery(c, &mut out);
     out
 }
 

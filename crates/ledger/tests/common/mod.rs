@@ -4,7 +4,7 @@
 
 use gpu_ledger::*;
 use more_identity::{
-    lease_message, mandate_message, ready_message, receipt_message, relay_message,
+    lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
     IdentityAuthority, KeyDirectory, ServiceCredential, ServiceRole, UserKey,
 };
 
@@ -199,6 +199,17 @@ impl World {
             stage,
             restored: [0; 3],
             signature: key(signer).sign(&ready_message(a.job, a.attempt, lender, [0; 3])),
+        })
+    }
+
+    /// `signer` attests that it received the restored state of the lender of `stage`.
+    pub fn corroborate(&mut self, a: &Assignment, stage: u32, signer: u32) -> Res {
+        let producer = a.lenders[stage as usize];
+        self.run(LedgerOp::RecordRestore {
+            job: a.job,
+            attempt: a.attempt,
+            producer,
+            signature: key(signer).sign(&restore_message(a.job, a.attempt, producer, [0; 3])),
         })
     }
 

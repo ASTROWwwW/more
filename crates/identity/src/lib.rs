@@ -17,8 +17,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 mod statements;
 
 pub use statements::{
-    lease_message, mandate_message, ready_message, receipt_message, relay_message, Assignment,
-    JobTerms,
+    lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
+    Assignment, JobTerms,
 };
 
 /// Account number, as used by the ledger and the domain (`AccountId.0`).

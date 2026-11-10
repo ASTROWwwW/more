@@ -102,6 +102,11 @@ pub enum LeaseState {
 pub struct Lease {
     pub state: LeaseState,
     pub expires_at: Time,
+    /// Positions the lender signed it restored its state to, once `Ready` (JOB-T05).
+    pub restored: Option<PerType<u32>>,
+    /// The recipient of this stage's output signed that it received that restored state: the
+    /// restoration is attested by a second account (JOB-R18).
+    pub corroborated: bool,
 }
 
 /// An attempt: fixed cluster, leases, production counters.

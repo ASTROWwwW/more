@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use more_identity::{lease_message, ready_message, receipt_message, Assignment};
+use more_identity::{lease_message, ready_message, receipt_message, restore_message, Assignment};
 
 use super::book::{AttemptRec, ItemRec, ItemState};
 use super::types::{ItemId, LedgerApiError, LedgerOutcome, LineRef, OutputRef};
@@ -81,6 +81,8 @@ impl LedgerService {
             assignment: a,
             accepted: vec![false; n],
             ready: vec![false; n],
+            restored: vec![[0; 3]; n],
+            corroborated: vec![false; n],
             recovery_reserved: 0,
             earmark_returned: false,
         };
@@ -140,7 +142,36 @@ impl LedgerService {
                 signature,
             )
             .map_err(|_| proof("readiness not signed by the stage's lender"))?;
-        self.attempt_mut(job, attempt)?.ready[s] = true;
+        let rec = self.attempt_mut(job, attempt)?;
+        rec.ready[s] = true;
+        rec.restored[s] = restored;
+        Ok(LedgerOutcome::Done)
+    }
+
+    /// JOB-R18: a lender's word that it restored its state is not enough to be paid for it. The
+    /// account that receives its output must sign that it received that restored state.
+    pub(super) fn record_restore(
+        &mut self,
+        job: u32,
+        attempt: u32,
+        producer: u32,
+        signature: &[u8; 64],
+    ) -> ApiResult {
+        let rec = self.attempt(job, attempt)?;
+        let s = rec
+            .stage_of(producer)
+            .ok_or(invalid("producer not in attempt"))?;
+        if !rec.ready[s] || rec.corroborated[s] {
+            return Err(invalid(
+                "restoration not signed by its lender, or corroborated twice",
+            ));
+        }
+        let recipient = rec.recipient_of(s).ok_or(invalid("no recipient"))?;
+        let msg = restore_message(job, attempt, producer, rec.restored[s]);
+        self.keys
+            .verify(recipient, &msg, signature)
+            .map_err(|_| proof("restoration not corroborated by the producer's recipient"))?;
+        self.attempt_mut(job, attempt)?.corroborated[s] = true;
         Ok(LedgerOutcome::Done)
     }
 
@@ -293,8 +324,9 @@ impl LedgerService {
     }
 
     /// Pays a reserved item, with proof: a recipient's receipt covering the output for a
-    /// contribution whose charge is still in force; the lender's readiness for recovery (checked
-    /// at reservation). Recovery is paid from the owner's budget first, then the pool's relay.
+    /// contribution whose charge is still in force; for recovery, the restoration corroborated
+    /// by the lender's recipient, on an attempt every lender signed ready for (checked at
+    /// reservation). Recovery is paid from the owner's budget first, then the pool's relay.
     pub(super) fn pay_line(&mut self, line: LineRef, item: ItemId) -> ApiResult {
         let it = self.reserved_item(line, item)?;
         let e = self.live_escrow(line.job)?;
@@ -310,7 +342,15 @@ impl LedgerService {
                     return Err(proof("no receipt from the recipient covers this output"));
                 }
             }
-            ItemId::Recovery { .. } => {
+            ItemId::Recovery { attempt, .. } => {
+                // JOB-R18: settled only on a restoration its recipient corroborated.
+                let rec = e.attempts.get(&attempt).ok_or(invalid("unknown attempt"))?;
+                let s = rec
+                    .stage_of(line.lender)
+                    .ok_or(proof("lender not in the attempt"))?;
+                if !rec.corroborated[s] {
+                    return Err(proof("recovery without a corroborated restoration"));
+                }
                 let left = e
                     .owner_recovery
                     .checked_sub(e.recovery_paid_owner)

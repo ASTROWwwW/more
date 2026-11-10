@@ -126,6 +126,12 @@ pub enum Op {
         job: u8,
         node: u8,
     },
+    /// The recipient of a stage attests its restoration, or the producer forges it (JOB-R18).
+    Corroborate {
+        job: u8,
+        stage: u8,
+        forged: bool,
+    },
     /// Every node but one keeps renewing until that one's lease runs out (JOB-R39).
     SilentNode {
         job: u8,
@@ -261,6 +267,7 @@ pub fn op_strategy() -> impl Strategy<Value = Op> {
         3 => b().prop_map(Op::Heartbeat),
         2 => (b(), b()).prop_map(|(job, node)| Op::NodeHeartbeat { job, node }),
         1 => (b(), b()).prop_map(|(job, node)| Op::SilentNode { job, node }),
+        3 => (b(), b(), prop::bool::weighted(0.2)).prop_map(|(job, stage, forged)| Op::Corroborate { job, stage, forged }),
         3 => (b(), b(), b()).prop_map(|(job, stage, step)| Op::LeaseStep { job, stage, step }),
         4 => (b(), b(), b(), prop::bool::weighted(0.2)).prop_map(|(job, wt, n, forged)| Op::Deliver { job, wt, n, forged }),
         2 => (b(), b(), b()).prop_map(|(job, wt, sel)| Op::Confirm { job, wt, sel }),

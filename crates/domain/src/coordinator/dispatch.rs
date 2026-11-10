@@ -62,6 +62,12 @@ impl Coordinator {
                 lender,
                 signature,
             } => self.accept_lease(*job, *attempt, *lender, signature),
+            CorroborateRestore {
+                job,
+                attempt,
+                lender,
+                signature,
+            } => self.corroborate_restore(*job, *attempt, *lender, signature),
             LeaseLoaded {
                 job,
                 attempt,

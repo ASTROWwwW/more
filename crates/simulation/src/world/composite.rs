@@ -154,6 +154,11 @@ impl Sim {
                 let mut v = self.renew_all(id);
                 if let Some(a) = j.current() {
                     v.extend(bring_up(id, j.attempt, &a.lenders, j.delivered));
+                    // Most clusters corroborate each other's restoration right away; some never
+                    // do, and their recovery claims stay held (JOB-R18).
+                    if !sel.is_multiple_of(4) {
+                        v.extend(corroborate(id, j.attempt, &a.lenders));
+                    }
                 }
                 v
             }

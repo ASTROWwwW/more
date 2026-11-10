@@ -34,12 +34,15 @@ fn reserve_recovery(w: &mut World, attempt: u32, lender: u32, segment: u32, amou
     })
 }
 
-/// A resumed attempt 2 on the same lenders with `earmark`, both ready.
+/// A resumed attempt 2 on the same lenders with `earmark`, both ready, each restoration
+/// corroborated by its recipient (L2 for L1, the witness for L2).
 fn resumed(w: &mut World, earmark: Amount) -> Assignment {
     let a = assignment(2, &[L1, L2], &[3, 1], earmark);
     w.place(&a);
     w.ready(&a, 0, L1).unwrap();
     w.ready(&a, 1, L2).unwrap();
+    w.corroborate(&a, 0, L2).unwrap();
+    w.corroborate(&a, 1, WIT).unwrap();
     a
 }
 
@@ -311,6 +314,7 @@ fn r2_recovery_needs_readiness_and_stays_within_the_earmark() {
     assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
     w.ready(&a, 1, L2).unwrap();
     reserve_recovery(&mut w, 2, L1, 0, 10).unwrap();
+    w.corroborate(&a, 0, L2).unwrap();
     assert!(
         reserve_recovery(&mut w, 2, L1, 1, 6).is_err(),
         "above earmark"
@@ -446,4 +450,132 @@ fn r2_pool_relay_needs_the_admins_consent() {
     assert!(w.run(rename.clone()).is_err());
     let platform = w.auth.issue(more_identity::ServiceRole::PlatformAdmin);
     assert!(w.ledger.execute(&platform, rename).is_err());
+}
+
+/// JOB-R18, decision after the second audit. Reservation: the amount is locked within the
+/// earmark before any payment. Execution: the lender signs its restoration and its recipient
+/// corroborates it. Settlement: nothing is paid on the lender's word alone.
+#[test]
+fn r2_recovery_is_settled_only_on_a_corroborated_restoration() {
+    let (mut w, _) = World::running();
+    w.fund(40).unwrap();
+    // The orchestrator places an account it controls next to an honest lender.
+    let a = assignment(2, &[MALLORY, L2], &[3, 1], 50);
+    w.place(&a);
+    w.ready(&a, 0, MALLORY).unwrap();
+    w.ready(&a, 1, L2).unwrap();
+    reserve_recovery(&mut w, 2, MALLORY, 0, 50).unwrap();
+    let item = ItemId::Recovery {
+        attempt: 2,
+        segment: 0,
+    };
+    let pay = LedgerOp::PayLine {
+        line: line(2, MALLORY),
+        item,
+    };
+    let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // Ready, signed by everyone, is not enough.
+    bad_proof(w.run(pay.clone()));
+    // Corroboration by the accomplice itself, by the orchestrator's other guesses, or by an
+    // honest account that is not the stage's recipient: refused.
+    for signer in [MALLORY, WIT, L1, ALICE] {
+        bad_proof(w.corroborate(&a, 0, signer));
+    }
+    bad_proof(w.run(pay.clone()));
+    // A corroboration of another attempt or another lender cannot be replayed here.
+    let honest = resumed_like(&mut w, 3);
+    let replay = LedgerOp::RecordRestore {
+        job: JOB,
+        attempt: 2,
+        producer: MALLORY,
+        signature: key(L2).sign(&more_identity::restore_message(JOB, 3, L1, [0; 3])),
+    };
+    bad_proof(w.run(replay));
+    let _ = honest;
+    // The amount stays reserved, never paid; the only way out is back to the recovery escrow.
+    assert_eq!(w.bal(Account::User(MALLORY)), 0);
+    w.run(LedgerOp::RefundLine {
+        line: line(2, MALLORY),
+        item,
+    })
+    .unwrap();
+    assert!(w.run(pay).is_err());
+    w.run(LedgerOp::SettleJob { job: JOB }).unwrap();
+    assert_eq!(w.bal(Account::User(MALLORY)), 0);
+    assert_eq!(w.bal(Account::PoolReserve(POOL)), 1_000);
+    assert_eq!(w.bal(Account::User(ALICE)), 1_000);
+}
+
+/// Another resumed attempt on the honest lenders, ready and corroborated.
+fn resumed_like(w: &mut World, attempt: u32) -> Assignment {
+    let a = assignment(attempt, &[L1, L2], &[3, 1], 0);
+    w.place(&a);
+    w.ready(&a, 0, L1).unwrap();
+    w.ready(&a, 1, L2).unwrap();
+    w.corroborate(&a, 0, L2).unwrap();
+    a
+}
+
+/// A valid receipt pays one contribution once: presenting it again, on the same attempt, on
+/// another attempt or on another job, never opens a second payment.
+#[test]
+fn r2_a_replayed_receipt_never_pays_twice() {
+    let (mut w, _) = World::running();
+    w.charge(1, 0).unwrap();
+    reserve_contribution(&mut w, 1, L1, 0, 0).unwrap();
+    w.receipt(1, L1, 1, L2).unwrap();
+    let pay = LedgerOp::PayLine {
+        line: line(1, L1),
+        item: contribution(0, 0),
+    };
+    assert_eq!(
+        w.run(pay.clone()),
+        Ok(LedgerOutcome::Paid {
+            amount: 6,
+            pool_part: 0
+        })
+    );
+    // The same receipt again: accepted as a record, worth nothing more.
+    w.receipt(1, L1, 1, L2).unwrap();
+    assert!(w.run(pay.clone()).is_err(), "paid twice");
+    assert!(
+        reserve_contribution(&mut w, 1, L1, 0, 0).is_err(),
+        "reserved twice"
+    );
+    // Same slice of another line of the same lender: the item, not the line, is unique.
+    let other_slice = LineRef {
+        slice: 2,
+        ..line(1, L1)
+    };
+    let again = LedgerOp::ReserveContribution {
+        line: other_slice,
+        output: out(0),
+        gen: 0,
+        stage: 0,
+    };
+    assert!(w.run(again).is_err());
+    // The signature binds the attempt and the job: it does not verify anywhere else.
+    w.place(&assignment(2, &[L1, L2], &[3, 1], 0));
+    let signature = key(L2).sign(&more_identity::receipt_message(JOB, 1, L1, WT, 1, 0));
+    let replay = |job, attempt| LedgerOp::RecordReceipt {
+        job,
+        attempt,
+        producer: L1,
+        wt: WT,
+        upto: 1,
+        digest: 0,
+        signature,
+    };
+    let r = w.run(replay(JOB, 2));
+    assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    w.open(2, 100).unwrap();
+    let mut second = assignment(1, &[L1, L2], &[3, 1], 0);
+    second.job = 2;
+    w.place(&second);
+    let r = w.run(replay(2, 1));
+    assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // One payment of 6 in all.
+    w.run(LedgerOp::ReleaseReward { line: line(1, L1) })
+        .unwrap();
+    assert_eq!(w.bal(Account::User(L1)) + w.bal(Account::Commission), 6);
 }

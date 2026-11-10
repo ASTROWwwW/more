@@ -31,18 +31,36 @@ impl Coordinator {
         if idxs.is_empty() {
             return Err(DomainError::Precondition("line not disputed"));
         }
+        let mut ruled = false;
         for idx in idxs {
-            if pay {
+            if !pay {
+                self.refund_item(slice, lender, idx, RefundReason::Arbitration)?;
+            } else if self.payable_by_ruling(slice, lender, idx) {
                 self.pay_item(slice, lender, idx, true)?;
             } else {
-                self.refund_item(slice, lender, idx, RefundReason::Arbitration)?;
+                // JOB-R18: a ruling cannot pay recovery nobody corroborated. It stays held until
+                // its recipient corroborates or a ruling refunds it.
+                continue;
             }
+            ruled = true;
+        }
+        if !ruled {
+            return Err(DomainError::InadmissibleProof);
         }
         if self.slices[&slice].lines.values().all(|l| l.disputed == 0) {
             self.set_slice(slice, SliceStatus::Final, "JOB-S06")?;
             self.maybe_return_earmark(slice.job, slice.attempt)?;
         }
         Ok(Outcome::Applied)
+    }
+
+    /// A pay ruling applies to every disputed item except recovery work whose restoration was not
+    /// corroborated (JOB-R18): the ledger would refuse it.
+    fn payable_by_ruling(&self, slice: SliceId, lender: AccountId, idx: usize) -> bool {
+        match self.slices[&slice].lines[&lender].items[idx].kind {
+            ItemKind::Recovery(rid) => self.restore_corroborated(rid, lender),
+            ItemKind::Contribution(_) => true,
+        }
     }
 
     pub(super) fn release_reward(&mut self, slice: SliceId, lender: AccountId) -> R<Outcome> {

@@ -230,6 +230,12 @@ impl Coordinator {
         &self.ledger
     }
 
+    /// Test only: the ledger's journal fails after `after` more entries (`None` clears it).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_ledger_fault(&mut self, after: Option<u64>) {
+        self.ledger.inject_fault(after);
+    }
+
     fn ledger_op(&mut self, op: LedgerOp) -> R<LedgerOutcome> {
         Ok(self.ledger.execute(&self.cred, op)?)
     }

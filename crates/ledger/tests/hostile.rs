@@ -5,7 +5,8 @@
 //! account (`MALLORY`), which it may place as a lender. The owner, the lenders `L1` and `L2` and
 //! the witness are honest: a lender signs a lease or its readiness only when the attempt names
 //! it, and a recipient signs a receipt only for what it received (attempt 1, outputs `0..3`, from
-//! an honest producer). The pool's admin agrees to relay at most 60 credits.
+//! an honest producer), and corroborates a restoration only from an honest producer. The pool's
+//! admin agrees to relay at most 60 credits.
 //! Out of scope: an attacker that also holds the keys of every recipient of its own stage.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -14,7 +15,7 @@ mod common;
 
 use common::*;
 use gpu_ledger::*;
-use more_identity::{lease_message, ready_message, receipt_message};
+use more_identity::{lease_message, ready_message, receipt_message, restore_message};
 use proptest::prelude::*;
 
 /// What the honest recipients really received on attempt 1.
@@ -39,6 +40,11 @@ enum Call {
     Ready {
         attempt: u8,
         stage: u8,
+        signer: u8,
+    },
+    Corroborate {
+        attempt: u8,
+        producer: u8,
         signer: u8,
     },
     Receipt {
@@ -106,6 +112,7 @@ fn calls() -> impl Strategy<Value = Call> {
         4 => (b(), b(), b()).prop_map(|(attempt, shape, earmark)| Call::Register { attempt, shape, earmark }),
         6 => (b(), b(), b()).prop_map(|(attempt, stage, signer)| Call::Accept { attempt, stage, signer }),
         5 => (b(), b(), b()).prop_map(|(attempt, stage, signer)| Call::Ready { attempt, stage, signer }),
+                5 => (b(), b(), b()).prop_map(|(attempt, producer, signer)| Call::Corroborate { attempt, producer, signer }),
         6 => (b(), b(), b(), b()).prop_map(|(attempt, producer, upto, signer)| Call::Receipt { attempt, producer, upto, signer }),
         6 => (b(), b(), b()).prop_map(|(attempt, pos, gen)| Call::Charge { attempt, pos, gen }),
         2 => (b(), b()).prop_map(|(pos, gen)| Call::Void { pos, gen }),
@@ -305,6 +312,28 @@ fn apply(w: &mut World, c: &Call) -> Res {
                 signature: key(signer(honest, s)).sign(&m),
             })
         }
+        Call::Corroborate {
+            attempt,
+            producer,
+            signer: s,
+        } => {
+            let attempt = att_of(w, attempt);
+            let producer = lender_of(w, attempt, producer);
+            // An honest recipient attests a restoration only if it received the restored state,
+            // which the attacker's account never sends.
+            let recipient = w.escrow().attempts.get(&attempt).and_then(|r| {
+                let stage = r.stage_of(producer)?;
+                r.recipient_of(stage)
+            });
+            let honest = recipient.filter(|_| producer != MALLORY);
+            let m = restore_message(JOB, attempt, producer, [0; 3]);
+            w.run(LedgerOp::RecordRestore {
+                job: JOB,
+                attempt,
+                producer,
+                signature: key(signer(honest, s)).sign(&m),
+            })
+        }
         Call::Receipt {
             attempt,
             producer,
@@ -442,20 +471,12 @@ fn apply(w: &mut World, c: &Call) -> Res {
 fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
     let ledger = w.ledger.audit_view(&w.auditor).unwrap();
     prop_assert!(ledger.check_invariants().is_empty(), "{c:?}");
-    // A bystander's balance never moves. The attacker's account is never paid a contribution:
-    // that takes a receipt from an honest recipient. Known limit (JOB-R18, see the audit): placed
-    // as a lender of an attempt whose lenders all sign ready, it can claim recovery, within the
-    // budget the owner and the pool's admin agreed to.
+    // A bystander's balance never moves, and the attacker's account never receives a credit:
+    // a contribution takes a receipt from an honest recipient, recovery a restoration that an
+    // honest recipient corroborated (JOB-R18).
     prop_assert_eq!(w.bal(Account::User(BOB)), 1_000, "{:?}", c);
+    prop_assert_eq!(w.bal(Account::User(MALLORY)), 0, "{:?}", c);
     let e = w.escrow();
-    let budget = i128::from(e.owner_recovery) + i128::from(e.pool_funded);
-    prop_assert!(w.bal(Account::User(MALLORY)) <= budget, "{c:?}");
-    let paid_contribution = e.items.iter().any(|(id, it)| {
-        matches!(id, ItemId::Contribution { .. })
-            && it.line.lender == MALLORY
-            && it.state == ItemState::Paid
-    });
-    prop_assert!(!paid_contribution, "{c:?}");
     // The pool's treasury never relays more than its admin agreed to.
     prop_assert!(e.pool_funded <= RELAY, "{c:?}");
     // The owner never ends with more than it had: pool credits never become the owner's.
@@ -506,7 +527,9 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
                 prop_assert!(r.is_some_and(|u| *u > output.pos), "{id:?} after {c:?}");
             }
             ItemId::Recovery { .. } => {
-                prop_assert!(s.is_some_and(|s| a.ready[s]), "{id:?} after {c:?}");
+                prop_assert!(a.ready.iter().all(|r| *r), "{id:?} after {c:?}");
+                let proven = s.is_some_and(|s| a.corroborated[s]);
+                prop_assert!(it.state != ItemState::Paid || proven, "{id:?} after {c:?}");
             }
             ItemId::Contribution { .. } => {}
         }
@@ -580,6 +603,16 @@ fn p30_generator_reaches_every_operation() {
                 *accepted.entry(name).or_default() += 1;
             }
         }
+        // Both kinds of payment happen, so their proofs are really exercised.
+        for (id, it) in &w.escrow().items {
+            if it.state == ItemState::Paid {
+                let kind = match id {
+                    ItemId::Contribution { .. } => "paid contributions",
+                    ItemId::Recovery { .. } => "paid recovery items",
+                };
+                *accepted.entry(kind.to_string()).or_default() += 1;
+            }
+        }
     }
     for kind in [
         "Reserve",
@@ -587,6 +620,7 @@ fn p30_generator_reaches_every_operation() {
         "Register",
         "Accept",
         "Ready",
+        "Corroborate",
         "Receipt",
         "Charge",
         "Void",
@@ -598,6 +632,8 @@ fn p30_generator_reaches_every_operation() {
         "Contest",
         "ReturnEarmark",
         "Settle",
+        "paid contributions",
+        "paid recovery items",
     ] {
         assert!(
             accepted.get(kind).copied().unwrap_or(0) > 0,

@@ -135,6 +135,12 @@ impl Sim {
                 attempt: n,
                 lender,
                 ..
+            }
+            | CorroborateRestore {
+                job,
+                attempt: n,
+                lender,
+                ..
             } => match attempt(job, *n)
                 .and_then(|a| a.stage_of(*lender).and_then(|st| a.recipient_of(st)))
             {
@@ -216,6 +222,19 @@ impl Sim {
             } if *signature == UNSIGNED => {
                 if let Some(a) = att(*job, *attempt) {
                     *signature = user_key(me).sign(&lease_message(&assignment_of(*job, a)));
+                }
+            }
+            CorroborateRestore {
+                job,
+                attempt,
+                lender,
+                signature,
+            } if *signature == UNSIGNED => {
+                // An honest recipient attests the restored state it received from the producer.
+                let restored = att(*job, *attempt)
+                    .and_then(|a| a.stage_of(*lender).and_then(|s| a.leases[s].restored));
+                if let Some(r) = restored {
+                    *signature = user_key(me).sign(&restore_message(job.0, *attempt, lender.0, r));
                 }
             }
             FundRecovery {

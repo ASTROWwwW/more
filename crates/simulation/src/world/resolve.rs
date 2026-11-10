@@ -54,7 +54,28 @@ impl Sim {
                     restored[1] = restored[1].saturating_add(1);
                 }
                 let Some(a) = j.current() else { return vec![] };
-                bring_up(id, j.attempt, &a.lenders, restored)
+                let mut v = bring_up(id, j.attempt, &a.lenders, restored);
+                v.extend(corroborate(id, j.attempt, &a.lenders));
+                v
+            }
+            Op::Corroborate { job, stage, forged } => {
+                let id = self.job(job);
+                let Ok(j) = c.job(id) else { return vec![] };
+                let Some(a) = j.current() else { return vec![] };
+                let lender = pick(&a.lenders, stage);
+                // Forged: the producer vouches for itself, under its own key.
+                let signature = match a.stage_of(lender).and_then(|s| a.leases[s].restored) {
+                    Some(r) if forged => {
+                        user_key(lender).sign(&restore_message(id.0, j.attempt, lender.0, r))
+                    }
+                    _ => UNSIGNED,
+                };
+                vec![Command::CorroborateRestore {
+                    job: id,
+                    attempt: j.attempt,
+                    lender,
+                    signature,
+                }]
             }
             Op::SilentNode { job, node } => self.silent_node(self.job(job), node),
             Op::LeaseStep { job, stage, step } => self.lease_step(self.job(job), stage, step),

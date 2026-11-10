@@ -151,6 +151,14 @@ pub enum Message {
         job: JobId,
         attempt: u32,
     },
+    /// The sender received `producer`'s restored state: `signature` over `restore_message`
+    /// (JOB-R18). The sender is the producer's recipient.
+    RestoreCorroboration {
+        job: JobId,
+        attempt: u32,
+        producer: AccountId,
+        signature: [u8; 64],
+    },
     /// The sender presents a receipt for its own output, signed by its recipient (JOB-R12).
     ReceiptPresent {
         job: JobId,
@@ -192,6 +200,7 @@ pub enum MessageKind {
     LayersLoaded,
     WitnessHeartbeat,
     ReceiptPresent,
+    RestoreCorroboration,
 }
 
 impl Message {
@@ -227,6 +236,7 @@ impl Message {
             M::LayersLoaded { .. } => K::LayersLoaded,
             M::WitnessHeartbeat { .. } => K::WitnessHeartbeat,
             M::ReceiptPresent { .. } => K::ReceiptPresent,
+            M::RestoreCorroboration { .. } => K::RestoreCorroboration,
         }
     }
 
@@ -293,6 +303,17 @@ impl Message {
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
+                w.bytes(signature);
+            }
+            M::RestoreCorroboration {
+                job,
+                attempt,
+                producer,
+                signature,
+            } => {
+                w.u32(job.0);
+                w.u32(*attempt);
+                w.u32(producer.0);
                 w.bytes(signature);
             }
             M::LayersLoaded {

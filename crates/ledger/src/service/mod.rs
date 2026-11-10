@@ -60,6 +60,12 @@ impl LedgerService {
         }
     }
 
+    /// Test only: the journal fails after `after` more entries (`None` clears the fault).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_fault(&mut self, after: Option<u64>) {
+        self.ledger.inject_fault(after);
+    }
+
     pub fn limits(&self) -> &LedgerLimits {
         &self.limits
     }
@@ -233,6 +239,12 @@ impl LedgerService {
                 restored,
                 signature,
             } => self.lease_ready(job, attempt, stage, restored, &signature),
+            LedgerOp::RecordRestore {
+                job,
+                attempt,
+                producer,
+                signature,
+            } => self.record_restore(job, attempt, producer, &signature),
             LedgerOp::RecordReceipt {
                 job,
                 attempt,

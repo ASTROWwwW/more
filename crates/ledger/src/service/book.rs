@@ -41,6 +41,10 @@ pub struct AttemptRec {
     pub accepted: Vec<bool>,
     /// Per stage: the lender signed that its state is restored.
     pub ready: Vec<bool>,
+    /// Per stage: the positions the lender signed it restored to.
+    pub restored: Vec<[u32; 3]>,
+    /// Per stage: the stage's recipient signed that it received that restored state (JOB-R18).
+    pub corroborated: Vec<bool>,
     /// Recovery reserved in lines for this attempt, paid or not (refunds give it back).
     pub recovery_reserved: Amount,
     pub earmark_returned: bool,

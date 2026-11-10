@@ -112,8 +112,13 @@ impl T {
     /// Every lender of `attempt` reports its state restored to `restored`.
     fn ready(&mut self, j: JobId, attempt: u32, restored: PerType<u32>) {
         self.load(j, attempt);
-        for l in self.job(j).attempts[&attempt].lenders.clone() {
-            self.ok(ready_cmd(j, attempt, l, restored));
+        let lenders = self.job(j).attempts[&attempt].lenders.clone();
+        for l in &lenders {
+            self.ok(ready_cmd(j, attempt, *l, restored));
+        }
+        // A healthy cluster: each stage's recipient attests the restoration (JOB-R18).
+        for cmd in corroborate(j, attempt, &lenders) {
+            self.ok(cmd);
         }
     }
 

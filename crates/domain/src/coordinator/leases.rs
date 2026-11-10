@@ -171,6 +171,7 @@ impl Coordinator {
             signature: *signature,
         })?;
         self.advance_lease(job, attempt, stage, LeaseState::Loaded, LeaseState::Ready)?;
+        self.attempt_mut(job, attempt)?.leases[stage].restored = Some(restored);
         self.audit.push(AuditEvent::Lease {
             job,
             attempt,
@@ -199,6 +200,48 @@ impl Coordinator {
         });
         self.set_exec(job, ExecStatus::Running, "JOB-T05")?;
         self.open_slice(job, attempt)?;
+        Ok(Outcome::Applied)
+    }
+
+    /// JOB-R18: the recipient of `lender`'s output attests that it received `lender`'s restored
+    /// state. Without it, `lender`'s recovery work is never paid automatically. The statement is
+    /// about the past: it is accepted after a revocation, until the job is settled.
+    pub(super) fn corroborate_restore(
+        &mut self,
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+        signature: &[u8; 64],
+    ) -> R<Outcome> {
+        let j = self.job(job)?;
+        if j.settle == SettleStatus::Closed {
+            return Err(DomainError::Precondition("job settled"));
+        }
+        let a = j.attempts.get(&attempt).ok_or(DomainError::StaleAttempt)?;
+        let stage = a
+            .stage_of(lender)
+            .ok_or(DomainError::Precondition("lender not in attempt"))?;
+        let lease = a.leases[stage];
+        if lease.state != LeaseState::Ready {
+            return Err(DomainError::Precondition(
+                "JOB-R18: nothing restored to corroborate",
+            ));
+        }
+        if lease.corroborated {
+            return Ok(Outcome::AlreadyApplied);
+        }
+        self.ledger_proof(LedgerOp::RecordRestore {
+            job: job_acct(job),
+            attempt,
+            producer: lender.0,
+            signature: *signature,
+        })?;
+        self.attempt_mut(job, attempt)?.leases[stage].corroborated = true;
+        self.audit.push(AuditEvent::RestoreCorroborated {
+            job,
+            attempt,
+            lender,
+        });
         Ok(Outcome::Applied)
     }
 

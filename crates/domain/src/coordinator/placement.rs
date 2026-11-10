@@ -101,6 +101,8 @@ impl Coordinator {
         let lease = Lease {
             state: LeaseState::Assigned,
             expires_at: now + ttl,
+            restored: None,
+            corroborated: false,
         };
         j.attempts.insert(
             no,

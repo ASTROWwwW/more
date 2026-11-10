@@ -132,6 +132,19 @@ pub fn bring_up(
     v
 }
 
+/// JOB-R18: the recipient of each stage attests the restored state it received from it.
+pub fn corroborate(job: JobId, attempt: u32, lenders: &[AccountId]) -> Vec<Command> {
+    lenders
+        .iter()
+        .map(|l| Command::CorroborateRestore {
+            job,
+            attempt,
+            lender: *l,
+            signature: UNSIGNED,
+        })
+        .collect()
+}
+
 /// Setup commands: pools, members, catalog, issuance, job submissions.
 pub fn setup_commands() -> Vec<Command> {
     let mut v = vec![

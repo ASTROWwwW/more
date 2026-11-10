@@ -78,7 +78,13 @@ impl Stats {
                     ..
                 } => self.bump("contributions voided with their output"),
                 AuditEvent::ItemRefunded { .. } => self.bump("items refunded for missing proof"),
-                AuditEvent::ItemDisputed { .. } => self.bump("items disputed"),
+                AuditEvent::ItemDisputed { kind, .. } => {
+                    self.bump("items disputed");
+                    if matches!(kind, ItemKind::Recovery(_)) {
+                        self.bump("recovery held (cap or no corroboration)");
+                    }
+                }
+                AuditEvent::RestoreCorroborated { .. } => self.bump("restorations corroborated"),
                 AuditEvent::ItemAwaitingDelivery { .. } => {
                     self.bump("contributions awaiting delivery")
                 }

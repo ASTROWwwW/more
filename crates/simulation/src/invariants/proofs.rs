@@ -146,13 +146,52 @@ fn items(job: u32, e: &Escrow, out: &mut Vec<Violation>) {
                 }
             }
             ItemId::Recovery { .. } => {
-                if !a.ready[s] {
+                if !a.ready.iter().all(|r| *r) {
                     p30(
                         out,
-                        format!("job {job}: {id:?} for a lender that never signed ready"),
+                        format!(
+                            "job {job}: {id:?} on an attempt not every lender signed ready for"
+                        ),
+                    );
+                }
+                if it.state == ItemState::Paid && !a.corroborated[s] {
+                    p30(
+                        out,
+                        format!("job {job}: {id:?} paid without a corroborated restoration"),
                     );
                 }
             }
+        }
+    }
+}
+
+/// TEST-P32 (JOB-R18), from the coordinator's log: recovery is paid only to a lender whose
+/// restoration its recipient corroborated, by evaluation or by ruling alike.
+pub(super) fn recovery(c: &Coordinator, out: &mut Vec<Violation>) {
+    for e in c.audit_log() {
+        let AuditEvent::ItemPaid {
+            slice,
+            lender,
+            kind: ItemKind::Recovery(rid),
+            ..
+        } = e
+        else {
+            continue;
+        };
+        let corroborated = c
+            .jobs()
+            .get(&rid.job)
+            .and_then(|j| j.attempts.get(&rid.attempt))
+            .and_then(|a| {
+                let s = a.lenders.iter().position(|l| l == lender)?;
+                Some(a.ready && a.leases[s].corroborated)
+            })
+            .unwrap_or(false);
+        if !corroborated {
+            out.push(v(
+                "TEST-P32",
+                format!("{slice:?}/{lender:?}: {rid:?} paid without a corroborated restoration"),
+            ));
         }
     }
 }

@@ -58,6 +58,18 @@ impl Coordinator {
                     refund(RefundReason::EvidenceNotFound)
                 }
             }
+            (ItemKind::Recovery(rid), Evidence::Committed | Evidence::Uncommitted)
+                if attempt_ready && !self.restore_corroborated(rid, lender) =>
+            {
+                // JOB-R18: the lender's own word that it restored its state is not paid on. Its
+                // recipient may still corroborate until the deadline; after that the amount stays
+                // held and is ruled on (JOB-S06), never paid automatically.
+                if before_deadline {
+                    Decision::Defer
+                } else {
+                    Decision::Dispute
+                }
+            }
             (ItemKind::Recovery(_), Evidence::Committed) => {
                 if attempt_ready {
                     Decision::Pay
@@ -97,6 +109,15 @@ impl Coordinator {
             }
             (_, Evidence::None) => refund(RefundReason::NoEvidence),
         })
+    }
+
+    /// JOB-R18: the recipient of `lender`'s stage corroborated its restoration on that attempt.
+    pub(super) fn restore_corroborated(&self, rid: RecoveryWorkId, lender: AccountId) -> bool {
+        self.jobs
+            .get(&rid.job)
+            .and_then(|j| j.attempts.get(&rid.attempt))
+            .and_then(|a| a.stage_of(lender).map(|s| a.leases[s].corroborated))
+            .unwrap_or(false)
     }
 
     /// JOB-S04: evaluates a closed slice.

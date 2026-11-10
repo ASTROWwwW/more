@@ -122,8 +122,9 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
         2 => (b(), b(), b()).prop_map(|(job, stage, step)| Op::LeaseStep { job, stage, step }),
         2 => (b(), b()).prop_map(|(job, node)| Op::NodeHeartbeat { job, node }),
         1 => (b(), b()).prop_map(|(job, node)| Op::SilentNode { job, node }),
+        2 => (b(), b(), prop::bool::weighted(0.2)).prop_map(|(job, stage, forged)| Op::Corroborate { job, stage, forged }),
         6 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Produce { job, wt, n }),
-        8 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Ack { job, wt, n }),
+        12 => (b(), b(), b()).prop_map(|(job, wt, n)| Op::Ack { job, wt, n }),
         3 => (b(), b(), b()).prop_map(|(job, stage, wt)| Op::Commit { job, stage, wt, partial: false }),
         6 => (b(), b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, wt, pos, ev)| Op::Claim { job, slice, stage, wt, pos, ev, honest: true }),
         2 => (b(), b(), b(), b(), b()).prop_map(|(job, slice, stage, amount, ev)| Op::ClaimRecovery { job, slice, stage, amount, ev }),
@@ -145,8 +146,8 @@ fn fault_heavy_op() -> impl Strategy<Value = Op> {
         1 => (b(), b(), b()).prop_map(|(job, wt, sel)| Op::Confirm { job, wt, sel }),
         1 => (b(), b(), b(), b()).prop_map(|(job, slice, lender, pay)| Op::Arbitrate { job, slice, lender, pay: pay % 2 == 0 }),
         2 => (b(), b()).prop_map(|(job, sel)| Op::DeliverAndSettle { job, sel }),
-        6 => (b(), b()).prop_map(|(job, sel)| Op::UncommittedBurst { job, sel }),
-        8 => (b(), b()).prop_map(|(job, sel)| Op::ArbitrateDisputed { job, sel }),
+        9 => (b(), b()).prop_map(|(job, sel)| Op::UncommittedBurst { job, sel }),
+        10 => (b(), b()).prop_map(|(job, sel)| Op::ArbitrateDisputed { job, sel }),
         2 => (b(), any::<bool>()).prop_map(|(job, commit_first)| Op::LateDeliver { job, commit_first }),
         3 => (b(), b(), any::<bool>()).prop_map(|(job, sel, honest)| Op::Supplement { job, sel, honest }),
         2 => (b(), b()).prop_map(|(job, sel)| Op::ContestReplay { job, sel }),
@@ -202,18 +203,21 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
 fn generator_reaches_interesting_paths() {
     use proptest::strategy::ValueTree;
 
+    // 180 operations per trace (150 before per-node leases): starting a cluster now takes three
+    // steps per lender and a corroboration per stage. The thresholds below did not move.
+    const TRACE: usize = 180;
     let mut total = Stats::default();
     for (gen_name, n) in [("faults", 300usize), ("delivery", 300)] {
         let mut runner = TestRunner::deterministic();
         let mut st = Stats::default();
         for _ in 0..n {
             let ops = if gen_name == "faults" {
-                prop::collection::vec(fault_heavy_op(), 150)
+                prop::collection::vec(fault_heavy_op(), TRACE)
                     .new_tree(&mut runner)
                     .unwrap()
                     .current()
             } else {
-                prop::collection::vec(delivery_adversary_op(), 150)
+                prop::collection::vec(delivery_adversary_op(), TRACE)
                     .new_tree(&mut runner)
                     .unwrap()
                     .current()
@@ -253,6 +257,8 @@ fn generator_reaches_interesting_paths() {
         ("rewards released", 100),
         ("attempts revoked with an expired lease", 50),
         ("attempts revoked for one silent node", 10),
+        ("restorations corroborated", 500),
+        ("recovery held (cap or no corroboration)", 5),
     ];
     let missing: Vec<String> = minimum
         .iter()

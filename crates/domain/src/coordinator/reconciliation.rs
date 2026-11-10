@@ -120,6 +120,14 @@ impl Coordinator {
                     Err(DomainError::Internal(m)) => {
                         return Err(DomainError::Internal(format!("reconcile {cmd:?}: {m}")))
                     }
+                    // A due transition the ledger refuses or cannot write is never skipped in
+                    // silence either: the job would look settled-in-progress forever while credits
+                    // sit in its accounts.
+                    Err(DomainError::Ledger(e)) => {
+                        return Err(DomainError::Internal(format!(
+                            "reconcile {cmd:?}: ledger {e:?}"
+                        )))
+                    }
                     // A due transition the reconciler may not run is a permission matrix bug: it
                     // would stay due forever.
                     Err(DomainError::Unauthorized(m)) => {

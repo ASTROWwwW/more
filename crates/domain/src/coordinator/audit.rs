@@ -30,6 +30,12 @@ pub enum AuditEvent {
         lender: AccountId,
         state: LeaseState,
     },
+    /// The recipient of `lender`'s output attested its restored state (JOB-R18).
+    RestoreCorroborated {
+        job: JobId,
+        attempt: u32,
+        lender: AccountId,
+    },
     /// Nodes whose own lease had expired when the attempt was revoked (JOB-R39).
     LeasesExpired {
         job: JobId,

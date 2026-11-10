@@ -642,3 +642,86 @@ fn ce07_only_the_reconciler_reconciles() {
     assert!(sim.exec_as(&ctx, Command::Reconcile).is_ok());
     assert_clean(&sim);
 }
+
+/// CE-08, found by `r2_a_fault_during_a_partial_settlement_then_restart_and_reconciliation`.
+/// When the ledger refused or failed a payment inside a due evaluation, reconciliation dropped
+/// the error and reported success: the slice stayed closed with its reserve in place and nobody
+/// was told. Fix (JOB-R20): a ledger failure inside reconciliation is reported like an internal
+/// error, and the whole reconciliation is rolled back.
+#[test]
+fn ce08_reconciliation_reports_a_ledger_failure() {
+    let mut sim = Sim::default();
+    let j = JobId(1);
+    let gen = WorkType::Generate;
+    let (l0, l1) = (AccountId(10), AccountId(11));
+    sim.exec(Command::Reserve { job: j }).unwrap();
+    sim.exec(Command::Place {
+        job: j,
+        lenders: vec![l0, l1, AccountId(12)],
+        layout: layout_of(j),
+        recovery_estimate: 0,
+        witness: WITNESS,
+        expected_version: None,
+    })
+    .unwrap();
+    sim.start_cluster(j, 1, [0; 3]).unwrap();
+    let slice = SliceId {
+        job: j,
+        attempt: 1,
+        slice: 1,
+    };
+    for cmd in [
+        Command::Produce {
+            job: j,
+            attempt: 1,
+            wt: gen,
+            upto: 1,
+        },
+        Command::Ack {
+            job: j,
+            attempt: 1,
+            wt: gen,
+            upto: 1,
+        },
+        Command::CommitReceipts {
+            job: j,
+            attempt: 1,
+            lender: l0,
+            wt: gen,
+            upto: 1,
+            digest: sim.coord.receipt_digest(j, 1, l0, gen, 1),
+            signature: UNSIGNED,
+        },
+        Command::Claim {
+            slice,
+            lender: l0,
+            items: vec![ClaimItem::Contribution {
+                output: OutputId {
+                    job: j,
+                    wt: gen,
+                    pos: 0,
+                },
+                stage: 0,
+                evidence: Evidence::Committed,
+            }],
+        },
+        Command::CloseSlice { slice },
+        Command::Tick { dt: 600 },
+    ] {
+        step(&mut sim, &cmd);
+    }
+    assert_clean(&sim);
+    // The journal refuses its next entry: the payment of the due evaluation.
+    sim.coord.inject_ledger_fault(Some(0));
+    let reconciler = sim.as_service(ServiceRole::Reconciler);
+    let before = sim.coord.clone();
+    let r = sim.coord.execute(&reconciler, &Command::Reconcile);
+    assert!(matches!(r, Err(DomainError::Internal(_))), "{r:?}");
+    assert!(sim.coord == before, "a failed reconciliation left a trace");
+    // Once the ledger answers again, the same reconciliation completes.
+    sim.coord.inject_ledger_fault(None);
+    sim.exec(Command::Reconcile).unwrap();
+    assert_eq!(sim.coord.slices()[&slice].lines[&l0].paid, 6);
+    sim.drain();
+    assert_clean(&sim);
+}

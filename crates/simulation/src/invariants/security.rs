@@ -129,6 +129,12 @@ pub(super) fn allowed(c: &Coordinator, ctx: &AuthContext, cmd: &Command) -> bool
             attempt,
             lender,
             ..
+        }
+        | CorroborateRestore {
+            job: id,
+            attempt,
+            lender,
+            ..
         } => match att(id, *attempt) {
             None => true,
             Some(a) => match a.lenders.iter().position(|l| l == lender) {
