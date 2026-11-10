@@ -21,7 +21,8 @@ use common::hostile::*;
 use common::*;
 use gpu_domain::{Command as Cmd, DomainError, Outcome};
 use gpu_ledger::link::{
-    Fault, LinkError, Message, Refusal, Rollback, StreamTransport, Transport, TxState, MAX_FRAME,
+    Fault, LinkError, Message, Refusal, Request, Rollback, StreamTransport, Transport, TxState,
+    MAX_FRAME,
 };
 use gpu_ledger::*;
 use gpu_simulation::{op_strategy, Cut, Faults, Flaky, RemoteRig, Sim, SimIdentity};
@@ -296,6 +297,53 @@ fn p35_the_daemon_is_the_same_ledger() {
     let compared = compared.into_inner();
     println!(
         "TEST-P35 against the process: {} daemons started, {compared} hostile calls compared",
+        cases(16)
+    );
+}
+
+/// TEST-P36 against the real process: groups of hostile calls inside transactions of the
+/// daemon, committed or aborted, against a plain copy-and-restore of the ledger in this
+/// process. After every group the daemon's auditor sees the same balances and journal.
+#[test]
+fn p36_transactions_in_the_daemon_match_copy_and_restore() {
+    let ended = AtomicU64::new(0);
+    let group = (prop::collection::vec(calls(), 1..8), any::<bool>());
+    let result = runner().run(&prop::collection::vec(group, 1..24), |groups| {
+        let (mut w, _daemon) = process_world();
+        w.open(JOB, 500).unwrap();
+        for (n, (group, commit)) in groups.iter().enumerate() {
+            let copy = w.ledger.clone();
+            let m = w.mirror.as_mut().unwrap();
+            m.orch.tx(Request::Begin {
+                id: tx(n as u64 + 1),
+            });
+            m.in_tx = true;
+            // Only the orchestrator's own calls belong in its transaction: the clock waits.
+            for c in group.iter().filter(|c| !matches!(c, Call::Tick(_))) {
+                let _ = apply(&mut w, c);
+            }
+            let m = w.mirror.as_mut().unwrap();
+            m.orch.tx(if *commit {
+                Request::Commit
+            } else {
+                Request::Abort
+            });
+            m.in_tx = false;
+            if !*commit {
+                w.ledger = copy;
+            }
+            w.same_as_mirror(commit);
+            check(&w, &Call::Settle(255))?;
+        }
+        ended.fetch_add(groups.len() as u64, Ordering::Relaxed);
+        Ok(())
+    });
+    if let Err(e) = result {
+        panic!("against the daemon: {e}");
+    }
+    let ended = ended.into_inner();
+    println!(
+        "TEST-P36 against the process: {} daemons started, {ended} transactions committed or aborted and compared",
         cases(16)
     );
 }
@@ -1252,6 +1300,35 @@ fn helper_run_as_the_orchestrators_user() {
         .current();
     let mut w = world_at(&ledger_dir.join("a.sock"));
     w.open(JOB, 500).unwrap();
+    // TEST-P36 first, on the same daemon: transactions committed or aborted.
+    let group = (prop::collection::vec(hostile::calls(), 1..8), any::<bool>());
+    let groups = prop::collection::vec(group, 1_000)
+        .new_tree(&mut runner)
+        .unwrap()
+        .current();
+    for (n, (group, commit)) in groups.iter().enumerate() {
+        let copy = w.ledger.clone();
+        let m = w.mirror.as_mut().unwrap();
+        m.orch.tx(Request::Begin {
+            id: tx(n as u64 + 1),
+        });
+        m.in_tx = true;
+        for c in group.iter().filter(|c| !matches!(c, Call::Tick(_))) {
+            let _ = apply(&mut w, c);
+        }
+        let m = w.mirror.as_mut().unwrap();
+        m.orch.tx(if *commit {
+            Request::Commit
+        } else {
+            Request::Abort
+        });
+        m.in_tx = false;
+        if !*commit {
+            w.ledger = copy;
+        }
+        w.same_as_mirror(commit);
+        check(&w, &Call::Settle(255)).unwrap();
+    }
     for c in &calls {
         let _ = apply(&mut w, c);
         check(&w, c).unwrap();
@@ -1276,8 +1353,9 @@ fn helper_run_as_the_orchestrators_user() {
     let followed = sim.shadow.as_ref().map_or(0, |s| s.followed);
     println!(
         "two users: ledger under user {LEDGER_USER}, this process under user {}: \
-         {} hostile calls compared, {followed} commands followed",
+         {} transactions and {} hostile calls compared, {followed} commands followed",
         me(),
+        groups.len(),
         calls.len()
     );
 }

@@ -323,19 +323,33 @@ impl World {
         };
         let remote = wire.exec(op.clone());
         assert_eq!(local, remote, "answers differ for {op:?}");
+        self.same_as_mirror(&op);
+        local
+    }
+
+    /// The ledger behind the link holds what the local one holds: its whole state when it is in
+    /// this process, and in any case balances, journal, position and clock as its auditor sees
+    /// them. Inside a transaction the auditor would be told to wait, and is not asked.
+    pub fn same_as_mirror(&mut self, after: &dyn std::fmt::Debug) {
+        let Some(m) = self.mirror.as_mut() else {
+            return;
+        };
         if let Some(host) = &m.host {
             let host = host.lock().unwrap();
-            assert!(*host.service() == self.ledger, "states differ after {op:?}");
+            assert!(
+                *host.service() == self.ledger,
+                "states differ after {after:?}"
+            );
         }
         if m.in_tx {
-            return local;
+            return;
         }
         let view = self.ledger.audit_view(&self.auditor).unwrap();
         let balances: Vec<(Account, i128)> = view.accounts().map(|(a, b)| (*a, *b)).collect();
         assert_eq!(
             balances,
             m.auditor.balances(),
-            "balances differ after {op:?}"
+            "balances differ after {after:?}"
         );
         let s = m.auditor.summary();
         let head = view.entries().last().map_or(0, |e| e.hash);
@@ -347,9 +361,8 @@ impl World {
                 self.ledger.seq(),
                 self.ledger.now()
             ),
-            "journals differ after {op:?}"
+            "journals differ after {after:?}"
         );
-        local
     }
 
     /// As the orchestrator.

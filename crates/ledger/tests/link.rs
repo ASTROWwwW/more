@@ -1481,7 +1481,7 @@ proptest! {
                 let _ = apply(&mut w, c);
             }
             let end = if *commit { Request::Commit } else { Request::Abort };
-                        let m = w.mirror.as_mut().unwrap();
+            let m = w.mirror.as_mut().unwrap();
             m.orch.tx(end);
             m.in_tx = false;
             if !*commit {
