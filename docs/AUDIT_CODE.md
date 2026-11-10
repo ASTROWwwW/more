@@ -333,5 +333,6 @@ What it costs: an honest lender whose recipient disappears before corroborating 
 - `r2_contests_follow_a_bounded_cycle` asserted that a later payment "restarts the hold for the line". That assertion described the defect of R3-01. It now asserts that the first payment is released on its own date and the second one on its own.
 - `r2_a_late_corroboration_lets_a_ruling_pay` waited for the evaluation deadline without heartbeats, then corroborated on expired leases. It now keeps the cluster alive while it waits. What it shows is unchanged: a corroboration recorded after the item was held lets a ruling pay it.
 - TEST-P30: the hostile generator gained `Revoke` (weight 1, mostly on an older attempt) and corroborations that name subsets of segments.
+- `r2_settlement_waits_for_every_item_and_is_final` asserted that late operations were refused; it now asserts they are refused with `EscrowSettled`. `r2_charges_and_voids_follow_the_ledgers_records` now charges a second output before trying to void one with a live share, and asserts the reason of the refusal. Both changes come from the mutation campaign, which let M65 and M76 through on `6351a3f` (`docs/VALIDATION.md`, "What the campaign found"). TEST-P30 gained one check: a share that holds or took money keeps its output charged.
 - No regression test was removed. CE-09 was added.
 
