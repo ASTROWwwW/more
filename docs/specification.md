@@ -379,7 +379,7 @@ An output has its own life, independent of the attempt that produced it:
 
 ## 3. Global rules
 
-- **JOB-R01 — Single transaction**: a transition MUST run in a single transaction containing the state change, the accounting entries and the insertion of events into the outbox. Either everything is written, or nothing. *(isolation)* When the ledger runs in its own process, the accounting entries of a transition are a transaction there, committed or rolled back with the coordinator's own state (LEDGER-023).
+- **JOB-R01 — Single transaction**: a transition MUST run in a single transaction containing the state change, the accounting entries and the insertion of events into the outbox. Either everything is written, or nothing. *(isolation)* When the ledger runs in its own process, the accounting entries of a transition are a transaction there, committed or rolled back with the coordinator's own state (LEDGER-023). If the answer to the commit does not come, the coordinator stops until it has asked the ledger what became of it (LEDGER-025).
 - **JOB-R02 — Outbox**: outgoing messages MUST be sent only after commit, from the outbox. Recipients MUST tolerate duplicates.
 - **JOB-R03 — Optimistic lock**: every job, slice and line carries a `version`; a transition MUST be conditioned on the version read.
 - **JOB-R04 — Idempotency**: every external command and every accounting entry MUST carry an idempotency key. A command already applied changes nothing, not even the sequence number.
@@ -674,7 +674,7 @@ Checked after **every** command on random sequences of commands, failures, dupli
 | TEST-P32 *(second amendment)* | Recovery is paid, by evaluation or by ruling, only on a started attempt, only to a lender whose restoration its recipient corroborated, only for a segment that corroboration names and only if it was recorded before the revocation *(third review)*; checked on the coordinator's log and on the ledger's records | JOB-R18 |
 | TEST-P34 *(third review)* | Judged on the state before the command: a corroboration is taken on record only by `RestoreCorroboration`, on an attempt that is not revoked, while the producer's and the recipient's leases are in force, with no right of either withdrawn since the placement, and for segments the producer committed to | JOB-R18, LEDGER-020 |
 | TEST-P35 *(isolation)* | The hostile orchestrator of TEST-P30, every call also sent over the link to a second ledger (in process, and to the real daemon): same answer, same balances, same journal, same state after every call | LEDGER-021, LEDGER-022, LEDGER-024 |
-| TEST-P36 *(isolation)* | Groups of hostile calls inside transactions, committed or aborted, against a plain copy-and-restore of the ledger: the two are equal after every group | LEDGER-023 |
+| TEST-P36 *(isolation)* | Groups of hostile calls inside transactions, committed or aborted, against a plain copy-and-restore of the ledger (in process, and in the real daemon): the two are equal after every group | LEDGER-023 |
 | TEST-P37 *(isolation)* | Every command of the simulation is also sent to a coordinator whose ledger is behind the link and which holds the orchestrator's key only. Same answers, same jobs, slices, registry, delivery book, audit log and log positions; same balances and journal in both ledgers | LEDGER-022, LEDGER-023, JOB-R01 |
 | TEST-P31 *(second amendment)* | A lease changes only on its own node's command, one state forward at a time; a renewal moves the sender's expiry only; a job enters `running` only with every lease ready | JOB-R38, JOB-R39 |
 
