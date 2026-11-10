@@ -431,7 +431,9 @@ fn a_killed_orchestrator_leaves_nothing_half_done() {
 /// Whatever arrives on the socket, the daemon keeps serving the others.
 #[test]
 fn garbage_on_the_socket_does_not_stop_the_daemon() {
-    let (w, daemon) = process_world();
+    // With a long time to authenticate: a connection closed here is closed for what it sent,
+    // not because that time ran out.
+    let (w, daemon) = process_world_with(&["--handshake-timeout-ms", "60000"]);
     let verifier = w.auth.verifier();
     let raw = || {
         let s = UnixStream::connect(&daemon.socket).unwrap();
