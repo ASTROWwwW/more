@@ -101,15 +101,16 @@ The Ledger exposes no generic transfer. Each operation has fixed source and dest
 | `RegisterAttempt` | Orchestrator | — | Layout covers the signed model; lenders distinct; witness neither a lender nor the owner; earmark within the recovery budget not yet promised; attempts in increasing order |
 | `AcceptLease` | Orchestrator | Lender of the stage | Signature over the registered assignment |
 | `LeaseReady` | Orchestrator | Lender of the stage | Signature over (job, attempt, lender, restored positions); lease accepted first |
-| `RecordRestore` | Orchestrator | Recipient of the producer | Signature over the positions the producer signed it restored to; lease ready first |
-| `RecordReceipt` | Orchestrator | Recipient of the producer (next stage, or witness) | Signature by the account the assignment names |
+| `Advance` | Clock | — | Time never goes back. The orchestrator cannot move it |
+| `RecordRestore` | Orchestrator | Recipient of the producer | Signature over the job, attempt, producer, layer range, positions, segments received and the commitment the producer signed; lease ready first; written once |
+| `RecordReceipt` | Orchestrator | Recipient of the producer (next stage, or witness) | Signature by the account the assignment names; the same coverage with another digest is refused |
 | `ChargeOutput`, `VoidOutput` | Orchestrator | — | Price from the signed terms; position within the signed maximum; one charge in force per output, billing generations in order; no void while a share is reserved or paid |
 | `ReserveContribution` | Orchestrator | — | The lender signed that stage of that attempt; the output is charged to that attempt at that generation; once per output, charge and stage; share computed by the Ledger |
 | `ReserveRecovery` | Orchestrator | — | Every lender of the attempt signed ready; within the attempt's earmark |
-| `PayLine` | Orchestrator | — | Item reserved on that line; for a contribution, charge still in force and a receipt from the recipient covering the output; for recovery, the restoration corroborated by the lender's recipient; split borrower first, then pool, computed by the Ledger |
+| `PayLine` | Orchestrator | — | Item reserved on that line; for a contribution, charge still in force and a receipt from the recipient covering the output; for recovery, the restoration corroborated by the lender's recipient for that segment; split borrower first, then pool, computed by the Ledger. Starts the item's contest window |
 | `RefundLine` | Orchestrator | — | Back to where the Ledger recorded the reserve came from; no destination in the request |
-| `ReleaseReward` | Orchestrator | — | Held reward → its own lender + commission; commission rate set by the Ledger |
-| `ContestReward` | Orchestrator | — | Held reward → the job's owner and pool; the pool's share is what the Ledger recorded |
+| `ReleaseReward` | Orchestrator | — | Held reward → its own lender + commission; commission rate set by the Ledger; not before 48 h after the line's latest payment, by the Ledger's clock |
+| `ContestReward` | Orchestrator | — | Held reward → the job's owner and pool; the pool's share is what the Ledger recorded; not later than 7 days after the line's oldest payment |
 | `ReturnEarmark` | Orchestrator | — | No undecided recovery item on the attempt; closes its recovery budget |
 | `SettleJob` | Orchestrator | — | No undecided item; pool share computed by the Ledger; afterwards nothing is written to the job's escrow, hold or lines |
 | Read balances | Orchestrator (job accounts), Auditor (everything) | — | — |
@@ -172,6 +173,7 @@ What each boundary is made of today. "In-process" means it holds against bugs an
 | Borrower consent to spending and to the job's terms | Ed25519 mandate verified by the Ledger | Enforced now |
 | Lender, recipient and pool admin consent | Ed25519 statements verified by the Ledger (lease, readiness, receipt, relay) | Enforced now |
 | Provenance of reserves, closure with no open item | Ledger records and checks, independent of the coordinator's | Enforced now (tests, TEST-P30 under a hostile orchestrator) |
+| Final proofs, bounded contest cycle | Write-once records in the Ledger; its own clock, moved by the Clock credential only | Enforced now (TEST-P33, TEST-P30) |
 | One lease per node | Per-stage state and expiry, authorized per sender | Enforced now (TEST-P24, TEST-P31) |
 | Per-resource authorization of commands | `authorize` runs before any mutation; TEST-P29 checks every accepted command against an independent restatement of the matrix, on traces where any principal sends any command | Enforced now |
 | Delivery and registry data owned by their module | Private fields in `DeliveryBook` and `Registry`, sibling modules of the coordinator; the delivery module never sees the ledger | Enforced now (compiler) |

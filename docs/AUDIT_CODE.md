@@ -246,6 +246,16 @@ The test "a fault in the middle of a settlement, then a restart and a reconcilia
 - "Tests exercise the intended paths, not a hostile orchestrator" (review, section on tests): exact for the Ledger. Part 1 had two compromise tests that tried single forbidden calls; none chained allowed calls. TEST-P30 does, and found R2-07 and R2-09 on its first deep runs.
 - The 101 tests and 64 mutants of part 1 were not contradicted by this review, and did not cover these sequences.
 
+## Three verifications asked before validating
+
+| Asked | What the code does | Tests |
+| --- | --- | --- |
+| The corroboration is bound to what was really restored and cannot serve another recovery | The lender's readiness signs a commitment to its restored state. The recipient signs `Restoration { job, attempt, producer, layers, restored, segments, state }`. The Ledger rebuilds that statement from its own records (assignment, lender's readiness) and the announced number of segments, so a signature over anything else does not verify. A recovery item is paid only if its segment is below the corroborated count. One corroboration per stage and attempt, written once | `r2_a_corroboration_is_bound_to_what_was_restored` (Ledger API: seven altered fields refused, uncovered segment refused, other lender and next attempt refused, replay refused), `r2_a_corroboration_covers_what_was_restored_and_nothing_else` (coordinator), mutations M94, M95, M101 to M103, M105 |
+| The Ledger knows when a proof is final; contests follow an explicit, bounded cycle | LEDGER-018. Lease, readiness and corroboration are written once; a receipt for the same coverage with another digest is refused before and after payment; a paid item is never refunded nor its output voided. A held reward is `held → released` (not before 48 h after the last payment) or `held → contested` (not after 7 days from the oldest), on a clock only the Clock service moves; both ends are final. The coordinator had no upper bound on a contest while a slice stayed unfinalized: it now applies the Ledger's limit | `r2_a_recorded_proof_cannot_be_replaced`, `r2_contests_follow_a_bounded_cycle` (Ledger API), `r2_a_payment_is_contestable_for_a_bounded_time_then_final` (coordinator), TEST-P33 on every command of the simulation, the same checks in TEST-P30, mutations M96 to M100, M104 |
+| CE-08 with several financial operations | `two_jobs_due` builds one reconciliation that pays recovery from the borrower's budget and the pool's relay, releases five rewards and settles two jobs, one returning credits to the pool. The journal is made to fail at each of its entries in turn. Every time: `INTERNAL` reported, state, journal and every balance identical to before, both jobs still `finalizing`; after a restart the reconciliation completes and the state equals the fault-free run | `r2_a_fault_at_any_entry_of_a_multi_job_reconciliation_leaves_nothing_half_done`, mutation M87 |
+
+What the first row does not give: the commitment is a value two accounts agree on. The Ledger checks that the recipient signed the same commitment as the lender, not that the state behind it is the right one; in the model it is symbolic, like the frame digests (SEC-006).
+
 ## Tests asked before the merge
 
 | Asked | Test | What it shows |
