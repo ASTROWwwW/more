@@ -7,7 +7,9 @@
 //! fields.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use gpu_ledger::link::{LedgerInfo, RemoteLedger};
 use gpu_ledger::{
     Account, Amount, Assignment, EscrowBucket, IssueTo, ItemId, JobTerms, Ledger, LedgerApiError,
     LedgerError, LedgerOp, LedgerOutcome, LedgerService, LineRef, OutputRef,
@@ -22,6 +24,7 @@ use crate::error::DomainError;
 use crate::ids::*;
 use crate::model::*;
 use crate::registry::{PoolMode, Registry};
+use link::LedgerLink;
 
 mod audit;
 mod claims;
@@ -31,6 +34,7 @@ mod dispatch;
 mod evaluation;
 mod leases;
 mod lifecycle;
+mod link;
 mod placement;
 mod receipts;
 mod reconciliation;
@@ -42,9 +46,9 @@ pub use audit::AuditEvent;
 pub struct Coordinator {
     cfg: Config,
     now: Time,
-    /// Ledger service. Private: reached only through typed operations, with the orchestrator's
-    /// own credential (`ledger_op`).
-    ledger: LedgerService,
+    /// The ledger, in this process or in its own. Private: reached only through typed
+    /// operations, with the orchestrator's own credential (`ledger_op`).
+    ledger: LedgerLink,
     /// The orchestrator's credential towards the ledger (role `Orchestrator`).
     cred: ServiceCredential,
     /// Checks the credentials of calling services (tag and revocation), like the ledger does.
@@ -120,6 +124,32 @@ impl Coordinator {
         cred: ServiceCredential,
         verifier: CredentialVerifier,
     ) -> R<Self> {
+        Self::start(cfg, LedgerLink::Local(ledger), cred, verifier)
+    }
+
+    /// A coordinator whose ledger runs in another process. `port` is the orchestrator's own
+    /// authenticated connection to it and `info` what the ledger answered to `Info` on that
+    /// connection. The same checks apply as for a ledger in this process.
+    ///
+    /// The coordinator then sends the ledger its own operations only. Issuance, the ledger's
+    /// clock and the registration of pool admins belong to other services, which hold their own
+    /// keys and talk to the ledger themselves.
+    pub fn with_remote_ledger(
+        cfg: Config,
+        port: Arc<Mutex<dyn RemoteLedger>>,
+        info: LedgerInfo,
+        cred: ServiceCredential,
+        verifier: CredentialVerifier,
+    ) -> R<Self> {
+        Self::start(cfg, LedgerLink::Remote(port, info), cred, verifier)
+    }
+
+    fn start(
+        cfg: Config,
+        ledger: LedgerLink,
+        cred: ServiceCredential,
+        verifier: CredentialVerifier,
+    ) -> R<Self> {
         cfg.validate().map_err(DomainError::InvalidInput)?;
         if verifier.verify(&cred) != Ok(ServiceRole::Orchestrator) {
             return Err(DomainError::InvalidInput(
@@ -173,13 +203,32 @@ impl Coordinator {
                 .map_err(|_| DomainError::Unauthorized("invalid or revoked service credential"))?;
         }
         authorize(self, ctx, cmd)?;
+        // With the ledger in another process, its part of the transition is a transaction there:
+        // committed with the coordinator's copy, or rolled back with it.
+        self.ledger.begin()?;
         let mut next = self.clone();
-        let out = next.step(ctx, cmd)?;
-        // An already applied command changes nothing, not even the sequence (JOB-R04).
-        if out == Outcome::Applied {
-            *self = next;
+        match next.step(ctx, cmd) {
+            Ok(Outcome::Applied) => {
+                // If the commit fails nothing is kept here either. Whether the ledger applied
+                // it is then unknown: the coordinator must be reconciled before it goes on.
+                next.ledger.commit()?;
+                *self = next;
+                Ok(Outcome::Applied)
+            }
+            // An already applied command changes nothing, not even the sequence (JOB-R04).
+            Ok(out) => {
+                self.ledger.abort()?;
+                Ok(out)
+            }
+            Err(e) => {
+                // The command's own error is the one to report. If the abort does not get
+                // through, the ledger rolls back when the connection ends or times out.
+                if self.ledger.abort().is_err() {
+                    return Err(e);
+                }
+                Err(e)
+            }
         }
-        Ok(out)
     }
 
     pub fn config(&self) -> &Config {
@@ -243,18 +292,26 @@ impl Coordinator {
 
     /// Full read access to the ledger, for the Auditor role only.
     pub fn audit_ledger(&self, auditor: &ServiceCredential) -> R<&Ledger> {
-        Ok(self.ledger.audit_view(auditor)?)
+        match self.ledger.local() {
+            Some(ledger) => Ok(ledger.audit_view(auditor)?),
+            None => Err(DomainError::Precondition(
+                "the ledger runs in its own process: audit it there",
+            )),
+        }
     }
 
-    /// The ledger service itself, read-only, for audits of escrows and denials.
-    pub fn ledger_service(&self) -> &LedgerService {
-        &self.ledger
+    /// The ledger service itself, read-only, for audits of escrows and denials. `None` when the
+    /// ledger runs in its own process: it is then audited there, by the auditor's own connection.
+    pub fn ledger_service(&self) -> Option<&LedgerService> {
+        self.ledger.local()
     }
 
     /// Test only: the ledger's journal fails after `after` more entries (`None` clears it).
     #[cfg(feature = "fault-injection")]
     pub fn inject_ledger_fault(&mut self, after: Option<u64>) {
-        self.ledger.inject_fault(after);
+        if let Some(ledger) = self.ledger.local_mut() {
+            ledger.inject_fault(after);
+        }
     }
 
     fn ledger_op(&mut self, op: LedgerOp) -> R<LedgerOutcome> {

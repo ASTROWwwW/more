@@ -294,6 +294,8 @@ impl<T: Transport> LedgerClient<T> {
 /// and a transaction around each command so that a command is applied entirely or not at all.
 pub trait RemoteLedger: Send {
     fn execute(&mut self, op: LedgerOp) -> Result<LedgerOutcome, LedgerApiError>;
+    /// Balance of one of the orchestrator's job accounts.
+    fn balance(&mut self, account: Account) -> Result<Amount, LedgerApiError>;
     fn begin(&mut self) -> Result<(), LedgerApiError>;
     fn commit(&mut self) -> Result<(), LedgerApiError>;
     fn abort(&mut self) -> Result<(), LedgerApiError>;
@@ -315,6 +317,9 @@ fn unavailable<V>(r: Result<Result<V, LedgerApiError>, LinkError>) -> Result<V, 
 impl<T: Transport + Send> RemoteLedger for LedgerClient<T> {
     fn execute(&mut self, op: LedgerOp) -> Result<LedgerOutcome, LedgerApiError> {
         unavailable(LedgerClient::execute(self, op))
+    }
+    fn balance(&mut self, account: Account) -> Result<Amount, LedgerApiError> {
+        unavailable(LedgerClient::balance(self, account))
     }
     fn begin(&mut self) -> Result<(), LedgerApiError> {
         unavailable(LedgerClient::begin(self))

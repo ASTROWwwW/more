@@ -196,7 +196,12 @@ fn r2_a_payment_is_contestable_for_a_bounded_time_then_final() {
     assert_eq!(sim.try_on_copy(&contest), Ok(Outcome::Applied));
     // Nobody reconciles for more than the ledger's limit: the slice is still not final, and the
     // payment can no longer be contested.
-    let limit = sim.coord.ledger_service().limits().contest_limit;
+    let limit = sim
+        .coord
+        .ledger_service()
+        .expect("ledger in this process")
+        .limits()
+        .contest_limit;
     sim.exec(Command::Tick { dt: limit }).unwrap();
     assert_eq!(
         sim.exec(contest.clone()),

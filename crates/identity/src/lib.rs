@@ -427,7 +427,7 @@ impl KeyDirectory {
         Ok(())
     }
 
-        /// Same, for a key received as bytes. Bytes that are not a public key are refused.
+    /// Same, for a key received as bytes. Bytes that are not a public key are refused.
     pub fn register_bytes(&self, account: AccountNo, key: &[u8; 32]) -> Result<(), AuthError> {
         let key = VerifyingKey::from_bytes(key).map_err(|_| AuthError::InvalidCredential)?;
         self.register(account, key)
@@ -511,7 +511,7 @@ impl VerifiedAccount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
     Account(AccountNo),
-    Service(ServiceCredential),
+        Service(Box<ServiceCredential>),
 }
 
 /// Verified caller identity handed to the domains. Built only from a [`VerifiedAccount`] or a
@@ -530,7 +530,7 @@ impl AuthContext {
 
     pub fn service(cred: ServiceCredential) -> Self {
         AuthContext {
-            principal: Principal::Service(cred),
+            principal: Principal::Service(Box::new(cred)),
         }
     }
 

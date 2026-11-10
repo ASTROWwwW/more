@@ -1146,7 +1146,7 @@ proptest! {
         );
         prop_assert_eq!(old.entries(), new.entries());
         prop_assert_eq!((before.seq(), before.now()), (after.seq(), after.now()));
-        prop_assert!(w.keys.contains(99) == false);
+        prop_assert!(!w.keys.contains(99));
     }
 }
 

@@ -533,6 +533,7 @@ fn ledger_attempt(sim: &Sim) -> gpu_ledger::AttemptRec {
     let escrows = sim
         .coord
         .ledger_service()
+        .expect("ledger in this process")
         .audit_escrows(&sim.ids.auditor)
         .unwrap();
     escrows[&J1.0].attempts[&2].clone()
@@ -581,7 +582,7 @@ fn r3_a_corroboration_after_the_lender_is_revoked_proves_nothing() {
     .unwrap();
     let vouch = corroborate(J1, 2, &L[..1]).remove(0);
     let denied = |sim: &Sim| {
-        let ledger = sim.coord.ledger_service();
+        let ledger = sim.coord.ledger_service().expect("ledger in this process");
         ledger.audit_denials(&sim.ids.auditor).unwrap().1
     };
     let asked = denied(&sim);
