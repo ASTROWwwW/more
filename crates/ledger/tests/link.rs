@@ -377,6 +377,32 @@ fn the_decoder_never_trusts_a_length() {
     }
     let huge = vec![0x04; MAX_FRAME + 1];
     assert_eq!(Message::decode(&huge), Err(Malformed));
+    // A list of balances that claims four billion entries and holds none.
+    let none = Message::Response {
+        seq: 1,
+        body: Response::Balances(Vec::new()),
+    };
+    let mut bytes = none.encode();
+    let at = bytes.len() - 4;
+    bytes[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(Message::decode(&bytes), Err(Malformed));
+    // A key one byte longer than the limit, written by a sender that does not cut it.
+    let fits = LedgerOp::Issue {
+        key: "k".repeat(160),
+        to: IssueTo::User(ALICE),
+        amount: 1,
+    };
+    let fits = Message::Request {
+        seq: 1,
+        body: Request::Execute(fits),
+    };
+    let mut bytes = fits.encode();
+    assert!(Message::decode(&bytes).is_ok());
+    let at = 1 + 8 + 1 + 1;
+    assert_eq!(bytes[at..at + 4], 160u32.to_le_bytes());
+    bytes[at..at + 4].copy_from_slice(&161u32.to_le_bytes());
+    bytes.insert(at + 4, b'k');
+    assert_eq!(Message::decode(&bytes), Err(Malformed));
     // An idempotency key longer than the limit is cut by the sender and refused by the reader.
     let long = LedgerOp::Issue {
         key: "k".repeat(500),
@@ -937,9 +963,12 @@ fn a_transaction_is_all_or_nothing_and_bounded() {
     assert!(auditor.audit_balances().unwrap().is_ok());
     // A connection that goes away takes its uncommitted work with it.
     let kept = state(&w);
+    // Nested or not, everything back to its first `Begin`.
     let mut gone = connect(&w, &env, &w.orch).unwrap();
     gone.begin().unwrap().unwrap();
     gone.execute(reserve(3)).unwrap().unwrap();
+    gone.begin().unwrap().unwrap();
+    gone.execute(reserve(8)).unwrap().unwrap();
     drop(gone);
     assert!(state(&w) == kept);
     // So does one that sends garbage in the middle.

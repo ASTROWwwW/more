@@ -81,6 +81,7 @@ impl LedgerLink {
         }
     }
 
+    #[cfg(feature = "fault-injection")]
     pub(super) fn local_mut(&mut self) -> Option<&mut LedgerService> {
         match self {
             LedgerLink::Local(s) => Some(s),
