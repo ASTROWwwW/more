@@ -74,7 +74,12 @@ impl Sim {
             ServiceRole::Scheduler => &ids.scheduler,
             ServiceRole::Reconciler => &ids.reconciler,
             ServiceRole::Auditor => &ids.auditor,
-            ServiceRole::Delivery | ServiceRole::Orchestrator => &ids.delivery,
+            // Roles with no command of their own in the coordinator: a valid credential that
+            // grants nothing there.
+            ServiceRole::Delivery
+            | ServiceRole::Orchestrator
+            | ServiceRole::Ledger
+            | ServiceRole::Identity => &ids.delivery,
         };
         AuthContext::service(cred.clone())
     }
