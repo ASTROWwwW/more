@@ -22,7 +22,7 @@ Severity scale: **critical** (credits or another user's job at the mercy of any 
 | A-02 | A refused reconciliation still checked by the post-reconciliation properties; reconciliation callable by the scheduler | Medium | Found by `proptest` (CE-07), fixed |
 | A-03 | Digest recomputation is linear in the number of positions | Low | Open |
 | A-04 | `test-support` feature could be enabled in a production build | Low | Open |
-| A-05 | All trust domains run in one process | Medium | Open, by design of the model |
+| A-05 | All trust domains run in one process | Medium | Partly closed: the ledger has its own process (see "Process separation, step 1"); the other domains still share one |
 | A-06 to A-08, A-10 | See open issues below | Low to medium | Open |
 | A-09 | Declared minimum Rust version wrong (1.75, while the code needed 1.87 and `proptest` 1.88) | Low | Fixed: 1.88, checked by CI |
 
@@ -237,7 +237,7 @@ The test "a fault in the middle of a settlement, then a restart and a reconcilia
 | R2-10 | Orchestrator plus every recipient of a stage (next lender, or the witness for the last stage): receipts and corroborations are attestations between two accounts, not proofs of computation | What was charged to the borrower and the recovery earmark; contest windows; JOB-R19 for uncommitted receipts | Verification of the work itself; witness assignment the orchestrator cannot choose alone |
 | A-04 (extended) | Two test-only features now exist: `more-identity/test-support` and `gpu-ledger/fault-injection` (forwarded by `gpu-domain`). Only the conformance tests enable them | A production build that enabled one would accept unsigned accounts or injected faults | CI check on the features of release binaries, once there is a binary |
 | R2-11 | The Ledger does not check the delivery proof behind a charge | An unproven charge pays nobody without receipts and returns at settlement | Witness attestation or client ack verified by the Ledger; contest filed with the Ledger |
-| R2-06 | One process | — | `SECURITY_ARCHITECTURE.md` section 11 |
+| R2-06 | One process | The ledger now runs in its own (step 1) | `SECURITY_ARCHITECTURE.md` section 11 for the steps left |
 | SEC-006 | Frame and receipt digests are symbolic (FNV-1a) | — | QUIC prototype |
 
 ## Claims checked and qualified
@@ -335,4 +335,42 @@ What it costs: an honest lender whose recipient disappears before corroborating 
 - TEST-P30: the hostile generator gained `Revoke` (weight 1, mostly on an older attempt) and corroborations that name subsets of segments.
 - `r2_settlement_waits_for_every_item_and_is_final` asserted that late operations were refused; it now asserts they are refused with `EscrowSettled`. `r2_charges_and_voids_follow_the_ledgers_records` now charges a second output before trying to void one with a live share, and asserts the reason of the refusal. Both changes come from the mutation campaign, which let M65 and M76 through on `6351a3f` (`docs/VALIDATION.md`, "What the campaign found"). TEST-P30 gained one check: a share that holds or took money keeps its output charged.
 - No regression test was removed. CE-09 was added.
+
+## Process separation, step 1
+
+The ledger leaves the orchestrator's process (R2-06, A-05). Branch `isolation/ledger-process`. The criterion set for it: taking over the orchestrator's process entirely must give no access to the ledger's memory and no way around its rules, and what the orchestrator may still do must be listed and bounded.
+
+### What had to change, and why
+
+| Id | Finding | Status |
+| --- | --- | --- |
+| R4-01 | A service credential was a value signed by the authority. In one process the type kept it from being copied; sent to another process it is a bearer token: whoever saw it once is that service | **Fixed**: a certificate over the service's own key, and proof of possession over fresh nonces on every connection (LEDGER-022) |
+| R4-02 | The coordinator passed the treasury's, the clock's and the platform admin's credentials on to the ledger. A compromised coordinator that had seen them once could have issued credits or moved the ledger's clock | **Fixed** between processes: the coordinator holds the orchestrator's key only, and those services reach the ledger themselves |
+| R4-03 | The all-or-nothing step of a command was a copy of the whole state, ledger included. With the ledger elsewhere a failed command would have left its first ledger operations applied | **Fixed**: one ledger transaction per command, nested for reconciliation, bounded, rolled back with its connection (LEDGER-023) |
+| R4-04 | Processes of the same user can read each other's memory | **Fixed** on Linux for the daemon (not dumpable); a user of its own is recommended |
+| R4-05 | The ledger had no way to learn of a revocation outside the process that shared the list with it | **Fixed**: a revocation is a statement signed by the authority, delivered over the link |
+
+### Defects found while building it
+
+- **A checked certificate vouched for another key.** The verifier remembers certificates whose signature it already checked. Its key was (id, role, tag): the same tag with another public key was then accepted from memory. Found by the first test written for certificates (`credential_cannot_be_altered`), before any commit; the key of that cache now includes the service's public key (mutant M133).
+- **Reconciliation needs nested transactions.** The first run of TEST-P37 failed on `Reconcile`: it applies each due transition as an atomic step of its own inside the command, and the ledger refused a second `Begin`. Transactions now nest, to a bounded depth, and a nested one is undone alone.
+- **A dying test binary counted as a missed mutant.** The mutation runner looked for the names of failed tests. A mutant that makes a test binary abort (an allocation of several gigabytes, for the length check of the decoder) lists none. The runner now treats a failed run with no listed test as a detection and says so.
+
+### What the criterion gets
+
+| Asked | What holds | Shown by |
+| --- | --- | --- |
+| No access to the ledger's memory | The ledger is another process. Its memory file is not openable by its own user (Linux), and the only way in is the socket | `another_process_of_the_same_user_cannot_read_the_ledgers_memory`, `the_socket_and_the_key_file_are_private` |
+| No way around the economic rules | Everything TEST-P30 shows of the ledger under a hostile orchestrator holds of the daemon: every hostile call gets the same answer and leaves the same balances and journal | `p35_the_daemon_is_the_same_ledger`, `p35_behind_the_link_the_ledger_is_the_same_ledger` |
+| No other service's rights | A connection is one service. Copying a certificate, replaying a handshake or sending another role's operation gets nothing | `a_copied_certificate_does_not_open_a_connection`, `a_recorded_handshake_cannot_be_replayed`, `a_connection_has_its_own_rights_and_no_other` |
+| Nothing half done when the orchestrator dies | Uncommitted work is rolled back when the socket closes | `a_killed_orchestrator_leaves_nothing_half_done` |
+| What remains abusable is listed and bounded | `SECURITY_ARCHITECTURE.md`, section 11, "What a fully compromised orchestrator process can still do" | The bounds are the ledger's own checks and the host's limits, each with a test and a mutant |
+
+Two of the remaining operations hurt honest lenders and cannot be told from honest use today: a refund instead of a payment, and a contest of a held reward. Neither carries a statement from the borrower. They are bounded (reserved or held amounts only, back to their payers), not prevented.
+
+### Test changes that need a justification (isolation)
+
+- `Coordinator::ledger_service()` now returns an `Option`: it is `None` when the ledger is in another process. The simulation and three tests that read the in-process ledger say so explicitly. No assertion changed.
+- The hostile generator of TEST-P30 moved to a shared test module so that the link tests and the daemon tests replay the same calls. Its code is unchanged.
+- No test was removed.
 

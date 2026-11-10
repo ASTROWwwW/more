@@ -6,14 +6,15 @@ A coordinator keeps the accounts and organizes the run, but the computation flow
 
 ## What is in the repository
 
-For now the repository holds the system specification and an executable Rust model of its rules. There is no network layer or GPU engine yet. The model checks, before the real coordinator is written, that the rules hold up against failures and cheating. An interrupted job has to resume without losing or re-billing a result that was already delivered. Each output is billed once, each lender contribution is paid at most once, and no credit is created or lost along the way.
+For now the repository holds the system specification and an executable Rust model of its rules. There is no network layer or GPU engine yet, and nothing here is ready to be deployed. The model checks, before the real coordinator is written, that the rules hold up against failures and cheating. An interrupted job has to resume without losing or re-billing a result that was already delivered. Each output is billed once, each lender contribution is paid at most once, and no credit is created or lost along the way.
 
-The tests generate random command sequences: nodes going down, duplicated messages, clients that never acknowledge, lenders lying about delivery, expiring clocks. Invariants are checked after every command, and a mutation campaign puts known bugs back in to make sure the tests catch them. The generators also send every kind of command from every kind of participant, to check that nobody can act on what is not theirs. The ledger is also tested on its own against an orchestrator that turned hostile: it only pays on what lenders, recipients, borrowers and pool admins signed.
+The tests generate random command sequences: nodes going down, duplicated messages, clients that never acknowledge, lenders lying about delivery, expiring clocks. Invariants are checked after every command, and a mutation campaign puts known bugs back in to make sure the tests catch them. The generators also send every kind of command from every kind of participant, to check that nobody can act on what is not theirs. The ledger is also tested on its own against an orchestrator that turned hostile: it only pays on what lenders, recipients, borrowers and pool admins signed. It can run as a separate process, so that taking over the coordinator does not give access to the accounts; the same hostile tests then run against that process over its socket.
 
 | Path | Purpose |
 | --- | --- |
-| `crates/identity` | Signatures, service credentials, authenticated caller context, signed statements |
-| `crates/ledger` | Append-only double-entry ledger behind a typed, authenticated API; keeps the signed terms, leases and receipts it pays on |
+| `crates/identity` | Signatures, one key and certificate per service, authenticated caller context, signed statements |
+| `crates/ledger` | Append-only double-entry ledger behind a typed, authenticated API; keeps the signed terms, leases and receipts it pays on. Its `link` module is the protocol other processes use to reach it |
+| `crates/ledgerd` | `more-ledgerd`: the ledger as a process of its own, behind a local socket. State in memory only for now |
 | `crates/domain` | Coordinator: authorization, jobs, attempts and per-node leases, pools and catalog, output delivery, settlement |
 | `crates/protocol` | Signed messages, size checks, error codes, replay protection |
 | `crates/simulation` | Invariant checker and random scenario generators |
