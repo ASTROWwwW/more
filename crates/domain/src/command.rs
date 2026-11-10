@@ -88,10 +88,14 @@ pub enum Command {
     /// JOB-R18: the recipient of `lender`'s output (next stage, or the witness) attests that it
     /// received `lender`'s restored state. `signature` is the recipient's over `restore_message`,
     /// checked by the ledger.
+    /// `segments`: recovery segments `0..segments` were received. The signature binds the job,
+    /// the attempt, the lender, its layer range, the restored positions, the segments and the
+    /// commitment the lender signed, so it cannot serve another recovery.
     CorroborateRestore {
         job: JobId,
         attempt: u32,
         lender: AccountId,
+        segments: u32,
         signature: [u8; 64],
     },
     /// Renews the sender's own lease (JOB-R31, JOB-R39).
@@ -153,13 +157,15 @@ pub enum Command {
     ExpireDeliveryWindow { job: JobId },
     /// JOB-T06.
     PlacementFailed { job: JobId },
-    /// JOB-T05, JOB-R38: the lender's state is restored to `restored`, signed for the ledger
-    /// (`ready_message`). The attempt starts when every lease is ready.
+    /// JOB-T05, JOB-R38: the lender's state is restored to `restored`; `state` commits to that
+    /// restored state. Both are signed for the ledger (`ready_message`). The attempt starts when
+    /// every lease is ready.
     AttemptReady {
         job: JobId,
         attempt: u32,
         lender: AccountId,
         restored: PerType<u32>,
+        state: u64,
         signature: [u8; 64],
     },
     /// Units produced by the cluster (JOB-R11, JOB-R13, JOB-R25).

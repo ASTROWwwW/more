@@ -84,20 +84,50 @@ pub fn lease_message(a: &Assignment) -> Vec<u8> {
         .0
 }
 
-/// Signed by a lender once its layers are loaded and its state restored to `restored`.
-pub fn ready_message(job: u32, attempt: u32, lender: AccountNo, restored: [u32; 3]) -> Vec<u8> {
-    let e = Enc::new(b"more/ready/v1").u32(job).u32(attempt).u32(lender);
-    restored.iter().fold(e, |e, r| e.u32(*r)).0
+/// Signed by a lender once its layers are loaded and its state restored to `restored`. `state`
+/// commits to that restored state (in production, a digest of what the stage hands to the next).
+pub fn ready_message(
+    job: u32,
+    attempt: u32,
+    lender: AccountNo,
+    restored: [u32; 3],
+    state: u64,
+) -> Vec<u8> {
+    let e = Enc::new(b"more/ready/v2").u32(job).u32(attempt).u32(lender);
+    restored.iter().fold(e, |e, r| e.u32(*r)).u64(state).0
 }
 
-/// Signed by the recipient of `producer`'s output once it has received `producer`'s state replayed
-/// up to `restored`: the restoration is corroborated by a second account (JOB-R18).
-pub fn restore_message(job: u32, attempt: u32, producer: AccountNo, restored: [u32; 3]) -> Vec<u8> {
+/// What a recipient attests about a producer's restoration (JOB-R18): which stage of which
+/// attempt, which layers, up to which positions, how many recovery segments it received, and the
+/// commitment to the restored state. Nothing in it can be moved to another recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restoration {
+    pub job: u32,
+    pub attempt: u32,
+    pub producer: AccountNo,
+    /// Layer range `[start, end)` of the producer's stage.
+    pub layers: (u32, u32),
+    pub restored: [u32; 3],
+    /// Recovery segments `0..segments` were received.
+    pub segments: u32,
+    /// The commitment the producer signed in its readiness.
+    pub state: u64,
+}
+
+/// Signed by the recipient of the producer's output once it has received the restored state.
+pub fn restore_message(r: &Restoration) -> Vec<u8> {
     let e = Enc::new(b"more/restore/v1")
-        .u32(job)
-        .u32(attempt)
-        .u32(producer);
-    restored.iter().fold(e, |e, r| e.u32(*r)).0
+        .u32(r.job)
+        .u32(r.attempt)
+        .u32(r.producer)
+        .u32(r.layers.0)
+        .u32(r.layers.1);
+    r.restored
+        .iter()
+        .fold(e, |e, x| e.u32(*x))
+        .u32(r.segments)
+        .u64(r.state)
+        .0
 }
 
 /// Signed by the recipient of `producer`'s output (next stage, or the witness after the last
@@ -145,8 +175,16 @@ mod tests {
             relay_message(1, 2, 3),
             mandate_message(1, 2, 3, &t),
             lease_message(&a),
-            ready_message(1, 1, 10, [0; 3]),
-            restore_message(1, 1, 10, [0; 3]),
+            ready_message(1, 1, 10, [0; 3], 5),
+            restore_message(&Restoration {
+                job: 1,
+                attempt: 1,
+                producer: 10,
+                layers: (0, 3),
+                restored: [0; 3],
+                segments: 1,
+                state: 5,
+            }),
             receipt_message(1, 1, 10, 1, 4, 9),
         ];
         for (i, x) in msgs.iter().enumerate() {

@@ -44,6 +44,8 @@ pub enum Message {
         job: JobId,
         attempt: u32,
         restored: PerType<u32>,
+        /// Commitment to the restored state.
+        state: u64,
         signature: [u8; 64],
     },
     AssignReject {
@@ -157,6 +159,7 @@ pub enum Message {
         job: JobId,
         attempt: u32,
         producer: AccountId,
+        segments: u32,
         signature: [u8; 64],
     },
     /// The sender presents a receipt for its own output, signed by its recipient (JOB-R12).
@@ -289,11 +292,13 @@ impl Message {
                 job,
                 attempt,
                 restored,
+                state,
                 signature,
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
                 restored.iter().for_each(|r| w.u32(*r));
+                w.u64(*state);
                 w.bytes(signature);
             }
             M::AssignAccept {
@@ -309,11 +314,13 @@ impl Message {
                 job,
                 attempt,
                 producer,
+                segments,
                 signature,
             } => {
                 w.u32(job.0);
                 w.u32(*attempt);
                 w.u32(producer.0);
+                w.u32(*segments);
                 w.bytes(signature);
             }
             M::LayersLoaded {

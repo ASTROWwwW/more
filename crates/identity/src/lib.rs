@@ -18,7 +18,7 @@ mod statements;
 
 pub use statements::{
     lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
-    Assignment, JobTerms,
+    Assignment, JobTerms, Restoration,
 };
 
 /// Account number, as used by the ledger and the domain (`AccountId.0`).
@@ -217,6 +217,8 @@ impl Eq for CredentialVerifier {}
 #[derive(Clone, Default)]
 pub struct KeyDirectory {
     keys: Arc<RwLock<BTreeMap<AccountNo, VerifyingKey>>>,
+    /// Signature checks done through this directory (cost accounting).
+    checks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KeyDirectory {
@@ -235,6 +237,11 @@ impl KeyDirectory {
         Ok(())
     }
 
+    /// Number of signature checks done through this directory and its clones.
+    pub fn signature_checks(&self) -> u64 {
+        self.checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn contains(&self, account: AccountNo) -> bool {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         keys.contains_key(&account)
@@ -251,6 +258,8 @@ impl KeyDirectory {
             let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
             *keys.get(&account).ok_or(AuthError::UnknownAccount)?
         };
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         key.verify(message, &Signature::from_bytes(signature))
             .map_err(|_| AuthError::BadSignature)?;
         Ok(VerifiedAccount(account))

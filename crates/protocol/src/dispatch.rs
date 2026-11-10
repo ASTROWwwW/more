@@ -64,12 +64,14 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             job,
             attempt,
             restored,
+            state,
             signature,
         } => Command::AttemptReady {
             job: *job,
             attempt: *attempt,
             lender: sender,
             restored: *restored,
+            state: *state,
             signature: *signature,
         },
         M::AssignAccept {
@@ -96,11 +98,13 @@ pub fn to_command(sender: AccountId, body: &Message) -> Command {
             job,
             attempt,
             producer,
+            segments,
             signature,
         } => Command::CorroborateRestore {
             job: *job,
             attempt: *attempt,
             lender: *producer,
+            segments: *segments,
             signature: *signature,
         },
         M::WitnessHeartbeat { job, attempt } => Command::WitnessHeartbeat {

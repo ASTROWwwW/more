@@ -111,13 +111,14 @@ impl Coordinator {
         })
     }
 
-    /// JOB-R18: the recipient of `lender`'s stage corroborated its restoration on that attempt.
+    /// JOB-R18: the recipient of `lender`'s stage corroborated its restoration on that attempt,
+    /// for a number of segments that covers this one.
     pub(super) fn restore_corroborated(&self, rid: RecoveryWorkId, lender: AccountId) -> bool {
         self.jobs
             .get(&rid.job)
             .and_then(|j| j.attempts.get(&rid.attempt))
-            .and_then(|a| a.stage_of(lender).map(|s| a.leases[s].corroborated))
-            .unwrap_or(false)
+            .and_then(|a| a.stage_of(lender).and_then(|s| a.leases[s].corroborated))
+            .is_some_and(|n| rid.segment < n)
     }
 
     /// JOB-S04: evaluates a closed slice.
@@ -303,6 +304,7 @@ impl Coordinator {
                 "payment of {kind:?}: ledger {paid:?}, coordinator {amount}/{pool_part}"
             )));
         }
+        let now = self.now;
         let l = self.line_mut(slice, lender)?;
         l.items[idx].pool_part = pool_part;
         match l.items[idx].status {
@@ -313,6 +315,7 @@ impl Coordinator {
         l.paid = add(l.paid, amount, "paid")?;
         l.held = add(l.held, amount, "held")?;
         l.items[idx].status = ItemStatus::Paid;
+        l.items[idx].paid_at = Some(now);
         l.items[idx].awaiting_delivery = false;
         // A zero reward (free pool) has nothing to hold or release.
         l.items[idx].reward_done = amount == 0;

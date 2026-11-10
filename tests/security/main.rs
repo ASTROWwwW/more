@@ -8,6 +8,7 @@ use more_identity::UserKey;
 
 mod attacks;
 mod compromise;
+mod finality;
 mod leases;
 mod protocol;
 mod recovery;

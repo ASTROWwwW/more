@@ -16,6 +16,7 @@ use crate::{Account, Amount, Ledger};
 
 mod book;
 mod funds;
+mod lines;
 mod types;
 mod work;
 
@@ -37,6 +38,8 @@ pub struct LedgerService {
     escrows: BTreeMap<u32, Escrow>,
     /// Admin of each pool's treasury, set by the platform admin.
     pools: BTreeMap<u32, u32>,
+    /// Ledger time, moved by the Clock service only (LEDGER-018).
+    now: u64,
     /// Accepted requests per (role, operation).
     accepted: BTreeMap<(ServiceRole, &'static str), u64>,
     denials: Vec<Denial>,
@@ -54,6 +57,7 @@ impl LedgerService {
             limits,
             escrows: BTreeMap::new(),
             pools: BTreeMap::new(),
+            now: 0,
             accepted: BTreeMap::new(),
             denials: Vec::new(),
             denied: 0,
@@ -64,6 +68,11 @@ impl LedgerService {
     #[cfg(feature = "fault-injection")]
     pub fn inject_fault(&mut self, after: Option<u64>) {
         self.ledger.inject_fault(after);
+    }
+
+    /// Ledger time.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     pub fn limits(&self) -> &LedgerLimits {
@@ -199,6 +208,13 @@ impl LedgerService {
 
     fn run(&mut self, op: LedgerOp) -> ApiResult {
         match op {
+            LedgerOp::Advance { now } => {
+                if now < self.now {
+                    return Err(LedgerApiError::Invalid("the clock never goes back"));
+                }
+                self.now = now;
+                Ok(LedgerOutcome::Done)
+            }
             LedgerOp::Issue { key, to, amount } => self.issue(key, to, amount),
             LedgerOp::OpenEscrow {
                 job,
@@ -237,14 +253,16 @@ impl LedgerService {
                 attempt,
                 stage,
                 restored,
+                state,
                 signature,
-            } => self.lease_ready(job, attempt, stage, restored, &signature),
+            } => self.lease_ready(job, attempt, stage, (restored, state), &signature),
             LedgerOp::RecordRestore {
                 job,
                 attempt,
                 producer,
+                segments,
                 signature,
-            } => self.record_restore(job, attempt, producer, &signature),
+            } => self.record_restore(job, attempt, producer, segments, &signature),
             LedgerOp::RecordReceipt {
                 job,
                 attempt,

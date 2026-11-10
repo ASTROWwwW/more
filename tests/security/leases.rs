@@ -45,6 +45,7 @@ fn ready(l: AccountId) -> Command {
         attempt: 1,
         lender: l,
         restored: [0; 3],
+        state: UNSET_STATE,
         signature: UNSIGNED,
     }
 }
@@ -134,7 +135,8 @@ fn r2_lease_steps_are_ordered_personal_and_signed() {
         attempt: 1,
         lender: L[0],
         restored: [0; 3],
-        signature: user_key(L[1]).sign(&more_identity::ready_message(J1.0, 1, L[0].0, [0; 3])),
+        state: 7,
+        signature: user_key(L[1]).sign(&more_identity::ready_message(J1.0, 1, L[0].0, [0; 3], 7)),
     };
     refused(&mut sim, &me(L[0]), forged, "INADMISSIBLE_PROOF");
     // A repeated step changes nothing.

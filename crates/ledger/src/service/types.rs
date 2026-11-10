@@ -20,6 +20,12 @@ pub struct LedgerLimits {
     /// Commission taken on release, in basis points (LEDGER-008). Set here so the orchestrator
     /// cannot change what lenders receive.
     pub commission_bps: u64,
+    /// A held reward cannot be released before this long after its last payment: the least
+    /// contest window a borrower always gets (JOB-R22).
+    pub reward_hold: u64,
+    /// A held reward cannot be contested later than this after its oldest payment: after it, a
+    /// payment can only become final.
+    pub contest_limit: u64,
 }
 
 impl Default for LedgerLimits {
@@ -29,6 +35,8 @@ impl Default for LedgerLimits {
             max_issue: 1_000_000_000_000,
             supply_cap: 1_000_000_000_000_000,
             commission_bps: 1_000,
+            reward_hold: 48 * 3600,
+            contest_limit: 7 * 24 * 3600,
         }
     }
 }
@@ -99,6 +107,9 @@ pub enum ItemId {
 /// are computed by the Ledger, never taken from the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LedgerOp {
+    /// Moves the ledger's clock forward. Clock service only: the orchestrator cannot open or
+    /// close a contest window by lying about the time.
+    Advance { now: u64 },
     /// LEDGER-003. Treasury only. `key` is the caller's idempotency key (LEDGER-001).
     Issue {
         key: String,
@@ -145,6 +156,8 @@ pub enum LedgerOp {
         attempt: u32,
         stage: u32,
         restored: [u32; 3],
+        /// Commitment to the restored state.
+        state: u64,
         signature: [u8; 64],
     },
     /// The recipient of `producer`'s output signed that it received `producer`'s restored state
@@ -153,6 +166,8 @@ pub enum LedgerOp {
         job: u32,
         attempt: u32,
         producer: u32,
+        /// Recovery segments `0..segments` were received.
+        segments: u32,
         signature: [u8; 64],
     },
     /// Receipt signed by the recipient of `producer`'s output (LEDGER-016).
@@ -208,6 +223,7 @@ pub enum LedgerOp {
 impl LedgerOp {
     pub fn kind(&self) -> &'static str {
         match self {
+            LedgerOp::Advance { .. } => "Advance",
             LedgerOp::Issue { .. } => "Issue",
             LedgerOp::OpenEscrow { .. } => "OpenEscrow",
             LedgerOp::Reserve { .. } => "Reserve",
@@ -235,6 +251,7 @@ impl LedgerOp {
     pub(crate) fn required_role(&self) -> ServiceRole {
         match self {
             LedgerOp::Issue { .. } => ServiceRole::Treasury,
+            LedgerOp::Advance { .. } => ServiceRole::Clock,
             LedgerOp::RegisterPool { .. } => ServiceRole::PlatformAdmin,
             _ => ServiceRole::Orchestrator,
         }
@@ -289,6 +306,9 @@ pub enum LedgerApiError {
     /// A lease, readiness or receipt signature is missing, wrong, or from the wrong account
     /// (LEDGER-015, LEDGER-016).
     BadProof(&'static str),
+    /// A held reward released before the contest window is over, or contested after the limit
+    /// (JOB-R22, LEDGER-018).
+    OutOfWindow(&'static str),
     /// The job still has undecided line items (LEDGER-014).
     OpenItems(u32),
     LimitExceeded(&'static str),
@@ -303,6 +323,7 @@ impl LedgerApiError {
             LedgerApiError::Forbidden { .. } => "FORBIDDEN",
             LedgerApiError::LimitExceeded(_) => "LIMIT_EXCEEDED",
             LedgerApiError::BadProof(_) => "BAD_PROOF",
+            LedgerApiError::OutOfWindow(_) => "OUT_OF_WINDOW",
             _ => "LEDGER_REJECTED",
         }
     }

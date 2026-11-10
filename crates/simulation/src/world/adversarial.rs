@@ -547,6 +547,7 @@ impl Sim {
                 attempt,
                 lender,
                 restored: j.delivered,
+                state: UNSET_STATE,
                 signature: UNSIGNED,
             },
             4 => Command::AcceptLease {
@@ -560,7 +561,8 @@ impl Sim {
                 attempt,
                 lender,
                 restored: j.delivered,
-                signature: forged(ready_message(id.0, attempt, lender.0, j.delivered)),
+                state: 7,
+                signature: forged(ready_message(id.0, attempt, lender.0, j.delivered, 7)),
             },
         }]
     }

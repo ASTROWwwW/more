@@ -102,11 +102,19 @@ pub enum LeaseState {
 pub struct Lease {
     pub state: LeaseState,
     pub expires_at: Time,
-    /// Positions the lender signed it restored its state to, once `Ready` (JOB-T05).
-    pub restored: Option<PerType<u32>>,
-    /// The recipient of this stage's output signed that it received that restored state: the
-    /// restoration is attested by a second account (JOB-R18).
-    pub corroborated: bool,
+    /// What the lender signed it restored, once `Ready` (JOB-T05).
+    pub restored: Option<Restored>,
+    /// The recipient of this stage's output signed that it received that restored state, and
+    /// how many recovery segments of it: the restoration is attested by a second account
+    /// (JOB-R18). Written once.
+    pub corroborated: Option<u32>,
+}
+
+/// A lender's restored state: the positions it resumed from and its commitment to that state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restored {
+    pub positions: PerType<u32>,
+    pub state: u64,
 }
 
 /// An attempt: fixed cluster, leases, production counters.
@@ -353,6 +361,8 @@ pub struct LineItem {
     pub pool_part: Amount,
     /// This item's reward was released or contested.
     pub reward_done: bool,
+    /// When the item was paid: start of its contest window (JOB-R22).
+    pub paid_at: Option<Time>,
     /// Contribution to an output still provisional at evaluation: waits for the output's fate,
     /// never arbitrated on its own (JOB-R30).
     pub awaiting_delivery: bool,

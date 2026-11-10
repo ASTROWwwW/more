@@ -35,6 +35,7 @@ pub enum AuditEvent {
         job: JobId,
         attempt: u32,
         lender: AccountId,
+        segments: u32,
     },
     /// Nodes whose own lease had expired when the attempt was revoked (JOB-R39).
     LeasesExpired {

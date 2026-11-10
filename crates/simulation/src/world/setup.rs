@@ -126,6 +126,7 @@ pub fn bring_up(
             attempt,
             lender: *l,
             restored,
+            state: UNSET_STATE,
             signature: UNSIGNED,
         });
     }
@@ -140,6 +141,7 @@ pub fn corroborate(job: JobId, attempt: u32, lenders: &[AccountId]) -> Vec<Comma
             job,
             attempt,
             lender: *l,
+            segments: SEGMENTS,
             signature: UNSIGNED,
         })
         .collect()

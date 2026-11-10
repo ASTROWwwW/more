@@ -118,6 +118,18 @@ impl Coordinator {
         if held == 0 {
             return Err(DomainError::Precondition("nothing held"));
         }
+        // LEDGER-018: a contest is bounded even if the slice is not final yet. Past the ledger's
+        // limit, counted from the oldest payment still held, the reward can only be released.
+        let oldest = s.lines[&lender]
+            .items
+            .iter()
+            .filter(|i| i.status == ItemStatus::Paid && !i.reward_done)
+            .filter_map(|i| i.paid_at)
+            .min();
+        let limit = self.ledger.limits().contest_limit;
+        if oldest.is_some_and(|t| self.now >= t + limit) {
+            return Err(DomainError::Precondition("JOB-R22: contest limit reached"));
+        }
         // CE-02: each payer gets its own share back (the pool for the recovery it funded).
         let to_pool = s.lines[&lender]
             .items

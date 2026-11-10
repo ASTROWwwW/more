@@ -15,7 +15,7 @@ mod common;
 
 use common::*;
 use gpu_ledger::*;
-use more_identity::{lease_message, ready_message, receipt_message, restore_message};
+use more_identity::{lease_message, ready_message, receipt_message};
 use proptest::prelude::*;
 
 /// What the honest recipients really received on attempt 1.
@@ -100,6 +100,8 @@ enum Call {
         lender: u8,
     },
     ReturnEarmark(u8),
+    /// The honest clock service moves time forward: minutes, hours, or past the windows.
+    Tick(u8),
     /// Settles on a few values only, so most sequences live long enough to pay.
     Settle(u8),
 }
@@ -118,11 +120,12 @@ fn calls() -> impl Strategy<Value = Call> {
         2 => (b(), b()).prop_map(|(pos, gen)| Call::Void { pos, gen }),
         8 => (b(), b(), b(), b(), b()).prop_map(|(attempt, lender, pos, gen, stage)| Call::Contribution { attempt, lender, pos, gen, stage }),
         5 => (b(), b(), b(), b()).prop_map(|(attempt, lender, segment, amount)| Call::Recovery { attempt, lender, segment, amount }),
-        8 => (b(), b(), b(), b(), b(), b()).prop_map(|(attempt, lender, item, pos, gen, stage)| Call::Pay { attempt, lender, item, pos, gen, stage }),
+        10 => (b(), b(), b(), b(), b(), b()).prop_map(|(attempt, lender, item, pos, gen, stage)| Call::Pay { attempt, lender, item, pos, gen, stage }),
         4 => (b(), b(), b(), b(), b(), b()).prop_map(|(attempt, lender, item, pos, gen, stage)| Call::Refund { attempt, lender, item, pos, gen, stage }),
-        4 => (b(), b()).prop_map(|(attempt, lender)| Call::Release { attempt, lender }),
+        6 => (b(), b()).prop_map(|(attempt, lender)| Call::Release { attempt, lender }),
         3 => (b(), b()).prop_map(|(attempt, lender)| Call::Contest { attempt, lender }),
-        2 => b().prop_map(Call::ReturnEarmark),
+                2 => b().prop_map(Call::ReturnEarmark),
+        6 => b().prop_map(Call::Tick),
         1 => b().prop_map(Call::Settle),
     ]
 }
@@ -303,12 +306,13 @@ fn apply(w: &mut World, c: &Call) -> Res {
             };
             let honest = rec.assignment.lenders.get(stage as usize).copied();
             let lender = honest.unwrap_or(MALLORY);
-            let m = ready_message(JOB, attempt, lender, [0; 3]);
+            let m = ready_message(JOB, attempt, lender, [0; 3], STATE);
             w.run(LedgerOp::LeaseReady {
                 job: JOB,
                 attempt,
                 stage,
                 restored: [0; 3],
+                state: STATE,
                 signature: key(signer(honest, s)).sign(&m),
             })
         }
@@ -326,13 +330,16 @@ fn apply(w: &mut World, c: &Call) -> Res {
                 r.recipient_of(stage)
             });
             let honest = recipient.filter(|_| producer != MALLORY);
-            let m = restore_message(JOB, attempt, producer, [0; 3]);
-            w.run(LedgerOp::RecordRestore {
-                job: JOB,
-                attempt,
-                producer,
-                signature: key(signer(honest, s)).sign(&m),
-            })
+            let Some(rec) = w.escrow().attempts.get(&attempt).cloned() else {
+                return Err(LedgerApiError::Invalid("test: unknown attempt"));
+            };
+            let Some(stage) = rec.stage_of(producer) else {
+                return Err(LedgerApiError::Invalid("test: not a lender"));
+            };
+            // Sometimes only the first segment was received.
+            let segments = 1 + u32::from(s / 4 % 3);
+            let r = restoration(&rec.assignment, stage as u32, segments, STATE);
+            w.corroborate_with(&r, signer(honest, s))
         }
         Call::Receipt {
             attempt,
@@ -347,17 +354,20 @@ fn apply(w: &mut World, c: &Call) -> Res {
                 let stage = r.stage_of(producer)?;
                 r.recipient_of(stage)
             });
-            // The attacker's account never produces anything, so nobody honest signs for it.
-            let honest =
-                recipient.filter(|_| attempt == 1 && upto <= RECEIVED && producer != MALLORY);
-            let m = receipt_message(JOB, attempt, producer, WT, upto, 0);
+            // The attacker's account never produces anything, so nobody honest signs for it, and
+            // an honest recipient only signs the true digest (0). The attacker, where it is the
+            // recipient, may try a second digest for the same coverage.
+            let digest = u64::from(s / 4 % 4 == 0);
+            let honest = recipient
+                .filter(|_| attempt == 1 && upto <= RECEIVED && producer != MALLORY && digest == 0);
+            let m = receipt_message(JOB, attempt, producer, WT, upto, digest);
             w.run(LedgerOp::RecordReceipt {
                 job: JOB,
                 attempt,
                 producer,
                 wt: WT,
                 upto,
-                digest: 0,
+                digest,
                 signature: key(signer(honest, s)).sign(&m),
             })
         }
@@ -462,6 +472,15 @@ fn apply(w: &mut World, c: &Call) -> Res {
             job: JOB,
             attempt: att_of(w, a),
         }),
+        Call::Tick(sel) => {
+            w.advance(match sel % 6 {
+                0 => 8 * 24 * HOUR,
+                1 | 2 => 49 * HOUR,
+                3 => 20 * HOUR,
+                _ => 600,
+            });
+            Ok(LedgerOutcome::Done)
+        }
         Call::Settle(sel) if sel < 24 => w.run(LedgerOp::SettleJob { job: JOB }),
         Call::Settle(_) => Err(LedgerApiError::Invalid("test: not now")),
     }
@@ -524,14 +543,74 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
                 let r = e
                     .receipts
                     .get(&(it.line.attempt, it.line.lender, output.wt));
-                prop_assert!(r.is_some_and(|u| *u > output.pos), "{id:?} after {c:?}");
+                let covered = r.is_some_and(|m| m.keys().any(|u| *u > output.pos));
+                prop_assert!(covered, "{id:?} after {c:?}");
             }
-            ItemId::Recovery { .. } => {
+            ItemId::Recovery { segment, .. } => {
                 prop_assert!(a.ready.iter().all(|r| *r), "{id:?} after {c:?}");
-                let proven = s.is_some_and(|s| a.corroborated[s]);
+                let proven = s.is_some_and(|s| a.corroborated[s].is_some_and(|n| *segment < n));
                 prop_assert!(it.state != ItemState::Paid || proven, "{id:?} after {c:?}");
             }
             ItemId::Contribution { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// LEDGER-018: what was recorded stays recorded, and a held reward leaves through the cycle
+/// only: released after the hold, contested before the limit, on the ledger's own clock.
+fn finality(before: &Escrow, now: u64, w: &World, c: &Call) -> Result<(), TestCaseError> {
+    let after = w.escrow();
+    let limits = w.ledger.limits();
+    for (key, old) in &before.receipts {
+        for (upto, digest) in old {
+            let kept = after.receipts.get(key).and_then(|r| r.get(upto));
+            prop_assert_eq!(kept, Some(digest), "receipt replaced by {:?}", c);
+        }
+    }
+    for (n, a) in &before.attempts {
+        let b = &after.attempts[n];
+        for s in 0..a.accepted.len() {
+            prop_assert!(!a.accepted[s] || b.accepted[s], "{c:?}");
+            prop_assert!(
+                !a.ready[s] || (b.ready[s] && b.state[s] == a.state[s]),
+                "{c:?}"
+            );
+            let kept = a.corroborated[s].is_none() || b.corroborated[s] == a.corroborated[s];
+            prop_assert!(kept, "corroboration replaced by {:?}", c);
+        }
+    }
+    let mut left: Vec<u64> = Vec::new();
+    for (id, old) in &before.items {
+        let new = &after.items[id];
+        match old.state {
+            ItemState::Reserved => {}
+            ItemState::Refunded => prop_assert_eq!(new.state, ItemState::Refunded, "{:?}", c),
+            ItemState::Paid => {
+                prop_assert_eq!(new.state, ItemState::Paid, "{:?} undid a payment", c);
+                prop_assert_eq!((new.amount, new.paid_at), (old.amount, old.paid_at));
+                prop_assert!(new.rewarded || !old.rewarded, "{c:?} reopened a reward");
+                if new.rewarded && !old.rewarded {
+                    left.extend(old.paid_at);
+                }
+            }
+        }
+    }
+    if let (Some(oldest), Some(latest)) = (left.iter().min(), left.iter().max()) {
+        match c {
+            Call::Release { .. } => {
+                prop_assert!(
+                    now >= latest + limits.reward_hold,
+                    "released inside the window"
+                );
+            }
+            Call::Contest { .. } => {
+                prop_assert!(
+                    now < oldest + limits.contest_limit,
+                    "contested past the limit"
+                );
+            }
+            other => prop_assert!(false, "{other:?} closed a held reward"),
         }
     }
     Ok(())
@@ -554,15 +633,17 @@ proptest! {
     ) {
         let mut w = world();
         w.open(JOB, 500).unwrap();
-        for c in &seq {
+                for c in &seq {
             let before = w.balances();
             let records = w.escrow().clone();
+            let now = w.ledger.now();
             if apply(&mut w, c).is_err() {
                 // A refused call leaves no trace, in the journal or in the job records.
                 prop_assert_eq!(&before, &w.balances(), "{:?}", c);
                 prop_assert_eq!(&records, w.escrow(), "{:?}", c);
             }
             check(&w, c)?;
+            finality(&records, now, &w, c)?;
         }
         // Closure is always reachable once the open items are decided, and it is final.
         let open: Vec<(ItemId, LineRef)> = w
@@ -632,6 +713,7 @@ fn p30_generator_reaches_every_operation() {
         "Contest",
         "ReturnEarmark",
         "Settle",
+        "Tick",
         "paid contributions",
         "paid recovery items",
     ] {

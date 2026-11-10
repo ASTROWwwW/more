@@ -22,6 +22,7 @@ fn ready(job: JobId) -> Command {
         attempt: 1,
         lender: AccountId(0),
         restored: [0; 3],
+        state: UNSET_STATE,
         signature: UNSIGNED,
     }
 }

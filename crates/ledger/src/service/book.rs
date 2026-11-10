@@ -29,8 +29,9 @@ pub struct Escrow {
     pub attempts: BTreeMap<u32, AttemptRec>,
     pub outputs: BTreeMap<OutputRef, OutputRec>,
     pub items: BTreeMap<ItemId, ItemRec>,
-    /// Highest receipt signed by the recipient, per `(attempt, producer, type)`.
-    pub receipts: BTreeMap<(u32, u32, u8), u32>,
+    /// Receipts signed by the recipient, per `(attempt, producer, type)`: covered up to → digest.
+    /// A recorded receipt is final: the same coverage with another digest is refused.
+    pub receipts: BTreeMap<(u32, u32, u8), BTreeMap<u32, u64>>,
 }
 
 /// An attempt as its lenders signed it.
@@ -43,8 +44,11 @@ pub struct AttemptRec {
     pub ready: Vec<bool>,
     /// Per stage: the positions the lender signed it restored to.
     pub restored: Vec<[u32; 3]>,
-    /// Per stage: the stage's recipient signed that it received that restored state (JOB-R18).
-    pub corroborated: Vec<bool>,
+    /// Per stage: the commitment to the restored state the lender signed.
+    pub state: Vec<u64>,
+    /// Per stage: the stage's recipient signed that it received that restored state, and how
+    /// many recovery segments of it (JOB-R18). Written once.
+    pub corroborated: Vec<Option<u32>>,
     /// Recovery reserved in lines for this attempt, paid or not (refunds give it back).
     pub recovery_reserved: Amount,
     pub earmark_returned: bool,
@@ -100,6 +104,8 @@ pub struct ItemRec {
     pub pool_part: Amount,
     /// The held reward of this item was released or contested.
     pub rewarded: bool,
+    /// Ledger time of the payment: start of the contest window (JOB-R22).
+    pub paid_at: Option<u64>,
 }
 
 impl Escrow {
@@ -129,6 +135,13 @@ impl Escrow {
             .values()
             .try_fold(0u64, |acc, a| acc.checked_add(a.committed_recovery()))?;
         total.checked_sub(committed)
+    }
+
+    /// A recorded receipt of `producer` on `attempt` covers position `pos` of type `wt`.
+    pub fn receipt_covers(&self, attempt: u32, producer: u32, wt: u8, pos: u32) -> bool {
+        self.receipts
+            .get(&(attempt, producer, wt))
+            .is_some_and(|r| r.range(pos.saturating_add(1)..).next().is_some())
     }
 
     pub fn has_open_items(&self) -> bool {

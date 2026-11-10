@@ -126,6 +126,12 @@ impl Coordinator {
                 "orchestrator credential expected",
             ));
         }
+        // JOB-R22: the coordinator never releases a reward before the ledger would let it.
+        if cfg.reward_window < ledger.limits().reward_hold {
+            return Err(DomainError::InvalidInput(
+                "reward window shorter than the ledger's hold",
+            ));
+        }
         Ok(Coordinator {
             cfg,
             now: 0,

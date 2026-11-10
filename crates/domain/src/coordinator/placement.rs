@@ -102,7 +102,7 @@ impl Coordinator {
             state: LeaseState::Assigned,
             expires_at: now + ttl,
             restored: None,
-            corroborated: false,
+            corroborated: None,
         };
         j.attempts.insert(
             no,

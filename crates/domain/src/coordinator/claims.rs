@@ -244,6 +244,7 @@ impl Coordinator {
                         status: ItemStatus::PendingEvaluation,
                         pool_part: 0,
                         reward_done: false,
+                        paid_at: None,
                         awaiting_delivery: false,
                     });
                     self.audit.push(AuditEvent::ItemReserved {

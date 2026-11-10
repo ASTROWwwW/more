@@ -5,7 +5,7 @@
 use gpu_ledger::*;
 use more_identity::{
     lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
-    IdentityAuthority, KeyDirectory, ServiceCredential, ServiceRole, UserKey,
+    IdentityAuthority, KeyDirectory, Restoration, ServiceCredential, ServiceRole, UserKey,
 };
 
 pub const ALICE: u32 = 1;
@@ -21,6 +21,11 @@ pub const ADMIN: u32 = 80;
 pub const JOB: u32 = 1;
 /// Output type used by the tests, priced 8.
 pub const WT: u8 = 1;
+/// Commitment an honest lender signs for its restored state in these tests.
+pub const STATE: u64 = 0xabc;
+/// Recovery segments an honest recipient attests by default.
+pub const SEGMENTS: u32 = 3;
+pub const HOUR: u64 = 3600;
 
 pub type Res = Result<LedgerOutcome, LedgerApiError>;
 
@@ -46,6 +51,7 @@ pub struct World {
     pub treasury: ServiceCredential,
     pub orch: ServiceCredential,
     pub auditor: ServiceCredential,
+    pub clock: ServiceCredential,
 }
 
 pub fn world() -> World {
@@ -58,6 +64,7 @@ pub fn world() -> World {
     let treasury = auth.issue(ServiceRole::Treasury);
     let orch = auth.issue(ServiceRole::Orchestrator);
     let auditor = auth.issue(ServiceRole::Auditor);
+    let clock = auth.issue(ServiceRole::Clock);
     let platform = auth.issue(ServiceRole::PlatformAdmin);
     let pool = LedgerOp::RegisterPool {
         pool: POOL,
@@ -82,6 +89,22 @@ pub fn world() -> World {
         treasury,
         orch,
         auditor,
+        clock,
+    }
+}
+
+/// What the recipient of `stage` attests about its lender's restoration.
+pub fn restoration(a: &Assignment, stage: u32, segments: u32, state: u64) -> Restoration {
+    let s = stage as usize;
+    let start: u32 = a.layout[..s].iter().sum();
+    Restoration {
+        job: a.job,
+        attempt: a.attempt,
+        producer: a.lenders[s],
+        layers: (start, start + a.layout[s]),
+        restored: [0; 3],
+        segments,
+        state,
     }
 }
 
@@ -193,24 +216,39 @@ impl World {
 
     pub fn ready(&mut self, a: &Assignment, stage: u32, signer: u32) -> Res {
         let lender = a.lenders[stage as usize];
+        let m = ready_message(a.job, a.attempt, lender, [0; 3], STATE);
         self.run(LedgerOp::LeaseReady {
             job: a.job,
             attempt: a.attempt,
             stage,
             restored: [0; 3],
-            signature: key(signer).sign(&ready_message(a.job, a.attempt, lender, [0; 3])),
+            state: STATE,
+            signature: key(signer).sign(&m),
         })
     }
 
     /// `signer` attests that it received the restored state of the lender of `stage`.
     pub fn corroborate(&mut self, a: &Assignment, stage: u32, signer: u32) -> Res {
-        let producer = a.lenders[stage as usize];
+        self.corroborate_with(&restoration(a, stage, SEGMENTS, STATE), signer)
+    }
+
+    /// `signer` signs exactly `r`; the ledger is told `r.segments` and rebuilds the rest.
+    pub fn corroborate_with(&mut self, r: &Restoration, signer: u32) -> Res {
         self.run(LedgerOp::RecordRestore {
-            job: a.job,
-            attempt: a.attempt,
-            producer,
-            signature: key(signer).sign(&restore_message(a.job, a.attempt, producer, [0; 3])),
+            job: r.job,
+            attempt: r.attempt,
+            producer: r.producer,
+            segments: r.segments,
+            signature: key(signer).sign(&restore_message(r)),
         })
+    }
+
+    /// The clock service moves the ledger's time forward by `dt`.
+    pub fn advance(&mut self, dt: u64) {
+        let now = self.ledger.now() + dt;
+        self.ledger
+            .execute(&self.clock, LedgerOp::Advance { now })
+            .unwrap();
     }
 
     /// `signer` signs a receipt for `producer`'s outputs `0..upto`.

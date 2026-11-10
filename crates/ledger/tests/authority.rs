@@ -131,6 +131,7 @@ fn r2_recovery_split_and_contest_follow_the_ledgers_records() {
             to_owner: 20
         }
     );
+    w.advance(48 * HOUR);
     w.run(LedgerOp::ReleaseReward { line: line(2, L2) })
         .unwrap();
     w.run(LedgerOp::SettleJob { job: JOB }).unwrap();
@@ -285,6 +286,7 @@ fn r2_no_payment_without_the_recipients_receipt() {
     assert!(pay(&mut w, L2, 0, 1).is_ok());
     // The receipt covers output 0 only.
     bad_proof(pay(&mut w, L1, 1, 0));
+    w.advance(48 * HOUR);
     w.run(LedgerOp::ReleaseReward { line: line(1, L1) })
         .unwrap();
     // 6 held, 10 % commission rounded down to 0.
@@ -488,10 +490,12 @@ fn r2_recovery_is_settled_only_on_a_corroborated_restoration() {
         job: JOB,
         attempt: 2,
         producer: MALLORY,
-        signature: key(L2).sign(&more_identity::restore_message(JOB, 3, L1, [0; 3])),
+        segments: SEGMENTS,
+        signature: key(L2).sign(&more_identity::restore_message(&restoration(
+            &honest, 0, SEGMENTS, STATE,
+        ))),
     };
     bad_proof(w.run(replay));
-    let _ = honest;
     // The amount stays reserved, never paid; the only way out is back to the recovery escrow.
     assert_eq!(w.bal(Account::User(MALLORY)), 0);
     w.run(LedgerOp::RefundLine {
@@ -575,7 +579,239 @@ fn r2_a_replayed_receipt_never_pays_twice() {
     let r = w.run(replay(2, 1));
     assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
     // One payment of 6 in all.
+    w.advance(48 * HOUR);
     w.run(LedgerOp::ReleaseReward { line: line(1, L1) })
         .unwrap();
     assert_eq!(w.bal(Account::User(L1)) + w.bal(Account::Commission), 6);
+}
+
+/// Verification 1: what the recipient signs is the restoration itself. Change the job, the
+/// attempt, the lender, the layer range, the positions, the number of segments or the
+/// commitment, and the signature no longer verifies; a corroboration covers the segments it
+/// names and no other recovery.
+#[test]
+fn r2_a_corroboration_is_bound_to_what_was_restored() {
+    let (mut w, _) = World::running();
+    w.fund(40).unwrap();
+    let a = resumed_uncorroborated(&mut w, 2, 40);
+    let good = restoration(&a, 0, 2, STATE);
+    let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // The recipient (L2) signs something else than what the ledger holds for this stage.
+    let altered = [
+        more_identity::Restoration { job: 9, ..good },
+        more_identity::Restoration { attempt: 1, ..good },
+        more_identity::Restoration {
+            producer: L2,
+            ..good
+        },
+        more_identity::Restoration {
+            layers: (0, 4),
+            ..good
+        },
+        more_identity::Restoration {
+            restored: [0, 5, 0],
+            ..good
+        },
+        more_identity::Restoration {
+            state: STATE + 1,
+            ..good
+        },
+        more_identity::Restoration {
+            segments: 3,
+            ..good
+        },
+    ];
+    for r in altered {
+        // The ledger rebuilds the statement from its own records and the announced segments.
+        let op = LedgerOp::RecordRestore {
+            job: JOB,
+            attempt: 2,
+            producer: L1,
+            segments: 2,
+            signature: key(L2).sign(&more_identity::restore_message(&r)),
+        };
+        bad_proof(w.run(op));
+    }
+    assert!(
+        w.corroborate_with(&restoration(&a, 0, 0, STATE), L2)
+            .is_err(),
+        "no segment"
+    );
+    w.corroborate_with(&good, L2).unwrap();
+    // Segments 0 and 1 were attested: they are payable, segment 2 is not.
+    for (segment, amount) in [(0, 10), (1, 10), (2, 10)] {
+        reserve_recovery(&mut w, 2, L1, segment, amount).unwrap();
+    }
+    let pay = |w: &mut World, attempt, lender, segment| {
+        w.run(LedgerOp::PayLine {
+            line: line(attempt, lender),
+            item: ItemId::Recovery { attempt, segment },
+        })
+    };
+    assert!(pay(&mut w, 2, L1, 0).is_ok());
+    assert!(pay(&mut w, 2, L1, 1).is_ok());
+    bad_proof(pay(&mut w, 2, L1, 2));
+    // Not reusable: the same corroboration pays nothing for the other lender of the attempt,
+    // nor on the next attempt of the same lender.
+    reserve_recovery(&mut w, 2, L2, 5, 5).unwrap();
+    bad_proof(pay(&mut w, 2, L2, 5));
+    let next = resumed_uncorroborated(&mut w, 3, 5);
+    reserve_recovery(&mut w, 3, L1, 0, 5).unwrap();
+    bad_proof(pay(&mut w, 3, L1, 0));
+    let replay = LedgerOp::RecordRestore {
+        job: JOB,
+        attempt: 3,
+        producer: L1,
+        segments: 2,
+        signature: key(L2).sign(&more_identity::restore_message(&good)),
+    };
+    bad_proof(w.run(replay));
+    let _ = next;
+}
+
+/// Attempt `n` on the honest lenders, both ready, nothing corroborated.
+fn resumed_uncorroborated(w: &mut World, n: u32, earmark: Amount) -> Assignment {
+    let a = assignment(n, &[L1, L2], &[3, 1], earmark);
+    w.place(&a);
+    w.ready(&a, 0, L1).unwrap();
+    w.ready(&a, 1, L2).unwrap();
+    a
+}
+
+/// Verification 2, proofs: once recorded, a proof is final. A corroboration cannot be replaced,
+/// a receipt cannot come back with another digest, and a paid item never goes back.
+#[test]
+fn r2_a_recorded_proof_cannot_be_replaced() {
+    let (mut w, _) = World::running();
+    w.fund(40).unwrap();
+    w.charge(1, 0).unwrap();
+    reserve_contribution(&mut w, 1, L1, 0, 0).unwrap();
+    w.receipt(1, L1, 1, L2).unwrap();
+    let receipt = |digest| {
+        let m = more_identity::receipt_message(JOB, 1, L1, WT, 1, digest);
+        LedgerOp::RecordReceipt {
+            job: JOB,
+            attempt: 1,
+            producer: L1,
+            wt: WT,
+            upto: 1,
+            digest,
+            signature: key(L2).sign(&m),
+        }
+    };
+    let bad_proof = |r: Res| assert!(matches!(r, Err(LedgerApiError::BadProof(_))), "{r:?}");
+    // The same recipient, validly signing other content for the same coverage: refused before
+    // the payment as well as after it.
+    bad_proof(w.run(receipt(77)));
+    let item = contribution(0, 0);
+    w.run(LedgerOp::PayLine {
+        line: line(1, L1),
+        item,
+    })
+    .unwrap();
+    bad_proof(w.run(receipt(77)));
+    assert!(
+        w.run(receipt(0)).is_ok(),
+        "the same receipt again is a no-op"
+    );
+    // A paid item is not refunded, paid again or voided with its output.
+    for op in [
+        LedgerOp::RefundLine {
+            line: line(1, L1),
+            item,
+        },
+        LedgerOp::PayLine {
+            line: line(1, L1),
+            item,
+        },
+        LedgerOp::VoidOutput {
+            job: JOB,
+            output: out(0),
+            gen: 0,
+        },
+    ] {
+        assert!(w.run(op.clone()).is_err(), "{op:?} after payment");
+    }
+    // Corroborations are written once.
+    let a = resumed_uncorroborated(&mut w, 2, 20);
+    w.corroborate_with(&restoration(&a, 0, 1, STATE), L2)
+        .unwrap();
+    assert!(w
+        .corroborate_with(&restoration(&a, 0, 3, STATE), L2)
+        .is_err());
+    assert!(w
+        .corroborate_with(&restoration(&a, 0, 1, STATE), L2)
+        .is_err());
+    assert_eq!(w.escrow().attempts[&2].corroborated[0], Some(1));
+    // Nor can the lender sign a second, different readiness.
+    assert!(w.ready(&a, 0, L1).is_err());
+}
+
+/// Verification 2, contests: a payment follows an explicit cycle on the ledger's own clock.
+/// Held, it can be contested until the limit; it can be released only after the hold; once
+/// released or contested, it is final. The orchestrator cannot move the clock.
+#[test]
+fn r2_contests_follow_a_bounded_cycle() {
+    let (mut w, _) = World::running();
+    let limits = w.ledger.limits().clone();
+    for pos in 0..3 {
+        w.charge(1, pos).unwrap();
+        reserve_contribution(&mut w, 1, L1, pos, 0).unwrap();
+        reserve_contribution(&mut w, 1, L2, pos, 1).unwrap();
+    }
+    w.receipt(1, L1, 3, L2).unwrap();
+    w.receipt(1, L2, 3, WIT).unwrap();
+    let pay = |w: &mut World, lender, pos, stage| {
+        w.run(LedgerOp::PayLine {
+            line: line(1, lender),
+            item: contribution(pos, stage),
+        })
+        .unwrap()
+    };
+    let window = |r: Res| assert!(matches!(r, Err(LedgerApiError::OutOfWindow(_))), "{r:?}");
+    let release = |lender| LedgerOp::ReleaseReward {
+        line: line(1, lender),
+    };
+    let contest = |lender| LedgerOp::ContestReward {
+        line: line(1, lender),
+    };
+    w.advance(100);
+    pay(&mut w, L1, 0, 0);
+    // Only the Clock service moves the ledger's time; time never goes back.
+    let jump = LedgerOp::Advance {
+        now: w.ledger.now() + limits.reward_hold,
+    };
+    assert!(matches!(w.run(jump), Err(LedgerApiError::Forbidden { .. })));
+    let back = LedgerOp::Advance { now: 0 };
+    assert!(w.ledger.execute(&w.clock.clone(), back).is_err());
+    // Too early to release: the borrower still has its window.
+    window(w.run(release(L1)));
+    w.advance(limits.reward_hold - 1);
+    window(w.run(release(L1)));
+    // A later payment on the same line restarts the hold for the line.
+    pay(&mut w, L1, 1, 0);
+    w.advance(1);
+    window(w.run(release(L1)));
+    w.advance(limits.reward_hold - 1);
+    assert!(w.run(release(L1)).is_ok());
+    // Released is final: nothing left to contest or to release.
+    assert!(w.run(contest(L1)).is_err());
+    assert!(w.run(release(L1)).is_err());
+    // L2's line: paid, contested inside the limit.
+    pay(&mut w, L2, 0, 1);
+    w.advance(limits.contest_limit - 1);
+    assert_eq!(
+        w.run(contest(L2)),
+        Ok(LedgerOutcome::Contested {
+            to_pool: 0,
+            to_owner: 2
+        })
+    );
+    assert!(w.run(release(L2)).is_err(), "contested is final");
+    // Paid again, then left alone past the limit: it can no longer be contested, only released.
+    pay(&mut w, L2, 1, 1);
+    w.advance(limits.contest_limit);
+    window(w.run(contest(L2)));
+    assert!(w.run(release(L2)).is_ok());
+    assert!(limits.reward_hold < limits.contest_limit);
 }

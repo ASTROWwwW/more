@@ -9,7 +9,7 @@ impl Coordinator {
         // Rejected commands roll back with the rest of the state, so sequence numbers have no gaps.
         self.seq += 1;
         match cmd {
-            Tick { dt } => self.tick(*dt),
+            Tick { dt } => self.tick(ctx, *dt),
             Issue { id, to, amount } => self.issue(ctx, *id, *to, *amount),
             CreatePool {
                 pool,
@@ -66,8 +66,9 @@ impl Coordinator {
                 job,
                 attempt,
                 lender,
+                segments,
                 signature,
-            } => self.corroborate_restore(*job, *attempt, *lender, signature),
+            } => self.corroborate_restore(*job, *attempt, *lender, *segments, signature),
             LeaseLoaded {
                 job,
                 attempt,
@@ -126,8 +127,9 @@ impl Coordinator {
                 attempt,
                 lender,
                 restored,
+                state,
                 signature,
-            } => self.attempt_ready(*job, *attempt, *lender, *restored, signature),
+            } => self.attempt_ready(*job, *attempt, *lender, (*restored, *state), signature),
             Produce {
                 job,
                 attempt,

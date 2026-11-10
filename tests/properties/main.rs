@@ -199,6 +199,76 @@ fn delivery_adversary_op() -> impl Strategy<Value = Op> {
 
 /// Coverage check: without it, properties could pass only because interesting paths are never
 /// reached. Each path must be hit a minimum number of times.
+/// Where the time of a checked command goes. Not a correctness test: run it by name to get
+/// the figures of `docs/VALIDATION.md` (`cargo test --release --test properties cost -- --ignored
+/// --nocapture`).
+#[test]
+#[ignore = "measurement, prints figures"]
+fn cost_breakdown() {
+    use proptest::strategy::ValueTree;
+    use std::time::{Duration, Instant};
+
+    let mut runner = TestRunner::deterministic();
+    let (mut time, mut commands, mut checks) = ([Duration::ZERO; 3], 0u64, 0u64);
+    let mut clone_cost = Duration::ZERO;
+    let traces = 400;
+    let start = Instant::now();
+    for _ in 0..traces {
+        let ops = prop::collection::vec(fault_heavy_op(), 220)
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
+        let mut sim = Sim::default();
+        for op in &ops {
+            sim.run_op(op);
+        }
+        sim.drain();
+        assert!(sim.violations.is_empty());
+        for (t, d) in time.iter_mut().zip(sim.time) {
+            *t += d;
+        }
+        commands += (sim.applied + sim.refused) as u64;
+        checks += sim.ids.keys.signature_checks();
+        // The coordinator copies its state once per command (its all-or-nothing step).
+        let t = Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(sim.coord.clone());
+        }
+        clone_cost += t.elapsed() / 20;
+    }
+    let total = start.elapsed();
+    // One Ed25519 check, measured here.
+    let key = user_key(BORROWERS[0]);
+    let dir = more_identity::KeyDirectory::new();
+    dir.register(1, key.public()).unwrap();
+    let sig = key.sign(b"cost");
+    let t = Instant::now();
+    for _ in 0..2_000 {
+        dir.verify(1, b"cost", &sig).unwrap();
+    }
+    let per_check = t.elapsed() / 2_000;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let per_cmd = |d: Duration| d.as_secs_f64() * 1e6 / commands as f64;
+    println!(
+        "traces {traces}, commands {commands}, total {:.0} ms",
+        ms(total)
+    );
+    println!("per command, in microseconds:");
+    println!("  checker's copy of the state      {:.2}", per_cmd(time[0]));
+    println!("  coordinator (command itself)     {:.2}", per_cmd(time[1]));
+    println!("  invariant checker                {:.2}", per_cmd(time[2]));
+    let sig_time = per_check * u32::try_from(checks).unwrap_or(u32::MAX);
+    println!(
+        "inside the coordinator: {checks} signature checks at {:.1} us = {:.2} us per command",
+        per_check.as_secs_f64() * 1e6,
+        per_cmd(sig_time)
+    );
+    println!(
+        "inside the coordinator: one copy of the final state costs {:.2} us on average",
+        clone_cost.as_secs_f64() * 1e6 / f64::from(traces)
+    );
+}
+
 #[test]
 fn generator_reaches_interesting_paths() {
     use proptest::strategy::ValueTree;

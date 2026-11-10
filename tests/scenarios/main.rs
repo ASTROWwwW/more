@@ -21,6 +21,7 @@ fn ready_cmd(job: JobId, attempt: u32, lender: AccountId, restored: PerType<u32>
         attempt,
         lender,
         restored,
+        state: UNSET_STATE,
         signature: UNSIGNED,
     }
 }

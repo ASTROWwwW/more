@@ -81,16 +81,19 @@ fn r2_an_accomplice_cannot_collect_recovery_without_corroboration() {
     // 1. Reserved before anything is settled, within the earmark.
     assert_eq!(line(&sim, accomplice).pending, EARMARK);
     // 2. Nobody but the stage's recipient can corroborate: not the accomplice, not a service.
+    let said = restoration_of(
+        J1,
+        &sim.coord.jobs()[&J1].attempts[&2],
+        accomplice,
+        SEGMENTS,
+    )
+    .expect("the accomplice reported ready");
     let vouch = Command::CorroborateRestore {
         job: J1,
         attempt: 2,
         lender: accomplice,
-        signature: user_key(accomplice).sign(&more_identity::restore_message(
-            J1.0,
-            2,
-            accomplice.0,
-            [0; 3],
-        )),
+        segments: SEGMENTS,
+        signature: user_key(accomplice).sign(&more_identity::restore_message(&said)),
     };
     for ctx in [
         more_identity::assume_account(accomplice.0),

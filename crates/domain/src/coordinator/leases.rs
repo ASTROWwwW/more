@@ -146,7 +146,7 @@ impl Coordinator {
         job: JobId,
         attempt: u32,
         lender: AccountId,
-        restored: PerType<u32>,
+        (restored, commitment): (PerType<u32>, u64),
         signature: &[u8; 64],
     ) -> R<Outcome> {
         let stage = self.placing_stage(job, attempt, lender)?;
@@ -168,10 +168,14 @@ impl Coordinator {
             attempt,
             stage: stage as u32,
             restored,
+            state: commitment,
             signature: *signature,
         })?;
         self.advance_lease(job, attempt, stage, LeaseState::Loaded, LeaseState::Ready)?;
-        self.attempt_mut(job, attempt)?.leases[stage].restored = Some(restored);
+        self.attempt_mut(job, attempt)?.leases[stage].restored = Some(Restored {
+            positions: restored,
+            state: commitment,
+        });
         self.audit.push(AuditEvent::Lease {
             job,
             attempt,
@@ -211,6 +215,7 @@ impl Coordinator {
         job: JobId,
         attempt: u32,
         lender: AccountId,
+        segments: u32,
         signature: &[u8; 64],
     ) -> R<Outcome> {
         let j = self.job(job)?;
@@ -227,20 +232,33 @@ impl Coordinator {
                 "JOB-R18: nothing restored to corroborate",
             ));
         }
-        if lease.corroborated {
-            return Ok(Outcome::AlreadyApplied);
+        // The first corroboration is final: the same one again changes nothing, another one is
+        // refused, so a proof a payment relied on cannot be replaced.
+        match lease.corroborated {
+            Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),
+            Some(_) => {
+                return Err(DomainError::Precondition(
+                    "JOB-R18: restoration already corroborated",
+                ))
+            }
+            None => {}
+        }
+        if segments == 0 {
+            return Err(DomainError::InvalidInput("no segment corroborated"));
         }
         self.ledger_proof(LedgerOp::RecordRestore {
             job: job_acct(job),
             attempt,
             producer: lender.0,
+            segments,
             signature: *signature,
         })?;
-        self.attempt_mut(job, attempt)?.leases[stage].corroborated = true;
+        self.attempt_mut(job, attempt)?.leases[stage].corroborated = Some(segments);
         self.audit.push(AuditEvent::RestoreCorroborated {
             job,
             attempt,
             lender,
+            segments,
         });
         Ok(Outcome::Applied)
     }

@@ -166,7 +166,7 @@ MUTATIONS = [
     ("M68", "Finding 3: line reserved for an account outside the attempt's stage", COORD,
      [("if usize::try_from(stage).ok() != Some(s) {", "if false && usize::try_from(stage).ok() != Some(s) {")]),
     ("M69", "Finding 3: contribution paid without the recipient's receipt", COORD,
-     [("if e.receipts.get(&key).is_none_or(|upto| *upto <= output.pos) {", "if false && e.receipts.get(&key).is_none_or(|upto| *upto <= output.pos) {")]),
+     [("if !e.receipt_covers(key.0, key.1, key.2, output.pos) {", "if false && !e.receipt_covers(key.0, key.1, key.2, output.pos) {")]),
     ("M70", "Finding 3: receipt kept whoever signed it", COORD,
      [(".map_err(|_| proof(\"receipt not signed by the producer's recipient\"))?;", ".ok();")]),
     ("M71", "Finding 3: the caller's share replaces the signed terms (double share)", COORD,
@@ -205,7 +205,7 @@ MUTATIONS = [
     ("M87", "CE-08 back: reconciliation skips a transition the ledger failed", COORD,
      [("Err(DomainError::Ledger(e)) => {\n return Err(DomainError::Internal(format!(\n \"reconcile {cmd:?}: ledger {e:?}\"\n )))\n }", "Err(DomainError::Ledger(_)) => {}")]),
     ("M88", "Ledger pays recovery without a corroborated restoration", COORD,
-     [("if !rec.corroborated[s] {", "if false && !rec.corroborated[s] {")]),
+     [("if !rec.corroborated[s].is_some_and(|n| segment < n) {", "if false && !rec.corroborated[s].is_some_and(|n| segment < n) {")]),
     ("M89", "Restoration corroborated by any signer", COORD,
      [(".map_err(|_| proof(\"restoration not corroborated by the producer's recipient\"))?;", ".ok();")]),
     ("M90", "A ruling pays recovery nobody corroborated", COORD,
@@ -216,6 +216,31 @@ MUTATIONS = [
      [("if lease.state != LeaseState::Ready {\n return Err(DomainError::Precondition(\n \"JOB-R18: nothing restored to corroborate\",", "if false && lease.state != LeaseState::Ready {\n return Err(DomainError::Precondition(\n \"JOB-R18: nothing restored to corroborate\",")]),
     ("M93", "Recovery held before the deadline instead of waiting for its corroboration", COORD,
      [("if before_deadline {\n Decision::Defer\n } else {\n Decision::Dispute", "if false && before_deadline {\n Decision::Defer\n } else {\n Decision::Dispute")]),
+    # ---- verifications asked before validating: content binding, finality, bounded contests
+    ("M94", "A corroboration can be replaced by another one", COORD,
+     [("if !rec.ready[s] || rec.corroborated[s].is_some() || segments == 0 {", "if !rec.ready[s] || segments == 0 {")]),
+    ("M95", "Recovery paid for a segment the corroboration does not cover", COORD,
+     [("if !rec.corroborated[s].is_some_and(|n| segment < n) {", "if rec.corroborated[s].is_none() {")]),
+    ("M96", "A recorded receipt replaced by a contradictory one", COORD,
+     [(".is_some_and(|d| *d != digest)", ".is_some_and(|d| false && *d != digest)")]),
+    ("M97", "Reward released inside the contest window", COORD,
+     [("if self.now < open_until {", "if false && self.now < open_until {")]),
+    ("M98", "Reward contested past the ledger's limit", COORD,
+     [("if self.now >= limit {", "if false && self.now >= limit {")]),
+    ("M99", "The ledger's clock can go back", COORD,
+     [("if now < self.now {", "if false && now < self.now {")]),
+    ("M100", "Coordinator lets a second corroboration through", COORD,
+     [("Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {\n return Err(DomainError::Precondition(\n \"JOB-R18: restoration already corroborated\",\n ))\n }", "Some(n) if n == segments => return Ok(Outcome::AlreadyApplied),\n Some(_) => {}")]),
+    ("M101", "Corroboration signature does not cover the state commitment", COORD,
+     [(".u32(r.segments)\n .u64(r.state)\n .0", ".u32(r.segments)\n .0")]),
+    ("M102", "Corroboration signature does not cover the layer range", COORD,
+     [(".u32(r.producer)\n .u32(r.layers.0)\n .u32(r.layers.1);", ".u32(r.producer);")]),
+    ("M103", "Corroboration signature does not cover the segments", COORD,
+     [(".fold(e, |e, x| e.u32(*x))\n .u32(r.segments)", ".fold(e, |e, x| e.u32(*x))")]),
+    ("M104", "Coordinator ignores the contest limit", COORD,
+     [("if oldest.is_some_and(|t| self.now >= t + limit) {", "if false && oldest.is_some_and(|t| self.now >= t + limit) {")]),
+    ("M105", "Coordinator pays recovery beyond the corroborated segments", COORD,
+     [(".is_some_and(|n| rid.segment < n)", ".is_some()")]),
 ]
 
 EXTRA = {
@@ -296,6 +321,12 @@ def main():
     if "--check" in sys.argv:
         return check_anchors()
     only = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # The campaign is only worth what it was run on: say which commit, and refuse a dirty tree.
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        raise SystemExit(f"working tree not clean, refusing to mutate it:\n{dirty}")
+    print(f"commit {head}", flush=True)
     results = []
     for mid, desc, path, reps in MUTATIONS:
         if only and mid not in only:
@@ -315,11 +346,16 @@ def main():
         finally:
             for f, content in backups.items():
                 open(os.path.join(ROOT, f), "w").write(content)
+        # A mutant that does not compile proves nothing about the tests: it is never "caught".
         status = "COMPILE ERROR" if cerr else ("MISSED" if ok else "caught")
         results.append((mid, desc, status, failed, props))
-        print(f"{mid} {status:22} {desc}\n      tests: {', '.join(failed) or '-'}\n      properties: {', '.join(props) or '-'}", flush=True)
+        print(f"{mid} {status:22} {desc}\n      tests ({len(failed)}): {', '.join(failed) or '-'}\n      properties: {', '.join(props) or '-'}", flush=True)
     caught = sum(1 for r in results if r[2] == "caught")
-    print(f"\n{caught}/{len(results)} mutations caught")
+    broken = [r[0] for r in results if r[2] == "COMPILE ERROR"]
+    missed = [r[0] for r in results if r[2] == "MISSED"]
+    print(f"\n{caught}/{len(results)} mutations caught by a failing test")
+    print(f"compile errors (not counted): {', '.join(broken) or 'none'}")
+    print(f"missed: {', '.join(missed) or 'none'}")
     return 0 if caught == len(results) else 1
 
 

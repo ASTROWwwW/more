@@ -130,7 +130,7 @@ fn items(job: u32, e: &Escrow, out: &mut Vec<Violation>) {
                 let covered = e
                     .receipts
                     .get(&(it.line.attempt, it.line.lender, output.wt))
-                    .is_some_and(|u| *u > output.pos);
+                    .is_some_and(|r| r.keys().any(|u| *u > output.pos));
                 if it.state == ItemState::Paid && !covered {
                     p30(
                         out,
@@ -145,7 +145,7 @@ fn items(job: u32, e: &Escrow, out: &mut Vec<Violation>) {
                     );
                 }
             }
-            ItemId::Recovery { .. } => {
+            ItemId::Recovery { segment, .. } => {
                 if !a.ready.iter().all(|r| *r) {
                     p30(
                         out,
@@ -154,7 +154,7 @@ fn items(job: u32, e: &Escrow, out: &mut Vec<Violation>) {
                         ),
                     );
                 }
-                if it.state == ItemState::Paid && !a.corroborated[s] {
+                if it.state == ItemState::Paid && !a.corroborated[s].is_some_and(|n| *segment < n) {
                     p30(
                         out,
                         format!("job {job}: {id:?} paid without a corroborated restoration"),
@@ -184,7 +184,7 @@ pub(super) fn recovery(c: &Coordinator, out: &mut Vec<Violation>) {
             .and_then(|j| j.attempts.get(&rid.attempt))
             .and_then(|a| {
                 let s = a.lenders.iter().position(|l| l == lender)?;
-                Some(a.ready && a.leases[s].corroborated)
+                Some(a.ready && a.leases[s].corroborated.is_some_and(|n| rid.segment < n))
             })
             .unwrap_or(false);
         if !corroborated {
@@ -230,6 +230,98 @@ pub(super) fn receipts_step(before: &Coordinator, after: &Coordinator) -> Vec<Vi
                     "{slice:?}/{lender:?}: {cid:?} refunded although its receipt was presented"
                 ),
             ));
+        }
+    }
+    out
+}
+
+/// TEST-P33 (LEDGER-018), on the ledger's records before and after one command: a recorded proof
+/// is never replaced, a payment never undone, and a held reward leaves only through the cycle:
+/// released after the hold, contested before the limit, by the ledger's own clock.
+pub(super) fn finality_step(
+    before: &Coordinator,
+    cmd: &Command,
+    after: &Coordinator,
+    auditor: &ServiceCredential,
+) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let (Ok(old), Ok(new)) = (
+        before.ledger_service().audit_escrows(auditor),
+        after.ledger_service().audit_escrows(auditor),
+    ) else {
+        return out;
+    };
+    let now = before.ledger_service().now();
+    let limits = before.ledger_service().limits();
+    let mut p33 = |detail: String| out.push(v("TEST-P33", detail));
+    for (job, a) in old {
+        let Some(b) = new.get(job) else {
+            p33(format!("job {job}: records dropped by {cmd:?}"));
+            continue;
+        };
+        for (key, receipts) in &a.receipts {
+            for (upto, digest) in receipts {
+                if b.receipts.get(key).and_then(|r| r.get(upto)) != Some(digest) {
+                    p33(format!(
+                        "job {job}: receipt {key:?}/{upto} replaced by {cmd:?}"
+                    ));
+                }
+            }
+        }
+        for (n, x) in &a.attempts {
+            let Some(y) = b.attempts.get(n) else {
+                p33(format!("job {job}: attempt {n} dropped by {cmd:?}"));
+                continue;
+            };
+            for s in 0..x.accepted.len() {
+                let kept = (!x.accepted[s] || y.accepted[s])
+                    && (!x.ready[s] || (y.ready[s] && y.state[s] == x.state[s]))
+                    && (x.corroborated[s].is_none() || y.corroborated[s] == x.corroborated[s]);
+                if !kept {
+                    p33(format!(
+                        "job {job}: signed lease {n}/{s} changed by {cmd:?}"
+                    ));
+                }
+            }
+        }
+        let mut left: Vec<u64> = Vec::new();
+        for (id, i) in &a.items {
+            let Some(j) = b.items.get(id) else {
+                p33(format!("job {job}: {id:?} dropped by {cmd:?}"));
+                continue;
+            };
+            let ok = match i.state {
+                ItemState::Reserved => true,
+                ItemState::Refunded => j.state == ItemState::Refunded,
+                ItemState::Paid => {
+                    if j.rewarded && !i.rewarded {
+                        left.extend(i.paid_at);
+                    }
+                    j.state == ItemState::Paid
+                        && (j.amount, j.paid_at) == (i.amount, i.paid_at)
+                        && (j.rewarded || !i.rewarded)
+                }
+            };
+            if !ok {
+                p33(format!("job {job}: decided {id:?} changed by {cmd:?}"));
+            }
+        }
+        if let (Some(oldest), Some(latest)) = (left.iter().min(), left.iter().max()) {
+            match cmd {
+                Command::ReleaseReward { .. } | Command::Reconcile => {
+                    if now < latest + limits.reward_hold {
+                        p33(format!(
+                            "job {job}: reward released inside the contest window"
+                        ));
+                    }
+                }
+                Command::ContestReward { .. } => {
+                    if now >= oldest + limits.contest_limit {
+                        p33(format!("job {job}: reward contested past the limit"));
+                    }
+                }
+                other => p33(format!("job {job}: {other:?} closed a held reward")),
+            }
         }
     }
     out

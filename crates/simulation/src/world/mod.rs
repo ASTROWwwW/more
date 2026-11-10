@@ -9,7 +9,8 @@ use gpu_domain::*;
 use gpu_ledger::{LedgerLimits, LedgerService};
 use more_identity::{
     assume_account, lease_message, mandate_message, ready_message, receipt_message, relay_message,
-    restore_message, Assignment, IdentityAuthority, JobTerms, KeyDirectory, ServiceRole, UserKey,
+    restore_message, Assignment, IdentityAuthority, JobTerms, KeyDirectory, Restoration,
+    ServiceRole, UserKey,
 };
 
 use crate::invariants::{check_state, check_step, Violation};
@@ -21,7 +22,10 @@ mod operations;
 mod resolve;
 mod setup;
 
-pub use identity::{assignment_of, SimIdentity, UNSET_CONFIG, UNSIGNED};
+pub use identity::{
+    assignment_of, restoration_of, state_commitment, SimIdentity, SEGMENTS, UNSET_CONFIG,
+    UNSET_STATE, UNSIGNED,
+};
 pub use operations::{op_strategy, Op};
 use operations::{pick, wt_of};
 pub use setup::*;
@@ -39,6 +43,8 @@ pub struct Sim {
     pub structural_claims: Vec<(SliceId, AccountId, ContributionId)>,
     /// Rejections per error type (coverage).
     pub refusal_counts: std::collections::BTreeMap<String, u64>,
+    /// Where the time goes: copying the state for the checker, running the command, checking.
+    pub time: [std::time::Duration; 3],
 }
 
 impl Default for Sim {
@@ -61,6 +67,7 @@ impl Sim {
             refused: 0,
             structural_claims: Vec::new(),
             refusal_counts: Default::default(),
+            time: Default::default(),
         };
         for c in setup_commands() {
             sim.exec(c).expect("setup must succeed");
@@ -79,6 +86,7 @@ impl Sim {
             refused: 0,
             structural_claims: Vec::new(),
             refusal_counts: Default::default(),
+            time: Default::default(),
         }
     }
 
@@ -146,8 +154,11 @@ impl Sim {
     /// Applies a command sent by `ctx` and checks every property, including TEST-P29.
     pub fn exec_as(&mut self, ctx: &AuthContext, cmd: Command) -> Result<Outcome, DomainError> {
         let cmd = self.signed(ctx, cmd);
+        let t0 = std::time::Instant::now();
         let before = self.coord.clone();
+        let t1 = std::time::Instant::now();
         let res = self.coord.execute(ctx, &cmd);
+        let t2 = std::time::Instant::now();
         if let (
             Ok(Outcome::Applied),
             Command::Claim {
@@ -167,6 +178,9 @@ impl Sim {
                 self.violations.push(v);
             }
         }
+        self.time[0] += t1 - t0;
+        self.time[1] += t2 - t1;
+        self.time[2] += t2.elapsed();
         match &res {
             Ok(_) => self.applied += 1,
             Err(e) => {

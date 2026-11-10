@@ -5,12 +5,20 @@ use super::*;
 impl Coordinator {
     /// Advances the coordinator clock. SAFE-001: time stays below `MAX_TIME`, so `time + duration`
     /// never overflows.
-    pub(super) fn tick(&mut self, dt: Time) -> R<Outcome> {
+    ///
+    /// The clock's own credential moves the ledger's clock too (LEDGER-018): the orchestrator
+    /// cannot open or close a contest window on its own.
+    pub(super) fn tick(&mut self, ctx: &AuthContext, dt: Time) -> R<Outcome> {
         self.now = self
             .now
             .checked_add(dt)
             .filter(|t| *t <= MAX_TIME)
             .ok_or(DomainError::Overflow("clock beyond MAX_TIME"))?;
+        let clock = ctx
+            .credential()
+            .ok_or(DomainError::Unauthorized("only the clock"))?;
+        self.ledger
+            .execute(clock, LedgerOp::Advance { now: self.now })?;
         Ok(Outcome::Applied)
     }
 
