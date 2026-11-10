@@ -514,8 +514,16 @@ fn check(w: &World, c: &Call) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// 512 sequences by default; `PROPTEST_CASES` overrides it for long campaigns.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(), failure_persistence: None, ..ProptestConfig::default() })]
 
     #[test]
     fn p30_hostile_orchestrator_never_moves_credits_it_should_not(
