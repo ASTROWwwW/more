@@ -371,7 +371,7 @@ MUTATIONS = [
      [("if role != op.required_role() {", "if false && role != op.required_role() {")]),
     # ---- third review of the isolation: outcomes, deadlines, restarts, socket access
     ("M168", "Link: the owner of a rolled-back transaction goes on outside it", COORD,
-     [("if self.expired.remove(&conn) {", "if false && self.expired.remove(&conn) {")]),
+     [("if self.expired.contains(&conn) {", "if false && self.expired.contains(&conn) {")]),
     ("M169", "Link: a transaction's deadline does not bind its owner", COORD,
      [("self.sweep(now_ms);", "if self.tx.as_ref().is_some_and(|tx| tx.conn != conn) {\n self.sweep(now_ms);\n }")]),
     ("M170", "Link: a nested transaction restarts the deadline", COORD,
@@ -379,11 +379,11 @@ MUTATIONS = [
     ("M171", "Link: a connection that is gone stays on the list of expired ones", COORD,
      [("conn.state = State::Closed;\n self.expired.remove(&conn.id);", "conn.state = State::Closed;")]),
     ("M172", "Link: a transaction name can be used twice", COORD,
-     [("Request::Begin { id } if self.outcomes.contains_key(&id) => {\n Response::Refused(Refusal::TransactionKnown)\n }", "")]),
+     [("Request::Begin { id } if self.names.get(&me).is_some_and(|last| id <= *last) => {\n Response::Refused(Refusal::TransactionKnown)\n }", "")]),
     ("M173", "Link: what became of a closed transaction is not recorded", COORD,
-     [("self.record(id, state);", "let _ = (id, state);")]),
+     [("self.record(name, state);", "let _ = (name, state);")]),
     ("M174", "Link: a rollback is recorded as a commit", COORD,
-     [("self.record(id, TxState::RolledBack(why));", "let _ = why;\n self.record(id, TxState::Committed { seq: 0 });")]),
+     [("self.record(name, TxState::RolledBack(why));", "let _ = why;\n self.record(name, TxState::Committed { seq: 0 });")]),
     ("M175", "Link: the outcome log grows without bound", COORD,
      [("while self.order.len() > self.limits.tx_log {", "while false && self.order.len() > self.limits.tx_log {")]),
     ("M176", "Link: any service may ask what became of a transaction", COORD,
@@ -448,6 +448,15 @@ MUTATIONS = [
      [("stream.set_read_timeout(Some(wait)).map_err(io)?;", "")]),
     ("M206", "Daemon: an option given twice is silently accepted", COORD,
      [("Some(_) => Err(format!(\"{flag} given more than once\")),", "Some(many) => Ok(many.last().copied()),")]),
+    # ---- fourth review of the isolation: names after eviction, connections after expiry
+    ("M207", "Link: a connection whose transaction expired is served again after one refusal", COORD,
+     [("if self.expired.contains(&conn) {", "if self.expired.remove(&conn) {")]),
+    ("M208", "Link: a name is refused only while its outcome is remembered", COORD,
+     [("self.names.get(&me).is_some_and(|last| id <= *last)", "self.outcomes.contains_key(&(me, id))")]),
+    ("M209", "Link: an earlier instance of a service goes on after a later one began", COORD,
+     [("self.names.get(&me).is_some_and(|last| id <= *last)", "self.names.get(&me).is_some_and(|last| id.node == last.node && id <= *last)")]),
+    ("M210", "Link: a transaction is reported open to a service that does not own it", COORD,
+     [(".is_some_and(|tx| tx.owner == me && tx.id == id);", ".is_some_and(|tx| tx.id == id);")]),
 ]
 
 EXTRA = {
