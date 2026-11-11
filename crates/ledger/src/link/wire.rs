@@ -799,9 +799,13 @@ pub(crate) fn get_error(r: &mut R) -> Res<LedgerApiError> {
     })
 }
 
-/// Name of a transaction, chosen by the orchestrator and never used twice: its incarnation and
-/// a counter. The ledger remembers what became of it (`TxStatus`), so a lost answer to `Commit`
-/// can be asked again instead of guessed.
+/// Name of a transaction, chosen by the orchestrator and never used twice: its instance number
+/// and a counter. The ledger remembers what became of it (`TxStatus`), so a lost answer to
+/// `Commit` can be asked again instead of guessed.
+///
+/// The names of a service only grow, in the order (instance, counter): the ledger refuses one
+/// that is not above the last that service began. A later instance of a service therefore
+/// takes a higher instance number, and shuts the earlier one out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TxId {
     /// The orchestrator instance that opened it.
@@ -956,10 +960,12 @@ pub enum Refusal {
     TransactionTooLarge,
     /// This connection already has a transaction: nest with `Savepoint`.
     TransactionOpen,
-    /// The name was already used. Ask `TxStatus` what became of it; it is never run again.
+    /// The name is spent: it is not above the last one this service began. Ask `TxStatus` what
+    /// became of it; it is never run again, even once its outcome is forgotten.
     TransactionKnown,
     /// The connection's transaction outlived its deadline and was rolled back. Nothing sent
-    /// since was applied, this request included.
+    /// since was applied, this request included, and nothing will be: only `TxStatus` is
+    /// still answered on this connection.
     TransactionExpired,
 }
 

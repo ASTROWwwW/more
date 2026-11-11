@@ -147,8 +147,9 @@ impl Coordinator {
     /// clock and the registration of pool admins belong to other services, which hold their own
     /// keys and talk to the ledger themselves.
     ///
-    /// `node` names this coordinator instance in its transactions. It must not be reused by
-    /// another instance talking to the same ledger incarnation.
+    /// `node` names this coordinator instance in its transactions. An instance started later
+    /// with the same credential must take a higher number: the ledger then refuses the earlier
+    /// one, and refuses a number that is not higher.
     pub fn with_remote_ledger(
         cfg: Config,
         port: Arc<Mutex<dyn RemoteLedger>>,

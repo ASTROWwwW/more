@@ -436,3 +436,58 @@ fn r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome() {
     t.both(Command::Reconcile).unwrap();
     t.in_step();
 }
+
+/// Fourth review of the isolation. A command takes so long that the ledger's deadline passes
+/// before its commit. The ledger rolls the transaction back and takes nothing more from that
+/// connection. The coordinator keeps nothing of the command; this is not an unknown outcome,
+/// the ledger said no. Its connection is of no further use: every command fails until it is
+/// given a new one, and then it is where the reference is.
+#[test]
+fn r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead() {
+    let mut t = Rigged::new(HostLimits::default());
+    let before = t.behind().clone();
+    let ledger = t.ledger();
+    // The deadline passes just before the commit of the next command reaches the ledger.
+    let host = t.host.clone();
+    let mut fired = false;
+    t.faults.arm(move |r| {
+        if matches!(r, Request::Commit) && !fired {
+            fired = true;
+            host.lock().unwrap().sweep(u64::MAX);
+        }
+        None
+    });
+    let answer = t.remote(reserve_j2());
+    assert!(
+        matches!(answer, Err(DomainError::Ledger(LedgerApiError::Unavailable(why))) if why.contains("expired")),
+        "{answer:?}"
+    );
+    assert_eq!(
+        t.behind().unknown_commit(),
+        None,
+        "the ledger answered: not applied"
+    );
+    assert!(*t.behind() == before);
+    assert_eq!(t.ledger(), ledger, "nothing of the command was kept");
+    // The same connection again: refused each time, and nothing lands outside a transaction.
+    for cmd in [reserve_j2(), Command::Reconcile, reserve_j2()] {
+        let again = t.remote(cmd);
+        assert!(
+            matches!(
+                again,
+                Err(DomainError::Ledger(LedgerApiError::Unavailable(_)))
+            ),
+            "{again:?}"
+        );
+    }
+    assert!(*t.behind() == before);
+    assert_eq!(t.ledger(), ledger);
+    drop(before);
+    t.reconnect().unwrap();
+    t.in_step();
+    assert_eq!(t.both(reserve_j2()), Ok(Outcome::Applied));
+    t.both(Command::Tick { dt: 5 }).unwrap();
+    t.in_step();
+    assert_eq!(t.host.lock().unwrap().retained().0, 0);
+    assert!(t.sim.violations.is_empty(), "{:#?}", t.sim.violations);
+}

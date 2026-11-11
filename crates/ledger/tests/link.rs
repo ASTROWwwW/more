@@ -1058,13 +1058,18 @@ fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
     w.open(JOB, 500).unwrap();
     let limit = HostLimits::default().tx_timeout_ms;
     let at = |ms: u64| env.now_ms.store(ms, Ordering::Relaxed);
-    let mut orch = connect(&w, &env, &w.orch).unwrap();
+    // A connection whose transaction expired is of no further use (fourth review): each case
+    // takes a new one, as a client that was refused would.
+    let dial = || connect(&w, &env, &w.orch).unwrap();
+    let mut asking = dial();
     let mut clock = connect(&w, &env, &w.clock).unwrap();
     let before = state(&w);
     let expired = Err(LinkError::Refused(Refusal::TransactionExpired));
     let late = Err(LinkError::Refused(Refusal::TransactionExpired));
+    let kept = |n: usize| assert_eq!(host_of(&w).lock().unwrap().retained().0, n);
 
     // 1. Active past its deadline: the owner keeps sending, nobody else is there.
+    let mut orch = dial();
     orch.begin(tx(1)).unwrap().unwrap();
     orch.execute(reserve(1)).unwrap().unwrap();
     at(limit - 1);
@@ -1076,15 +1081,17 @@ fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
         "rolled back, and the late reserve was not applied alone"
     );
     assert_eq!(status(&mut orch, 1), TxState::RolledBack(Rollback::Expired));
-    // Told once: the connection works again, outside any transaction.
-    assert_eq!(
-        orch.commit(),
-        Err(LinkError::Refused(Refusal::NoTransaction))
-    );
-    assert_eq!(host_of(&w).lock().unwrap().retained().0, 0);
+    // Not told once and then served again: refused for as long as the connection lasts.
+    assert_eq!(orch.commit(), late);
+    assert_eq!(orch.execute(reserve(3)), expired);
+    assert!(state(&w) == before);
+    kept(1);
+    drop(orch);
+    kept(0);
 
     // 2. Idle: the owner sends nothing more and nobody else asks. The sweep ends it.
     at(10 * limit);
+    let mut orch = dial();
     orch.begin(tx(2)).unwrap().unwrap();
     orch.execute(reserve(4)).unwrap().unwrap();
     {
@@ -1109,13 +1116,12 @@ fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
         "a reserve meant for the transaction did not land"
     );
     assert_eq!(status(&mut orch, 2), TxState::RolledBack(Rollback::Expired));
-    assert_eq!(
-        orch.commit(),
-        Err(LinkError::Refused(Refusal::NoTransaction))
-    );
+    assert_eq!(orch.commit(), late);
+    drop(orch);
 
     // 3. Nested: the deadline is the outermost one's.
     at(20 * limit);
+    let mut orch = dial();
     orch.begin(tx(3)).unwrap().unwrap();
     at(21 * limit - 1);
     orch.savepoint().unwrap().unwrap();
@@ -1123,18 +1129,25 @@ fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
     at(21 * limit);
     assert_eq!(orch.commit(), late, "a late nested commit");
     assert!(state(&w) == advanced);
-    assert_eq!(status(&mut orch, 3), TxState::RolledBack(Rollback::Expired));
+    assert_eq!(
+        status(&mut asking, 3),
+        TxState::RolledBack(Rollback::Expired)
+    );
+    drop(orch);
 
     // 4. A commit that arrives after the deadline is refused like the rest.
     at(30 * limit);
+    let mut orch = dial();
     orch.begin(tx(4)).unwrap().unwrap();
     orch.execute(reserve(7)).unwrap().unwrap();
     at(31 * limit);
     assert_eq!(orch.commit(), late);
     assert!(state(&w) == advanced);
+    drop(orch);
 
     // 5. Another client showing up after the deadline ends it too, and the owner still learns.
     at(40 * limit);
+    let mut orch = dial();
     orch.begin(tx(5)).unwrap().unwrap();
     orch.execute(reserve(8)).unwrap().unwrap();
     at(41 * limit - 1);
@@ -1149,21 +1162,23 @@ fn r5_a_deadline_binds_the_owner_of_a_transaction_too() {
         .unwrap();
     assert_eq!(orch.execute(reserve(8)), expired);
     assert_eq!(state(&w).now(), 9);
-    assert_eq!(orch.balance(Account::EscrowWork(JOB)).unwrap(), Ok(0));
+    assert_eq!(asking.balance(Account::EscrowWork(JOB)).unwrap(), Ok(0));
+    drop(orch);
+    kept(0);
 
     // 6. A connection that goes away after its transaction expired leaves nothing behind.
     at(50 * limit);
-    let mut gone = connect(&w, &env, &w.orch).unwrap();
+    let mut gone = dial();
     gone.begin(tx(6)).unwrap().unwrap();
     host_of(&w).lock().unwrap().sweep(51 * limit);
-    assert_eq!(host_of(&w).lock().unwrap().retained().0, 1);
+    kept(1);
     drop(gone);
-    assert_eq!(host_of(&w).lock().unwrap().retained().0, 0);
+    kept(0);
     // A clock that goes back never ends a transaction.
     at(60 * limit);
-    orch.begin(tx(7)).unwrap().unwrap();
+    asking.begin(tx(7)).unwrap().unwrap();
     assert!(!host_of(&w).lock().unwrap().sweep(0));
-    orch.abort().unwrap().unwrap();
+    asking.abort().unwrap().unwrap();
 }
 
 /// Third review of the isolation, unknown outcomes. A transaction has a name the ledger
@@ -1271,6 +1286,182 @@ fn r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once() {
     );
 }
 
+/// Fourth review of the isolation, first finding. The ledger remembers a bounded number of
+/// outcomes, and it refused a name only while its outcome was remembered: once forgotten, the
+/// name could be run again, and a coordinator asking about its commit would have been told
+/// what became of someone else's run. A name is spent for good. The names of a service only
+/// grow, which takes one name of memory per service, and they are its own: another service
+/// neither reads nor takes them.
+#[test]
+fn r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten() {
+    let mut w = bare_world();
+    let limits = HostLimits {
+        tx_log: 3,
+        ..HostLimits::default()
+    };
+    let service = LedgerService::new(w.auth.verifier(), w.keys.clone(), LedgerLimits::default());
+    let host = LedgerHost::new(
+        service,
+        w.keys.clone(),
+        w.auth.verifier(),
+        w.ledger_id.clone(),
+        limits,
+        INCARNATION,
+    )
+    .unwrap();
+    let host = Arc::new(Mutex::new(host));
+    let env = TestEnv::default();
+    let verifier = w.auth.verifier();
+    let dial = |me: &ServiceCredential| {
+        let link = Loopback::new(host.clone(), Box::new(env.clone()));
+        LedgerClient::connect(link, me, &verifier, [1; 32]).unwrap()
+    };
+    let known = Err(LinkError::Refused(Refusal::TransactionKnown));
+    let mut orch = dial(&w.orch);
+    orch.begin(tx(1)).unwrap().unwrap();
+    orch.commit().unwrap().unwrap();
+    let committed = status(&mut orch, 1);
+    assert!(matches!(committed, TxState::Committed { .. }));
+    // Three more transactions push the first outcome out of the log.
+    for n in 2..=4 {
+        orch.begin(tx(n)).unwrap().unwrap();
+        orch.abort().unwrap().unwrap();
+    }
+    assert_eq!(host.lock().unwrap().retained().1, 3);
+    assert_eq!(status(&mut orch, 1), TxState::Unknown, "forgotten");
+    // The attack: run the forgotten name again and abort it, so that whoever asks about the
+    // commit of transaction 1 is told "rolled back".
+    assert_eq!(orch.begin(tx(1)), known);
+    assert_eq!(
+        orch.abort(),
+        Err(LinkError::Refused(Refusal::NoTransaction))
+    );
+    assert_eq!(
+        status(&mut orch, 1),
+        TxState::Unknown,
+        "still forgotten, not rewritten"
+    );
+    // From another connection of the same service too, and for every name already passed.
+    let mut again = dial(&w.orch);
+    for n in 1..=4 {
+        assert_eq!(again.begin(tx(n)), known, "name {n}");
+    }
+    assert_eq!(host.lock().unwrap().retained().1, 3, "nothing was recorded");
+    again.begin(tx(5)).unwrap().unwrap();
+    // Spent as soon as it is begun, not only once it has ended.
+    again.abort().unwrap().unwrap();
+    assert_eq!(again.begin(tx(5)), known);
+    // A refused Begin spends nothing.
+    again.begin(tx(6)).unwrap().unwrap();
+    assert_eq!(
+        again.begin(tx(9)),
+        Err(LinkError::Refused(Refusal::TransactionOpen))
+    );
+    again.commit().unwrap().unwrap();
+    again.begin(tx(7)).unwrap().unwrap();
+    again.commit().unwrap().unwrap();
+    // A later instance of the service takes a higher number. From then on the earlier one is
+    // out, whatever counter it comes back with.
+    let newer = TxId {
+        node: 7,
+        counter: 1,
+    };
+    again.begin(newer).unwrap().unwrap();
+    again.commit().unwrap().unwrap();
+    let older = TxId {
+        node: 1,
+        counter: u64::MAX,
+    };
+    assert_eq!(orch.begin(older), known);
+    assert_eq!(again.begin(newer), known);
+    // Names belong to the service that used them. Another orchestrator service has its own:
+    // it is told nothing of these, and what it runs under the same name rewrites nothing.
+    let second = w.auth.issue(ServiceRole::Orchestrator);
+    let mut other = dial(&second);
+    let (theirs, _) = other.tx_status(newer).unwrap().unwrap();
+    assert_eq!(theirs, TxState::Unknown);
+    let (kept, _) = orch.tx_status(newer).unwrap().unwrap();
+    assert!(matches!(kept, TxState::Committed { .. }));
+    other.begin(newer).unwrap().unwrap();
+    let (mine, _) = orch.tx_status(newer).unwrap().unwrap();
+    assert_eq!(
+        mine, kept,
+        "not reported open because another service runs that name"
+    );
+    let (theirs, _) = other.tx_status(newer).unwrap().unwrap();
+    assert_eq!(theirs, TxState::Open);
+    other.abort().unwrap().unwrap();
+    let (mine, _) = orch.tx_status(newer).unwrap().unwrap();
+    assert_eq!(mine, kept, "not rewritten by another service");
+    let (theirs, _) = other.tx_status(newer).unwrap().unwrap();
+    assert_eq!(theirs, TxState::RolledBack(Rollback::Asked));
+}
+
+/// Fourth review of the isolation, second finding. After its transaction expired, a connection
+/// was refused once and then served again: a client that ignored the refusal could send the
+/// rest of the transaction one operation at a time, outside any transaction. Such a connection
+/// is now refused everything until it closes, except the question of what became of a
+/// transaction.
+#[test]
+fn r6_a_connection_whose_transaction_expired_is_refused_until_it_closes() {
+    let (mut w, env) = wired();
+    w.open(JOB, 500).unwrap();
+    let limit = HostLimits::default().tx_timeout_ms;
+    let mut orch = connect(&w, &env, &w.orch).unwrap();
+    let mut clock = connect(&w, &env, &w.clock).unwrap();
+    let before = state(&w);
+    orch.begin(tx(1)).unwrap().unwrap();
+    orch.execute(reserve(1)).unwrap().unwrap();
+    assert!(host_of(&w).lock().unwrap().sweep(limit));
+    assert!(state(&w) == before);
+    #[track_caller]
+    fn expired<V: std::fmt::Debug>(answer: Result<V, LinkError>) {
+        match answer {
+            Err(LinkError::Refused(Refusal::TransactionExpired)) => {}
+            other => panic!("served after its transaction expired: {other:?}"),
+        }
+    }
+    // The client is told, and does not care: it sends the rest of what it had planned.
+    expired(orch.execute(reserve(2)));
+    for n in 3..8 {
+        expired(orch.execute(reserve(n)));
+    }
+    expired(orch.commit());
+    expired(orch.abort());
+    expired(orch.savepoint());
+    // Nor does it start over on that connection.
+    expired(orch.begin(tx(2)));
+    expired(orch.execute(reserve(9)));
+    expired(orch.info());
+    expired(orch.balance(Account::EscrowWork(JOB)));
+    assert!(
+        state(&w) == before,
+        "nothing of the expired transaction was applied"
+    );
+    // What became of it can still be asked there.
+    assert_eq!(status(&mut orch, 1), TxState::RolledBack(Rollback::Expired));
+    assert_eq!(
+        status(&mut orch, 2),
+        TxState::Unknown,
+        "the refused Begin spent no name"
+    );
+    // The others are not concerned.
+    clock
+        .execute(LedgerOp::Advance { now: 5 })
+        .unwrap()
+        .unwrap();
+    // The ledger remembers such a connection for as long as it is open, and no longer.
+    assert_eq!(host_of(&w).lock().unwrap().retained().0, 1);
+    drop(orch);
+    assert_eq!(host_of(&w).lock().unwrap().retained().0, 0);
+    // The service itself is not banned: on a new connection it works.
+    let mut fresh = connect(&w, &env, &w.orch).unwrap();
+    fresh.begin(tx(2)).unwrap().unwrap();
+    fresh.execute(reserve(1)).unwrap().unwrap();
+    fresh.commit().unwrap().unwrap();
+    assert_eq!(fresh.balance(Account::EscrowWork(JOB)).unwrap(), Ok(10));
+}
+
 /// A link that loses the answers it is told to lose, and otherwise works.
 struct Lossy {
     inner: Loopback,
@@ -1331,7 +1522,16 @@ fn r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead() 
     let why = not_applied(RemoteLedger::commit(&mut orch));
     assert!(why.contains("expired"), "{why}");
     assert!(state(&w) == before);
-    // The connection is still good after a refusal.
+    // That connection is of no further use (fourth review), and says why each time.
+    let again = RemoteLedger::begin(&mut orch, tx(3));
+    assert!(
+        matches!(again, Err(LedgerApiError::Unavailable(why)) if why.contains("expired")),
+        "{again:?}"
+    );
+    assert_eq!(status(&mut asking, 3), TxState::Unknown);
+    let mut orch = lossy(&w);
+    // A plain refusal leaves a connection as it was.
+    not_applied(RemoteLedger::commit(&mut orch));
     RemoteLedger::begin(&mut orch, tx(3)).unwrap();
     RemoteLedger::execute(&mut orch, reserve(1)).unwrap();
 

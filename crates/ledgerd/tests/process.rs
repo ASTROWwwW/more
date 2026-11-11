@@ -635,18 +635,30 @@ fn r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself() {
     std::thread::sleep(Duration::from_millis(2_000));
     assert_eq!(asking.tx_status(tx(1)).unwrap().unwrap().0, expired);
     assert!(state(&mut auditor) == before, "rolled back");
-    // The owner comes back and goes on with what it believes is its transaction.
+    // The owner comes back and goes on with what it believes is its transaction. It is told
+    // no, and told no again if it insists (fourth review): nothing lands outside a transaction.
     assert_eq!(owner.execute(reserve_op(2)), late);
-    assert!(
-        state(&mut auditor) == before,
-        "the late reserve did not land alone"
-    );
+    for n in 3..6 {
+        assert_eq!(owner.execute(reserve_op(n)), late);
+    }
     assert_eq!(
         owner.commit(),
-        Err(LinkError::Refused(Refusal::NoTransaction))
+        Err(LinkError::Refused(Refusal::TransactionExpired))
     );
+    assert_eq!(
+        owner.begin(tx(9)),
+        Err(LinkError::Refused(Refusal::TransactionExpired))
+    );
+    assert!(
+        state(&mut auditor) == before,
+        "nothing sent after the deadline was applied"
+    );
+    // That connection can still ask what happened, and nothing else. The next ones are new.
+    assert_eq!(owner.tx_status(tx(1)).unwrap().unwrap().0, expired);
+    drop(owner);
 
     // 2. Active: the owner never stops, and no one else asks anything.
+    let mut owner = dial(&w.orch);
     owner.begin(tx(2)).unwrap().unwrap();
     let mut accepted = 0u32;
     let stopped = eventually(|| match owner.execute(reserve_op(100 + accepted)) {
@@ -666,6 +678,8 @@ fn r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself() {
     assert!(state(&mut auditor) == before);
 
     // 3. Nested: a savepoint late in the transaction does not buy time.
+    drop(owner);
+    let mut owner = dial(&w.orch);
     let begun = Instant::now();
     owner.begin(tx(3)).unwrap().unwrap();
     std::thread::sleep(Duration::from_millis(500));
@@ -681,7 +695,9 @@ fn r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself() {
     );
     assert!(state(&mut auditor) == before);
 
-    // The connection is as good as new, and a transaction within its time commits.
+    // On a new connection, a transaction within its time commits.
+    drop(owner);
+    let mut owner = dial(&w.orch);
     owner.begin(tx(4)).unwrap().unwrap();
     owner.execute(reserve_op(4)).unwrap().unwrap();
     owner.commit().unwrap().unwrap();
@@ -696,6 +712,37 @@ fn r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself() {
         said.contains(more_ledgerd::SWEPT),
         "the timer ended nothing: {said}"
     );
+}
+
+/// Fourth review of the isolation, against the real process: the daemon remembers 1,024
+/// outcomes. After more transactions than that, the first name is still refused, from any
+/// connection of the service, and nothing is known of it any more.
+#[test]
+fn r6_the_daemon_refuses_a_name_whose_outcome_it_forgot() {
+    let w = bare_world();
+    let daemon = Daemon::start(&w.ledger_id, dom(), None);
+    let verifier = w.auth.verifier();
+    let mut orch = connect(&daemon.socket, &w.orch, &verifier).unwrap();
+    let known = Err(LinkError::Refused(Refusal::TransactionKnown));
+    orch.begin(tx(1)).unwrap().unwrap();
+    orch.commit().unwrap().unwrap();
+    assert!(matches!(
+        orch.tx_status(tx(1)).unwrap().unwrap().0,
+        TxState::Committed { .. }
+    ));
+    let log = gpu_ledger::link::HostLimits::default().tx_log as u64;
+    for n in 2..=log + 1 {
+        orch.begin(tx(n)).unwrap().unwrap();
+        orch.abort().unwrap().unwrap();
+    }
+    assert_eq!(orch.tx_status(tx(1)).unwrap().unwrap().0, TxState::Unknown);
+    assert_eq!(orch.begin(tx(1)), known);
+    let mut other = connect(&daemon.socket, &w.orch, &verifier).unwrap();
+    assert_eq!(other.begin(tx(1)), known);
+    assert_eq!(other.begin(tx(log + 1)), known);
+    assert_eq!(other.tx_status(tx(1)).unwrap().unwrap().0, TxState::Unknown);
+    other.begin(tx(log + 2)).unwrap().unwrap();
+    other.commit().unwrap().unwrap();
 }
 
 /// Third review of the isolation, unknown outcomes, against the real process. The daemon
