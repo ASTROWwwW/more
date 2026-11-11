@@ -250,7 +250,9 @@ It holds the orchestrator's key and the socket. Everything below is an operation
 | Revoke an attempt early | Once per attempt | A lender whose restoration was not yet corroborated is not paid for it |
 | Hold the Ledger with a transaction | 5 s from its first `Begin`, 4,096 operations, 4 levels; rolled back at the deadline whoever is asking, and if its connection ends | Others wait at most that long, each time. It can open the next one at once: a per-service share of the ledger's time is not built |
 | Open connections | 64 at once for everyone; an unauthenticated one is closed after 2 s | With its own key it can hold all 64: other services cannot connect until it lets go. A cap per service is not built |
-| Ask what became of any transaction | The last 1,024 outcomes | Nothing: names and outcomes of the orchestrator's own transactions |
+| Ask what became of a transaction | Its own names, among the last 1,024 outcomes | Nothing |
+| Spend its transaction names: begin one with the highest possible name | The names of its own service | That service can open no transaction on this ledger until it is restarted, or the service is given a new identity. It stops itself, which it can do anyway by doing nothing |
+| Push outcomes out of the log with transactions of its own | 1,024 outcomes for all services | Another orchestrator service that asks about an older commit is told "unknown" and stays stopped; nothing is applied or rewritten |
 | Refuse to pay, release or settle | None on its side | Liveness: credits stay held; visible to the auditor |
 | Read its jobs' escrow, hold and line balances | Job accounts only | Nothing beyond what the orchestrator already knows |
 
@@ -285,6 +287,7 @@ A commit that gets no answer may or may not have been applied. The coordinator c
 | The ledger refuses, or ends the connection itself | Keeps nothing of the command; reports the error |
 | No answer to the commit | Stops. Every command is refused with `LEDGER_OUTCOME_UNKNOWN`. Keeps both states: the one it had, and the one that goes with the commit |
 | Then, asked on a new connection: committed | Takes the state that goes with the commit, goes on |
+| The ledger says the transaction expired | Keeps nothing of the command. That connection is refused everything from then on: the coordinator needs a new one |
 | … rolled back | Keeps the state it had, goes on. The sender may send the command again; it runs under a new name |
 | … still open | Stays stopped. The ledger's deadline rolls the transaction back within 5 s |
 | … unknown to the ledger | Stays stopped. More than 1,024 transactions went by, or something is wrong: a person compares the two sides |

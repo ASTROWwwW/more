@@ -408,3 +408,25 @@ Review of `isolation/ledger-process` at `4e13c58`, five points: unknown outcomes
 - `the_socket_and_the_key_file_are_private` runs its refused starts with a deadline. `a_killed_orchestrator_leaves_nothing_half_done` also asks for the outcome of the dead transaction.
 - `RemoteRig::follow` is split into its sending and checking halves so that a test can send a command to one side only. `follow` itself does what it did.
 - No test was removed.
+
+## Process separation, second review of step 1
+
+Review of pull request #3 at `e0782c0`. Two findings from reading `link/host.rs`, neither run by the reviewer. Both were reproduced by a test before anything was changed.
+
+| Id | Finding | Reproduction on `e0782c0` | Status |
+| --- | --- | --- | --- |
+| R6-01 | `Begin` refused a name only while its outcome was in the bounded log. Once evicted, the name could be run again: "used once" did not hold for ever. The second run also rewrote the outcome, so a coordinator asking about a commit could have been told what became of a later run | With a log of three: commit transaction 1, run three more, begin transaction 1 again. Expected `TransactionKnown`, got `Done` | **Fixed**: the ledger keeps the highest name each service began and refuses any that is not above it. One name of memory per service, never evicted. Names and outcomes are per service, so another service cannot take or rewrite them either |
+| R6-02 | A connection whose transaction had expired was refused once, then served again. A client speaking the protocol directly could ignore the refusal and send the rest of its transaction one operation at a time, outside any transaction | Begin, one reserve, deadline, then reserves 2 to 7. The first is refused, the second answers `Done` and is applied | **Fixed**: such a connection is refused everything but `TxStatus` until it closes |
+
+What each was worth. Neither gave a way around an economic rule: an orchestrator may send single operations outside a transaction at any time, and each is checked by the ledger on its own. R6-02 broke what the transaction promised, that a command is applied at the ledger entirely or not at all, for any client that did not stop at the first refusal. R6-01 let the holder of an orchestrator key make the ledger lie about an old commit.
+
+What the fix of R6-01 adds: the order of names. An instance of a service started later must take a higher instance number, and from its first transaction the earlier instance is refused. Two coordinators on one ledger with one credential would each hold a state the other does not know; the second now stops the first.
+
+What it costs: a service can spend its own names by beginning the highest possible one. It then opens no transaction on that ledger until the ledger restarts or the service gets a new identity. Listed with the bounded abuses in `SECURITY_ARCHITECTURE.md`.
+
+### Test changes that need a justification (second review)
+
+- `r5_a_deadline_binds_the_owner_of_a_transaction_too` asserted that after one refusal the connection worked again, outside any transaction (`NoTransaction` on the next `Commit`). That was R6-02. It now asserts the refusal is repeated, and each of its cases takes a new connection. Every other assertion is kept.
+- `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead` went on with the same connection after an expired commit; it now checks that connection is refused and takes a new one.
+- `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself`: same change, against the daemon, and it sends several operations after the deadline instead of one.
+- No test was removed.
