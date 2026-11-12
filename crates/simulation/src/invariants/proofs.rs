@@ -18,7 +18,11 @@ pub(super) fn state(
     auditor: &ServiceCredential,
     out: &mut Vec<Violation>,
 ) {
-    let Ok(escrows) = c.ledger_service().audit_escrows(auditor) else {
+    let Ok(escrows) = c
+        .ledger_service()
+        .expect("ledger in this process")
+        .audit_escrows(auditor)
+    else {
         return p30(out, "the auditor cannot read the job records".into());
     };
     for (job, e) in escrows {
@@ -256,13 +260,25 @@ pub(super) fn finality_step(
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     let (Ok(old), Ok(new)) = (
-        before.ledger_service().audit_escrows(auditor),
-        after.ledger_service().audit_escrows(auditor),
+        before
+            .ledger_service()
+            .expect("ledger in this process")
+            .audit_escrows(auditor),
+        after
+            .ledger_service()
+            .expect("ledger in this process")
+            .audit_escrows(auditor),
     ) else {
         return out;
     };
-    let now = before.ledger_service().now();
-    let limits = before.ledger_service().limits();
+    let now = before
+        .ledger_service()
+        .expect("ledger in this process")
+        .now();
+    let limits = before
+        .ledger_service()
+        .expect("ledger in this process")
+        .limits();
     let mut p33 = |detail: String| out.push(v("TEST-P33", detail));
     for (job, a) in old {
         let Some(b) = new.get(job) else {

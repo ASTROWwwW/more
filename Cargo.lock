@@ -368,6 +368,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "more-ledgerd"
+version = "0.3.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "gpu-domain",
+ "gpu-ledger",
+ "gpu-simulation",
+ "more-identity",
+ "proptest",
+ "rustix",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

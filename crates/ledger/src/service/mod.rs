@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use more_identity::{CredentialVerifier, Domain, KeyDirectory, ServiceCredential, ServiceRole};
+use more_identity::{
+    CredentialVerifier, Domain, KeyDirectory, ServiceCertificate, ServiceCredential, ServiceRole,
+};
 
 use crate::{Account, Amount, Ledger};
 
@@ -95,12 +97,23 @@ impl LedgerService {
         self.seq
     }
 
+    /// Number of requests refused so far.
+    pub(crate) fn denied(&self) -> u64 {
+        self.denied
+    }
+
     /// Runs one operation for `caller`. Nothing is written unless every check passes and every
     /// entry of the operation succeeds: each operation checks first, writes its entries, and only
     /// then updates the job records, so rolling back the journal is enough.
     pub fn execute(&mut self, caller: &ServiceCredential, op: LedgerOp) -> ApiResult {
+        self.execute_as(&caller.certificate(), op)
+    }
+
+    /// Same, for a caller known by its certificate. Only for a peer that has proved it holds
+    /// the certified key: that is what the link's handshake establishes.
+    pub fn execute_as(&mut self, caller: &ServiceCertificate, op: LedgerOp) -> ApiResult {
         let kind = op.kind();
-        let role = match self.verifier.verify(caller) {
+        let role = match self.verifier.verify_certificate(caller) {
             Ok(r) => r,
             Err(e) => return Err(self.deny(None, kind, LedgerApiError::Unauthenticated(e))),
         };
@@ -141,9 +154,18 @@ impl LedgerService {
 
     /// Balance of one of a job's accounts, for the orchestrator.
     pub fn job_balance(&self, caller: &ServiceCredential, account: Account) -> ApiResult<Amount> {
+        self.job_balance_as(&caller.certificate(), account)
+    }
+
+    /// Same, for a peer that proved it holds the certified key.
+    pub fn job_balance_as(
+        &self,
+        caller: &ServiceCertificate,
+        account: Account,
+    ) -> ApiResult<Amount> {
         let role = self
             .verifier
-            .verify(caller)
+            .verify_certificate(caller)
             .map_err(LedgerApiError::Unauthenticated)?;
         let job_scoped = matches!(
             account,
@@ -164,9 +186,14 @@ impl LedgerService {
 
     /// Full read-only view (journal, every balance), for the Auditor role only.
     pub fn audit_view(&self, caller: &ServiceCredential) -> ApiResult<&Ledger> {
+        self.audit_view_as(&caller.certificate())
+    }
+
+    /// Same, for a peer that proved it holds the certified key.
+    pub fn audit_view_as(&self, caller: &ServiceCertificate) -> ApiResult<&Ledger> {
         let role = self
             .verifier
-            .verify(caller)
+            .verify_certificate(caller)
             .map_err(LedgerApiError::Unauthenticated)?;
         if role != ServiceRole::Auditor {
             return Err(LedgerApiError::Forbidden {

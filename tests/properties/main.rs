@@ -112,6 +112,40 @@ fn invariants_hold_under_delivery_adversaries() {
     );
 }
 
+/// TEST-P37: the same traces, also run by a coordinator whose ledger is behind the ledger link.
+/// It holds the orchestrator's key only; the clock, the treasury and the platform admin reach
+/// the ledger on their own connections. Command after command, both coordinators answer the
+/// same and end in the same state, and both ledgers hold the same journal.
+#[test]
+fn a_coordinator_behind_the_link_matches_the_one_in_process() {
+    let config = ProptestConfig {
+        cases: (cases() / 4).max(8),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    let followed = Mutex::new(0u64);
+    let ops = prop_oneof![fault_heavy_op(), delivery_adversary_op(), op_strategy()];
+    let mut runner = TestRunner::new(config);
+    let result = runner.run(&prop::collection::vec(ops, 1..200), |ops| {
+        let mut sim = Sim::shadowed_in_process();
+        for op in &ops {
+            sim.run_op(op);
+        }
+        sim.drain();
+        if !sim.violations.is_empty() {
+            return Err(TestCaseError::fail(report(&sim, &ops)));
+        }
+        *followed.lock().unwrap() += sim.shadow.as_ref().map_or(0, |s| s.followed);
+        Ok(())
+    });
+    if let Err(e) = result {
+        panic!("behind the link: {e}");
+    }
+    let followed = followed.into_inner().unwrap();
+    assert!(followed > 1_000, "only {followed} commands followed");
+    println!("commands followed behind the link: {followed}");
+}
+
 /// Mix that pushes the normal path plus faults.
 fn fault_heavy_op() -> impl Strategy<Value = Op> {
     let b = any::<u8>;

@@ -22,7 +22,7 @@ Severity scale: **critical** (credits or another user's job at the mercy of any 
 | A-02 | A refused reconciliation still checked by the post-reconciliation properties; reconciliation callable by the scheduler | Medium | Found by `proptest` (CE-07), fixed |
 | A-03 | Digest recomputation is linear in the number of positions | Low | Open |
 | A-04 | `test-support` feature could be enabled in a production build | Low | Open |
-| A-05 | All trust domains run in one process | Medium | Open, by design of the model |
+| A-05 | All trust domains run in one process | Medium | Partly closed: the ledger has its own process (see "Process separation, step 1"); the other domains still share one |
 | A-06 to A-08, A-10 | See open issues below | Low to medium | Open |
 | A-09 | Declared minimum Rust version wrong (1.75, while the code needed 1.87 and `proptest` 1.88) | Low | Fixed: 1.88, checked by CI |
 
@@ -237,7 +237,7 @@ The test "a fault in the middle of a settlement, then a restart and a reconcilia
 | R2-10 | Orchestrator plus every recipient of a stage (next lender, or the witness for the last stage): receipts and corroborations are attestations between two accounts, not proofs of computation | What was charged to the borrower and the recovery earmark; contest windows; JOB-R19 for uncommitted receipts | Verification of the work itself; witness assignment the orchestrator cannot choose alone |
 | A-04 (extended) | Two test-only features now exist: `more-identity/test-support` and `gpu-ledger/fault-injection` (forwarded by `gpu-domain`). Only the conformance tests enable them | A production build that enabled one would accept unsigned accounts or injected faults | CI check on the features of release binaries, once there is a binary |
 | R2-11 | The Ledger does not check the delivery proof behind a charge | An unproven charge pays nobody without receipts and returns at settlement | Witness attestation or client ack verified by the Ledger; contest filed with the Ledger |
-| R2-06 | One process | — | `SECURITY_ARCHITECTURE.md` section 11 |
+| R2-06 | One process | The ledger now runs in its own (step 1) | `SECURITY_ARCHITECTURE.md` section 11 for the steps left |
 | SEC-006 | Frame and receipt digests are symbolic (FNV-1a) | — | QUIC prototype |
 
 ## Claims checked and qualified
@@ -336,3 +336,97 @@ What it costs: an honest lender whose recipient disappears before corroborating 
 - `r2_settlement_waits_for_every_item_and_is_final` asserted that late operations were refused; it now asserts they are refused with `EscrowSettled`. `r2_charges_and_voids_follow_the_ledgers_records` now charges a second output before trying to void one with a live share, and asserts the reason of the refusal. Both changes come from the mutation campaign, which let M65 and M76 through on `6351a3f` (`docs/VALIDATION.md`, "What the campaign found"). TEST-P30 gained one check: a share that holds or took money keeps its output charged.
 - No regression test was removed. CE-09 was added.
 
+## Process separation, step 1
+
+The ledger leaves the orchestrator's process (R2-06, A-05). Branch `isolation/ledger-process`. The criterion set for it: taking over the orchestrator's process entirely must give no access to the ledger's memory and no way around its rules, and what the orchestrator may still do must be listed and bounded.
+
+### What had to change, and why
+
+| Id | Finding | Status |
+| --- | --- | --- |
+| R4-01 | A service credential was a value signed by the authority. In one process the type kept it from being copied; sent to another process it is a bearer token: whoever saw it once is that service | **Fixed**: a certificate over the service's own key, and proof of possession over fresh nonces on every connection (LEDGER-022) |
+| R4-02 | The coordinator passed the treasury's, the clock's and the platform admin's credentials on to the ledger. A compromised coordinator that had seen them once could have issued credits or moved the ledger's clock | **Fixed** between processes: the coordinator holds the orchestrator's key only, and those services reach the ledger themselves |
+| R4-03 | The all-or-nothing step of a command was a copy of the whole state, ledger included. With the ledger elsewhere a failed command would have left its first ledger operations applied | **Fixed**: one ledger transaction per command, nested for reconciliation, bounded, rolled back with its connection (LEDGER-023) |
+| R4-04 | Processes of the same user can read each other's memory | **Fixed** on Linux for the daemon (not dumpable); a user of its own is recommended |
+| R4-05 | The ledger had no way to learn of a revocation outside the process that shared the list with it | **Fixed**: a revocation is a statement signed by the authority, delivered over the link |
+
+### Defects found while building it
+
+- **A checked certificate vouched for another key.** The verifier remembers certificates whose signature it already checked. Its key was (id, role, tag): the same tag with another public key was then accepted from memory. Found by the first test written for certificates (`credential_cannot_be_altered`), before any commit; the key of that cache now includes the service's public key (mutant M133).
+- **Reconciliation needs nested transactions.** The first run of TEST-P37 failed on `Reconcile`: it applies each due transition as an atomic step of its own inside the command, and the ledger refused a second `Begin`. Transactions now nest, to a bounded depth, and a nested one is undone alone.
+- **A dying test binary counted as a missed mutant.** The mutation runner looked for the names of failed tests. A mutant that makes a test binary abort (an allocation of several gigabytes, for the length check of the decoder) lists none. The runner now treats a failed run with no listed test as a detection and says so.
+
+### What the criterion gets
+
+| Asked | What holds | Shown by |
+| --- | --- | --- |
+| No access to the ledger's memory | The ledger is another process. Its memory file is not openable by its own user (Linux), and the only way in is the socket | `another_process_of_the_same_user_cannot_read_the_ledgers_memory`, `the_socket_and_the_key_file_are_private` |
+| No way around the economic rules | Everything TEST-P30 shows of the ledger under a hostile orchestrator holds of the daemon: every hostile call gets the same answer and leaves the same balances and journal | `p35_the_daemon_is_the_same_ledger`, `p35_behind_the_link_the_ledger_is_the_same_ledger` |
+| No other service's rights | A connection is one service. Copying a certificate, replaying a handshake or sending another role's operation gets nothing | `a_copied_certificate_does_not_open_a_connection`, `a_recorded_handshake_cannot_be_replayed`, `a_connection_has_its_own_rights_and_no_other` |
+| Nothing half done when the orchestrator dies | Uncommitted work is rolled back when the socket closes | `a_killed_orchestrator_leaves_nothing_half_done` |
+| What remains abusable is listed and bounded | `SECURITY_ARCHITECTURE.md`, section 11, "What a fully compromised orchestrator process can still do" | The bounds are the ledger's own checks and the host's limits, each with a test and a mutant |
+
+Two of the remaining operations hurt honest lenders and cannot be told from honest use today: a refund instead of a payment, and a contest of a held reward. Neither carries a statement from the borrower. They are bounded (reserved or held amounts only, back to their payers), not prevented.
+
+### Test changes that need a justification (isolation)
+
+- `Coordinator::ledger_service()` now returns an `Option`: it is `None` when the ledger is in another process. The simulation and three tests that read the in-process ledger say so explicitly. No assertion changed.
+- The hostile generator of TEST-P30 moved to a shared test module so that the link tests and the daemon tests replay the same calls. Its code is unchanged.
+- No test was removed.
+
+## Process separation, review of step 1
+
+Review of `isolation/ledger-process` at `4e13c58`, five points: unknown outcomes, timeouts, Unix users, durability, validation. Durability stays out of scope by decision and is documented as such; the rest is fixed below.
+
+### Findings
+
+| Id | Finding | Status |
+| --- | --- | --- |
+| R5-01 | When the answer to a `Commit` was lost, the coordinator kept nothing and had no way to learn whether the ledger had applied it. The documentation said "all or nothing in both processes" without that reserve | **Fixed**: transactions have names, the ledger records their outcome and answers `TxStatus` at any time; the coordinator stops, asks and acts on the answer, and never resends (LEDGER-025). The documentation no longer claims atomic commitment across both processes |
+| R5-02 | A transaction's deadline was checked only when another connection needed the ledger. Its owner was exempt, and an idle transaction with nobody else around stayed open for ever | **Fixed**: the deadline is checked on every request, the owner's included, and by the daemon's timer (LEDGER-023) |
+| R5-03 | Found while fixing R5-02: after a transaction had been rolled back because another connection needed the ledger, its owner did not know. Its next operations were applied one by one outside any transaction, and its `Commit` was then refused: a command applied in part, the very thing the transaction was there to prevent | **Fixed**: the owner's next request is refused with `TransactionExpired`, whatever it is (`r5_a_deadline_binds_the_owner_of_a_transaction_too`, mutants M168, M178) |
+| R5-04 | The socket was 0600 and nothing else: the orchestrator had to run as the ledger's user, so "run it under a user of its own" could not be followed | **Fixed**: one group on the file, a list of admitted users checked with `SO_PEERCRED`, never all users (LEDGER-027). Tested with three system users |
+| R5-05 | A connection that never authenticated was kept for as long as it liked; 64 of them left no room for a real service | **Fixed**: 2 s to authenticate, for the whole handshake |
+| R5-06 | A ledger that restarted came back empty, and a coordinator that reconnected would have gone on against it | **Fixed**: incarnation number, `LEDGER_STATE_LOST` (LEDGER-026) |
+| R5-07 | After an answer that did not come, a client could go on using the connection: the late answer would have been read as the answer to the next request | **Fixed**: such a connection is dead; a client waits 30 s for an answer by default |
+| R5-08 | Persistence | **Out of scope**, by decision. What a restart loses is listed in `SECURITY_ARCHITECTURE.md`, section 11, and in LEDGER-026. The daemon says at every start that it is not for real credits |
+
+### Defects found while fixing them
+
+- **Reconnecting needed an answer the ledger would not give.** The first version of the reconnection asked the ledger for `Info`. While the transaction in doubt was still open, the ledger answered "busy" to everything but `TxStatus`, so the coordinator could not reconnect until the deadline. Found by the first test of a commit lost on the way. The reconnection now asks with `TxStatus`, which carries the incarnation.
+- **A copy of the coordinator kept the failed connection open.** The state kept aside for an unknown commit held the old connection, so the ledger did not see it close and reported the transaction open until its deadline. The reconnection now replaces it there too (mutant M192).
+- **A test that could hang for ever.** `the_socket_and_the_key_file_are_private` waited without limit for a daemon that should refuse to start. Under a mutant that made it start, the test never ended and the pre-check of mutants had to be killed. Commands that must end by themselves now have ten seconds; the mutation runner stops a suite that hangs, with the daemons it started, and counts it as a detection.
+- **A new rule hid an old one from its test.** The first full campaign on this branch (`35f7ebf`) let M166 through: a frame of any length read by the daemon. Its test sends a length of four gigabytes and expects the connection to be closed. With the new authentication deadline the daemon closed that connection after two seconds whatever it had sent, and the test only waited three. The test now gives the daemon a minute to authenticate, so that a close can only come from the length.
+- **Delays too short for a loaded machine.** While checking that fix, the test of a timed-out connection failed once next to the others and passed alone. The process tests used deadlines of 200 and 300 ms. They now use one second, with checks several hundred milliseconds away from any boundary, and no longer assert how fast a dead connection refuses.
+- **A timer nobody could see.** Any request makes the ledger look at its transactions, so a test that polled the daemon could not tell its timer from its own polling: removing the timer changed nothing observable. The timer now says on standard error when it ends a transaction, and the test stays silent for the whole delay (mutant M201).
+
+### Test changes that need a justification (review of step 1)
+
+- `a_transaction_is_all_or_nothing_and_bounded` was rewritten for named transactions and savepoints. Every assertion it made is still made. The part about a transaction "older than its limit rolled back when someone else asks" moved to `r5_a_deadline_binds_the_owner_of_a_transaction_too`, which also covers the owner, the idle case and nesting.
+- `p35_the_daemon_is_the_same_ledger` and `p37_a_coordinator_drives_a_ledger_in_another_process` use an explicit proptest runner instead of the `proptest!` macro, with the same strategies and the same number of cases, so that they can print how many calls and commands they compared.
+- `garbage_on_the_socket_does_not_stop_the_daemon` starts its daemon with a long authentication deadline (see M166 above); its assertions are unchanged.
+- `the_socket_and_the_key_file_are_private` runs its refused starts with a deadline. `a_killed_orchestrator_leaves_nothing_half_done` also asks for the outcome of the dead transaction.
+- `RemoteRig::follow` is split into its sending and checking halves so that a test can send a command to one side only. `follow` itself does what it did.
+- No test was removed.
+
+## Process separation, second review of step 1
+
+Review of pull request #3 at `e0782c0`. Two findings from reading `link/host.rs`, neither run by the reviewer. Both were reproduced by a test before anything was changed.
+
+| Id | Finding | Reproduction on `e0782c0` | Status |
+| --- | --- | --- | --- |
+| R6-01 | `Begin` refused a name only while its outcome was in the bounded log. Once evicted, the name could be run again: "used once" did not hold for ever. The second run also rewrote the outcome, so a coordinator asking about a commit could have been told what became of a later run | With a log of three: commit transaction 1, run three more, begin transaction 1 again. Expected `TransactionKnown`, got `Done` | **Fixed**: the ledger keeps the highest name each service began and refuses any that is not above it. One name of memory per service, never evicted. Names and outcomes are per service, so another service cannot take or rewrite them either |
+| R6-02 | A connection whose transaction had expired was refused once, then served again. A client speaking the protocol directly could ignore the refusal and send the rest of its transaction one operation at a time, outside any transaction | Begin, one reserve, deadline, then reserves 2 to 7. The first is refused, the second answers `Done` and is applied | **Fixed**: such a connection is refused everything but `TxStatus` until it closes |
+
+What each was worth. Neither gave a way around an economic rule: an orchestrator may send single operations outside a transaction at any time, and each is checked by the ledger on its own. R6-02 broke what the transaction promised, that a command is applied at the ledger entirely or not at all, for any client that did not stop at the first refusal. R6-01 let the holder of an orchestrator key make the ledger lie about an old commit.
+
+What the fix of R6-01 adds: the order of names. An instance of a service started later must take a higher instance number, and from its first transaction the earlier instance is refused. Two coordinators on one ledger with one credential would each hold a state the other does not know; the second now stops the first.
+
+What it costs: a service can spend its own names by beginning the highest possible one. It then opens no transaction on that ledger until the ledger restarts or the service gets a new identity. Listed with the bounded abuses in `SECURITY_ARCHITECTURE.md`.
+
+### Test changes that need a justification (second review)
+
+- `r5_a_deadline_binds_the_owner_of_a_transaction_too` asserted that after one refusal the connection worked again, outside any transaction (`NoTransaction` on the next `Commit`). That was R6-02. It now asserts the refusal is repeated, and each of its cases takes a new connection. Every other assertion is kept.
+- `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead` went on with the same connection after an expired commit; it now checks that connection is refused and takes a new one.
+- `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself`: same change, against the daemon, and it sends several operations after the deadline instead of one.
+- No test was removed.

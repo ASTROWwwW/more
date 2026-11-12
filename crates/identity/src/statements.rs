@@ -14,6 +14,12 @@ impl Domain {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// A domain read from a configuration file or from the wire. It is public data: knowing it
+    /// gives no right.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Domain(bytes)
+    }
 }
 
 /// What a borrower agrees to for one job: the model and its size, the price of each output type,

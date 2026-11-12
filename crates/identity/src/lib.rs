@@ -44,6 +44,31 @@ pub enum ServiceRole {
     Delivery,
     /// Read-only access to every domain, for invariant checks and audits.
     Auditor,
+    /// The ledger's own identity, shown to the services that connect to it.
+    Ledger,
+    /// Registers account keys with the ledger. No right on credits.
+    Identity,
+}
+
+impl ServiceRole {
+    /// Inverse of `role as u8`, for certificates read from the wire.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        use ServiceRole::*;
+        [
+            Clock,
+            Treasury,
+            PlatformAdmin,
+            Scheduler,
+            Reconciler,
+            Orchestrator,
+            Delivery,
+            Auditor,
+            Ledger,
+            Identity,
+        ]
+        .into_iter()
+        .find(|r| *r as u8 == b)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -78,17 +103,21 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// Credential of one service, minted by the [`IdentityAuthority`]. The tag is the authority's
-/// Ed25519 signature of the id and the role: a credential cannot be altered or made up, and the
-/// services that check it hold only the authority's public key, so they cannot mint one either.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ServiceCredential {
+/// Public half of a service's identity: its id, its role and its own public key, signed by the
+/// [`IdentityAuthority`]. It can be shown to anyone and proves nothing alone: the service also
+/// has to sign with the matching key (see [`ServiceCredential::sign`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ServiceCertificate {
     id: ServiceId,
     role: ServiceRole,
+    key: [u8; 32],
     tag: [u8; 64],
 }
 
-impl ServiceCredential {
+impl ServiceCertificate {
+    /// Encoded size: id, role, key, tag.
+    pub const LEN: usize = 4 + 1 + 32 + 64;
+
     pub fn id(&self) -> ServiceId {
         self.id
     }
@@ -96,20 +125,121 @@ impl ServiceCredential {
     pub fn role(&self) -> ServiceRole {
         self.role
     }
-}
 
-impl fmt::Debug for ServiceCredential {
-    // The tag is a secret-derived value: never printed.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ServiceCredential({:?}, {:?})", self.id, self.role)
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[..4].copy_from_slice(&self.id.0.to_le_bytes());
+        out[4] = self.role as u8;
+        out[5..37].copy_from_slice(&self.key);
+        out[37..].copy_from_slice(&self.tag);
+        out
+    }
+
+    /// `None` unless `bytes` is exactly one certificate with a known role.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::LEN] = bytes.try_into().ok()?;
+        Some(ServiceCertificate {
+            id: ServiceId(u32::from_le_bytes(bytes[..4].try_into().ok()?)),
+            role: ServiceRole::from_u8(bytes[4])?,
+            key: bytes[5..37].try_into().ok()?,
+            tag: bytes[37..].try_into().ok()?,
+        })
+    }
+
+    /// Checks a signature made with the service's own key. It says nothing about who certified
+    /// that key: check the certificate with [`CredentialVerifier::verify_certificate`] first.
+    pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<(), AuthError> {
+        let key = VerifyingKey::from_bytes(&self.key).map_err(|_| AuthError::InvalidCredential)?;
+        key.verify(message, &Signature::from_bytes(signature))
+            .map_err(|_| AuthError::BadSignature)
     }
 }
 
-fn credential_message(id: ServiceId, role: ServiceRole) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(16);
-    msg.extend_from_slice(b"more/svc/v1");
+impl fmt::Debug for ServiceCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ServiceCertificate({:?}, {:?})", self.id, self.role)
+    }
+}
+
+/// Identity of one service: its certificate and the private key that goes with it. The key
+/// never leaves the service; what travels is the certificate and signatures made with the key,
+/// so a copied certificate is useless to whoever copied it.
+#[derive(Clone)]
+pub struct ServiceCredential {
+    cert: ServiceCertificate,
+    key: SigningKey,
+}
+
+impl ServiceCredential {
+    /// Encoded size: the key's seed, then the certificate.
+    pub const LEN: usize = 32 + ServiceCertificate::LEN;
+
+    pub fn id(&self) -> ServiceId {
+        self.cert.id
+    }
+
+    pub fn role(&self) -> ServiceRole {
+        self.cert.role
+    }
+
+    pub fn certificate(&self) -> ServiceCertificate {
+        self.cert
+    }
+
+    /// Signs with the service's own key (proof of possession).
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.key.sign(message).to_bytes()
+    }
+
+    /// Secret material, for provisioning a service from a file readable by that service only.
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[..32].copy_from_slice(&self.key.to_bytes());
+        out[32..].copy_from_slice(&self.cert.to_bytes());
+        out
+    }
+
+    /// `None` unless the key is the one the certificate names.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let seed: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+        let cert = ServiceCertificate::from_bytes(bytes.get(32..)?)?;
+        let key = SigningKey::from_bytes(&seed);
+        (key.verifying_key().to_bytes() == cert.key).then_some(ServiceCredential { cert, key })
+    }
+}
+
+impl PartialEq for ServiceCredential {
+    fn eq(&self, other: &Self) -> bool {
+        self.cert == other.cert
+    }
+}
+
+impl Eq for ServiceCredential {}
+
+impl fmt::Debug for ServiceCredential {
+    // Never prints the key or the tag.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ServiceCredential({:?}, {:?})",
+            self.cert.id, self.cert.role
+        )
+    }
+}
+
+fn credential_message(id: ServiceId, role: ServiceRole, key: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(48);
+    msg.extend_from_slice(b"more/svc/v2");
     msg.extend_from_slice(&id.0.to_le_bytes());
     msg.push(role as u8);
+    msg.extend_from_slice(key);
+    msg
+}
+
+fn revocation_message(id: ServiceId) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(24);
+    msg.extend_from_slice(b"more/svc-revoke/v1");
+    msg.extend_from_slice(&id.0.to_le_bytes());
     msg
 }
 
@@ -131,20 +261,42 @@ impl IdentityAuthority {
         }
     }
 
-    pub fn issue(&mut self, role: ServiceRole) -> ServiceCredential {
+    /// Certifies a key the service generated itself: the authority never sees the private half.
+    pub fn certify(&mut self, role: ServiceRole, service_key: [u8; 32]) -> ServiceCertificate {
         let id = ServiceId(self.next_id);
         self.next_id += 1;
-        ServiceCredential {
+        let tag = self.key.sign(&credential_message(id, role, &service_key));
+        ServiceCertificate {
             id,
             role,
-            tag: self.key.sign(&credential_message(id, role)).to_bytes(),
+            key: service_key,
+            tag: tag.to_bytes(),
         }
+    }
+
+    /// Mints a whole identity, key included. For the model and its tests: the key is derived
+    /// from the authority's, so runs are reproducible. A deployed service generates its own key
+    /// and asks for [`IdentityAuthority::certify`].
+    pub fn issue(&mut self, role: ServiceRole) -> ServiceCredential {
+        let mut label = b"more/svc-key/v1".to_vec();
+        label.extend_from_slice(&self.next_id.to_le_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&self.key.sign(&label).to_bytes()[..32]);
+        let key = SigningKey::from_bytes(&seed);
+        let cert = self.certify(role, key.verifying_key().to_bytes());
+        ServiceCredential { cert, key }
     }
 
     pub fn revoke(&self, id: ServiceId) {
         // A poisoned lock means a panic while revoking: keep the revocation anyway.
         let mut set = self.revoked.write().unwrap_or_else(|e| e.into_inner());
         set.insert(id);
+    }
+
+    /// A revocation any verifier of this authority accepts, wherever it runs
+    /// ([`CredentialVerifier::apply_revocation`]).
+    pub fn revocation(&self, id: ServiceId) -> [u8; 64] {
+        self.key.sign(&revocation_message(id)).to_bytes()
     }
 
     /// This deployment's identifier in signed statements (LEDGER-019).
@@ -163,8 +315,9 @@ impl IdentityAuthority {
     }
 }
 
-/// (service id, role, tag) of a credential whose signature was checked.
-type CredentialKey = (u32, u8, [u8; 64]);
+/// (service id, role, service key, tag) of a certificate whose signature was checked. The key is
+/// part of it: a checked tag must not vouch for another key.
+type CredentialKey = (u32, u8, [u8; 32], [u8; 64]);
 
 /// Checks that a credential was minted by the authority and is not revoked.
 #[derive(Clone)]
@@ -176,13 +329,40 @@ pub struct CredentialVerifier {
 }
 
 impl CredentialVerifier {
+    /// A verifier for a process that only knows the authority's public key (its domain). It
+    /// starts with no revocation; those arrive signed ([`CredentialVerifier::apply_revocation`]).
+    pub fn for_domain(domain: Domain) -> Option<Self> {
+        Some(CredentialVerifier {
+            authority: VerifyingKey::from_bytes(domain.as_bytes()).ok()?,
+            revoked: Arc::default(),
+            seen: Arc::default(),
+        })
+    }
+
     /// The deployment this verifier belongs to: statements signed for another one are void here.
     pub fn domain(&self) -> Domain {
         Domain(self.authority.to_bytes())
     }
 
+    /// Records a revocation signed by the authority. Anyone may deliver it: only the authority
+    /// can have signed it.
+    pub fn apply_revocation(&self, id: ServiceId, signature: &[u8; 64]) -> Result<(), AuthError> {
+        self.authority
+            .verify(&revocation_message(id), &Signature::from_bytes(signature))
+            .map_err(|_| AuthError::BadSignature)?;
+        let mut set = self.revoked.write().unwrap_or_else(|e| e.into_inner());
+        set.insert(id);
+        Ok(())
+    }
+
     pub fn verify(&self, cred: &ServiceCredential) -> Result<ServiceRole, AuthError> {
-        let key = (cred.id.0, cred.role as u8, cred.tag);
+        self.verify_certificate(&cred.cert)
+    }
+
+    /// The certificate was signed by the authority and is not revoked. The caller still has to
+    /// check that its peer holds the certified key.
+    pub fn verify_certificate(&self, cred: &ServiceCertificate) -> Result<ServiceRole, AuthError> {
+        let key = (cred.id.0, cred.role as u8, cred.key, cred.tag);
         let known = self
             .seen
             .read()
@@ -191,7 +371,7 @@ impl CredentialVerifier {
         if !known {
             self.authority
                 .verify(
-                    &credential_message(cred.id, cred.role),
+                    &credential_message(cred.id, cred.role, &cred.key),
                     &Signature::from_bytes(&cred.tag),
                 )
                 .map_err(|_| AuthError::InvalidCredential)?;
@@ -245,6 +425,12 @@ impl KeyDirectory {
         }
         keys.insert(account, key);
         Ok(())
+    }
+
+    /// Same, for a key received as bytes. Bytes that are not a public key are refused.
+    pub fn register_bytes(&self, account: AccountNo, key: &[u8; 32]) -> Result<(), AuthError> {
+        let key = VerifyingKey::from_bytes(key).map_err(|_| AuthError::InvalidCredential)?;
+        self.register(account, key)
     }
 
     /// Number of signature checks done through this directory and its clones.
@@ -325,7 +511,7 @@ impl VerifiedAccount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
     Account(AccountNo),
-    Service(ServiceCredential),
+    Service(Box<ServiceCredential>),
 }
 
 /// Verified caller identity handed to the domains. Built only from a [`VerifiedAccount`] or a
@@ -344,7 +530,7 @@ impl AuthContext {
 
     pub fn service(cred: ServiceCredential) -> Self {
         AuthContext {
-            principal: Principal::Service(cred),
+            principal: Principal::Service(Box::new(cred)),
         }
     }
 
@@ -361,7 +547,7 @@ impl AuthContext {
 
     pub fn service_role(&self) -> Option<ServiceRole> {
         match &self.principal {
-            Principal::Service(c) => Some(c.role),
+            Principal::Service(c) => Some(c.role()),
             Principal::Account(_) => None,
         }
     }
@@ -395,8 +581,15 @@ mod tests {
         let cred = auth.issue(ServiceRole::Delivery);
         assert_eq!(v.verify(&cred), Ok(ServiceRole::Delivery));
         let mut forged = cred.clone();
-        forged.role = ServiceRole::Treasury;
+        forged.cert.role = ServiceRole::Treasury;
         assert_eq!(v.verify(&forged), Err(AuthError::InvalidCredential));
+        // Nor can the certified key be swapped for another one.
+        let mut rekeyed = cred.certificate();
+        rekeyed.key = SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            v.verify_certificate(&rekeyed),
+            Err(AuthError::InvalidCredential)
+        );
     }
 
     #[test]
@@ -419,6 +612,82 @@ mod tests {
         assert_eq!(a.domain(), a.verifier().domain());
         assert_eq!(a.domain(), IdentityAuthority::new([7; 32]).domain());
         assert_ne!(a.domain(), b.domain());
+    }
+
+    /// A certificate is public: showing it proves nothing. Only the holder of the certified key
+    /// can sign for the service, and a credential read back from bytes must match its key.
+    #[test]
+    fn a_certificate_without_its_key_proves_nothing() {
+        let mut auth = IdentityAuthority::new([7; 32]);
+        let v = auth.verifier();
+        let (orch, treasury) = (
+            auth.issue(ServiceRole::Orchestrator),
+            auth.issue(ServiceRole::Treasury),
+        );
+        let cert = treasury.certificate();
+        assert_eq!(v.verify_certificate(&cert), Ok(ServiceRole::Treasury));
+        assert_eq!(cert.verify(b"nonce", &treasury.sign(b"nonce")), Ok(()));
+        assert_eq!(
+            cert.verify(b"nonce", &orch.sign(b"nonce")),
+            Err(AuthError::BadSignature)
+        );
+        assert_eq!(
+            cert.verify(b"other", &treasury.sign(b"nonce")),
+            Err(AuthError::BadSignature)
+        );
+        // Round trips, and a key grafted onto someone else's certificate is refused.
+        let bytes = treasury.to_bytes();
+        assert_eq!(
+            ServiceCredential::from_bytes(&bytes),
+            Some(treasury.clone())
+        );
+        assert_eq!(ServiceCertificate::from_bytes(&cert.to_bytes()), Some(cert));
+        let mut grafted = bytes;
+        grafted[..32].copy_from_slice(&orch.to_bytes()[..32]);
+        assert_eq!(ServiceCredential::from_bytes(&grafted), None);
+        assert_eq!(ServiceCredential::from_bytes(&bytes[1..]), None);
+        let mut unknown_role = cert.to_bytes();
+        unknown_role[4] = 200;
+        assert_eq!(ServiceCertificate::from_bytes(&unknown_role), None);
+        // A service that made its own key is certified without the authority seeing it.
+        let own = SigningKey::from_bytes(&[9; 32]);
+        let cert = auth.certify(ServiceRole::Ledger, own.verifying_key().to_bytes());
+        assert_eq!(v.verify_certificate(&cert), Ok(ServiceRole::Ledger));
+        for r in 0..=255u8 {
+            if let Some(role) = ServiceRole::from_u8(r) {
+                assert_eq!(role as u8, r);
+            }
+        }
+    }
+
+    /// A process that only knows the authority's public key learns of a revocation through a
+    /// statement the authority signed. Nobody else can revoke.
+    #[test]
+    fn revocations_travel_signed() {
+        let mut auth = IdentityAuthority::new([7; 32]);
+        let other = IdentityAuthority::new([8; 32]);
+        let (a, b) = (
+            auth.issue(ServiceRole::Scheduler),
+            auth.issue(ServiceRole::Clock),
+        );
+        let remote = CredentialVerifier::for_domain(auth.domain()).unwrap();
+        assert_eq!(remote.domain(), auth.domain());
+        assert_eq!(remote.verify(&a), Ok(ServiceRole::Scheduler));
+        assert_eq!(
+            remote.apply_revocation(a.id(), &other.revocation(a.id())),
+            Err(AuthError::BadSignature)
+        );
+        assert_eq!(
+            remote.apply_revocation(a.id(), &auth.revocation(b.id())),
+            Err(AuthError::BadSignature)
+        );
+        assert_eq!(remote.verify(&a), Ok(ServiceRole::Scheduler));
+        assert_eq!(
+            remote.apply_revocation(a.id(), &auth.revocation(a.id())),
+            Ok(())
+        );
+        assert_eq!(remote.verify(&a), Err(AuthError::RevokedCredential));
+        assert_eq!(remote.verify(&b), Ok(ServiceRole::Clock));
     }
 
     #[test]

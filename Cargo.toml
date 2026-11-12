@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/identity",
-    "crates/ledger",
+        "crates/ledger",
+    "crates/ledgerd",
     "crates/domain",
     "crates/protocol",
     "crates/simulation",

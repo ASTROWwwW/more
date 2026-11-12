@@ -1,6 +1,218 @@
 # Validation
 
-How the changes were checked, with the real results. Part 2 covers the branch `hardening/ledger-authority`. Part 1 is the report written for the previous branch, kept as it was.
+How the changes were checked, with the real results. Part 3 covers the branch `isolation/ledger-process`, part 2 the branch `hardening/ledger-authority`. Parts 2 and 1 are the reports written for those branches, kept as they were.
+
+## Part 3: `isolation/ledger-process`
+
+Environment: Linux, Rust 1.97.0, November 10 and 11, 2026. Baseline: `main` at `8ed2001`. Commit checked: `cfb63b1`. The commits after it change documentation only: `git diff cfb63b1 HEAD -- crates tests scripts .github Cargo.toml Cargo.lock` prints nothing.
+
+This part covers the whole branch: the ledger in its own process (step 1), the review of that step, and the two findings of the review of the pull request. Every figure was measured again on `cfb63b1`. It does not cover persistence, which is out of scope: the ledger process loses its state when it stops and is not for credits that are worth anything.
+
+### Commands and results
+
+| Command | Where | Result |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | local, CI | Clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | local, CI | Clean |
+| `cargo check --workspace --all-targets` on Rust 1.88 | CI | Passes |
+| `python3 scripts/mutation.py --check` | local, CI | 212 of 212 anchors match exactly one place |
+| `cargo test --workspace` (overflow checks on) | local, CI | 198 passed, 0 failed, 3 ignored: the cost measurement and the two that need root |
+| `cargo test --release --workspace` | local, CI | 198 passed, 0 failed, 3 ignored |
+| The process tests with `--ignored`, started as root | local, CI job `isolation` | 2 passed: three system users, then the differential tests as the orchestrator's user |
+| `PROPTEST_CASES=5000 cargo test --release --workspace` | local, CI | 198 passed. Locally: 17,544 traces, 3,279,458 commands checked, property tests 104.1 s |
+| `PROPTEST_CASES=16000 cargo test --release -p more-ledgerd --test process p3` | local | 3,000 daemons started; 60,126 hostile calls, 11,957 transactions and 109,261 commands compared; 41 s |
+| `PROPTEST_CASES=20000 cargo test --release -p gpu-ledger --test hostile` | local | 20,000 hostile sequences of up to 119 ledger calls, no violation, 36 s |
+| `python3 scripts/mutation.py --shard=K/4`, K = 0..3 | CI | 212 of 212 mutants caught by a failing test; 0 compile errors; 0 missed |
+
+CI is GitHub Actions run [43072723155](https://github.com/ASTROWwwW/more/actions/runs/43072723155) on `cfb63b1`: format, lints, minimum Rust version, debug and release tests, the three-users job, the reference run and the four mutation shards.
+
+### The review, point by point
+
+| Asked | What was done | Tests | Mutants |
+| --- | --- | --- | --- |
+| Lose the answer exactly after a `Commit` was applied | A link that fails at a chosen request, in process and in front of the real daemon. The ledger commits; the coordinator gets nothing, stops, reconnects, asks, takes the state that goes with the commit. Both ledgers hold the same journal afterwards: applied once | `link_faults::r5_an_answer_lost_after_the_commit_is_asked_about_and_nothing_is_sent_twice`, `r5_a_commit_applied_by_the_daemon_whose_answer_was_lost_is_found_again`, `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead` | M181, M182, M183, M184, M185, M188 |
+| A stable transaction identity and a way to ask for its state | `TxId` (instance, counter), used once; outcome log of 1,024; `TxStatus`, answered to the orchestrator whatever the ledger is doing | `r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once` | M172 to M177, M179 |
+| Never run again a transaction whose outcome is unknown | The coordinator refuses every command until the ledger has answered; "open" and "unknown" keep it stopped; a name is never reused | `link_faults::r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `…r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline`, `…r5_an_outcome_the_ledger_forgot_is_left_to_a_person`, `…r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome` | M183, M186, M187, M192, M193 |
+| No claim of full distributed atomicity | `SECURITY_ARCHITECTURE.md` section 11 says what holds and what does not; LEDGER-025 | | |
+| The deadline applies to the owner's own requests | Checked on every request, the owner's first | `r5_a_deadline_binds_the_owner_of_a_transaction_too` (active, commit late) | M144, M168, M169 |
+| Idle transaction | The daemon's timer; `LedgerHost::sweep` | same test (idle), `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` (total silence, timer seen on standard error) | M178, M201 |
+| Active transaction past its deadline | | both tests above | M169 |
+| Nested transaction | The deadline is the outermost one's | both tests above | M170, M151 |
+| Cut connection | Rolled back, recorded as such, nothing kept about the connection | `a_killed_orchestrator_leaves_nothing_half_done`, `a_transaction_is_all_or_nothing_and_bounded`, `r5_a_connection_that_timed_out_is_not_used_again` | M147, M165, M171, M180, M205 |
+| Expired transactions cleaned up, resources released | Snapshots dropped at rollback; the list of connections to tell is emptied when they close; outcome log bounded | `r5_a_deadline_binds_the_owner_of_a_transaction_too` (`retained`), `r5_the_outcome_…` | M171, M175 |
+| Two distinct system users | Ledger, orchestrator and a bystander under three users; the differential tests run as the orchestrator's user | `r5_two_users_the_orchestrator_reaches_the_ledger_through_its_socket_only` (root) | M194, M196 |
+| A socket policy that fits, never all local users | `--allow-uid` (kernel-reported peer), `--socket-group` (0660), default 0600 | `r5_the_socket_admits_listed_users_only`, `r5_the_daemon_checks_its_own_options` | M163, M194 to M197, M206 |
+| Persistence out of scope, losses documented | LEDGER-026; `SECURITY_ARCHITECTURE.md` section 11 | | |
+| Identifiers and protocol ready for recovery | Transaction names, outcome log, incarnation in `Info` and `TxStatus` | `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_restarted_daemon_is_another_ledger_and_says_so` | M189, M190, M191, M202 |
+| Not presented as ready for real credits | Banner at every start; README; LEDGER-026 | `r5_a_restarted_daemon_is_another_ledger_and_says_so` reads it | M203 |
+| Also found: no deadline on authentication | 2 s for the whole handshake | `r5_a_connection_that_does_not_authenticate_in_time_is_closed` | M198, M199, M200, M204 |
+
+### The second review, point by point
+
+Two findings from reading the code of pull request #3 at `e0782c0`. Each was reproduced first, by a test written for it and run on `e0782c0` unchanged.
+
+| Finding | Reproduction on `e0782c0` | Fix | Tests | Mutants |
+| --- | --- | --- | --- | --- |
+| A transaction name could be used again once its outcome had left the bounded log | `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten` fails: with a log of three, `Begin` of the evicted name answers `Done` where `TransactionKnown` is expected | The ledger keeps the highest name each service began, outside the log, and refuses any name that is not above it. Names and outcomes are per service | that test; `r6_the_daemon_refuses_a_name_whose_outcome_it_forgot` (1,025 transactions against the daemon) | M172, M208, M209, M210 |
+| A connection whose transaction expired was refused once, then served again | `r6_a_connection_whose_transaction_expired_is_refused_until_it_closes` fails: the second reserve sent after the deadline answers `Done` and is applied outside any transaction | Refused everything but `TxStatus` until the connection closes | that test; `link_faults::r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead`; `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` against the daemon | M168, M178, M207 |
+
+Three existing tests asserted the old behaviour of the second finding and were changed; `docs/AUDIT_CODE.md` lists them.
+
+### Differential tests against the real process
+
+Every figure here is from a run against `more-ledgerd` started as a separate process and reached over its Unix socket. The loopback runs are listed for comparison only.
+
+| Test | Where the ledger is | What is compared | Volume |
+| --- | --- | --- | --- |
+| TEST-P35 | This process, behind the link's messages | Hostile calls: answer, balances, journal, whole state | 5,000 sequences of up to 119 calls (reference run) |
+| TEST-P35 | `more-ledgerd`, a daemon per sequence | Hostile calls: answer, balances, journal | Reference run: 312 daemons, 18,675 calls. `PROPTEST_CASES=16000`: 1,000 daemons, 60,126 calls |
+| TEST-P35 | `more-ledgerd` under another system user | Same | One daemon, one trace of 20,000 calls (local as root, and CI job `isolation`) |
+| TEST-P36 | This process, behind the link's messages | Transactions committed or aborted against copy-and-restore: whole state | 5,000 sequences of up to 23 transactions (reference run) |
+| TEST-P36 | `more-ledgerd`, a daemon per sequence | Same, as the daemon's auditor sees it: balances, journal, position, clock | Reference run: 312 daemons, 3,630 transactions. `PROPTEST_CASES=16000`: 1,000 daemons, 11,957 transactions |
+| TEST-P36 | `more-ledgerd` under another system user | Same | One daemon, 1,000 transactions |
+| TEST-P37 | This process, behind the link's messages | Two coordinators and two ledgers, command by command | 1,250 traces, 235,413 commands (reference run) |
+| TEST-P37 | `more-ledgerd`, a daemon per trace | Same | Reference run: 312 daemons, 35,883 commands. `PROPTEST_CASES=16000`: 1,000 daemons, 109,261 commands |
+| TEST-P37 | `more-ledgerd` under another system user | Same | One daemon, one trace of 4,122 commands |
+| Answer lost after a commit, and commit lost on the way | `more-ledgerd` | Both coordinators and both ledgers once the outcome has been asked | One scenario each way, then more commands on both sides |
+
+What the comparison is: after every call (TEST-P35) the two ledgers must give the same answer and hold the same balances and journal head; after every command (TEST-P37) the two coordinators must give the same answer and hold the same jobs, slices, registry, delivery book, audit log and log position, and the two ledgers the same balances, journal and clock. One difference fails the test.
+
+The three-users run uses one daemon per deployment, so each property gets one long trace there instead of many short ones. The daemon's user is 61001, the test's 61002, and the socket's group 61500. The services on the test's side (orchestrator, treasury, clock, platform admin, auditor, identity) all connect from user 61002, each with its own key.
+
+### Tests, before and after
+
+| Suite | `main` | Now | Added on this branch |
+| --- | --- | --- | --- |
+| `more-identity` (unit) | 8 | 10 | a service's key and certificate, signed revocations |
+| `gpu-ledger` (unit) | 6 | 6 | |
+| `gpu-ledger` (API) | 29 | 29 | |
+| `gpu-ledger` (link, in process) | 0 | 22 | encoding, handshake, roles, transactions, TEST-P35, TEST-P36; review: outcomes, deadlines, the three ends of a commit; second review: a name after its outcome is forgotten, a connection after its transaction expired |
+| `gpu-ledger` (doc test) | 1 | 1 | |
+| `gpu-protocol` (unit) | 4 | 4 | |
+| `tests/properties` | 5 | 6 | TEST-P37; one ignored cost measurement |
+| `tests/scenarios` | 46 | 46 | |
+| `tests/regressions` | 10 | 10 | |
+| `tests/security` | 41 | 48 | six tests of a link that fails around a commit; second review: a command that outlives the deadline |
+| `more-ledgerd` (real process) | 0 | 16 | TEST-P35, TEST-P36 and TEST-P37 against the daemon, killed orchestrator, garbage on the socket, private files, memory; review: deadlines, lost answer, restart, timed-out connection, authentication deadline, admitted users, options, ping; second review: a forgotten name. Two more need root (three users) |
+| **Total** | **150** | **198** | plus 2 that need root |
+
+No test was removed. Changes to existing tests are listed with their reason in `docs/AUDIT_CODE.md` ("Test changes that need a justification", isolation, review and second review of step 1).
+
+### Mutation campaign
+
+212 mutants: the 134 of part 2, 35 for step 1 (M133 to M167, nine of them re-anchored after the review), 39 for the review (M168 to M206), 4 for the second review (M207 to M210, with four others re-anchored). Each one puts a defect back into the production code; the whole suite then runs in release mode with 300 traces per generator. The counting rules are those of part 2. One was added: a suite that does not end within 25 minutes is stopped with every process it started and counts as a detection. It did not happen in this campaign.
+
+Result on `cfb63b1`: **212 of 212 caught by a failing test. Compile errors: none. Missed: none.** Each shard printed `commit cfb63b15f67d48c6050ca6f733cb26e2f7227234` before its first mutant.
+
+Before the campaign, the 48 mutants added or re-anchored for the review were run locally without the four random generators and without TEST-P30: identity, the ledger's API and link tests (TEST-P35 and TEST-P36 included), protocol, the daemon's tests, scenarios, regressions, security, and TEST-P37. All 48 fail at least one of them. The 14 whose tests changed afterwards were run again the same way: all 14 fail. So were the 18 added, re-anchored or touched by the second review: all 18 fail.
+
+#### What the campaign found
+
+- **First full run, on `35f7ebf`: 207 of 208.** M166 (the daemon reads a frame of any length) passed. Its test expects the daemon to close a connection that announces four gigabytes. The authentication deadline added in the review closed that connection after two seconds whatever it had sent, inside the three seconds the test waited. The rule was still there; its test no longer showed it. The test now starts its daemon with a one-minute deadline (`090318f`).
+- **A test that failed once under load.** While re-checking M166 with the directed tests, `r5_a_connection_that_timed_out_is_not_used_again` was listed as failing too. Run alone under the same mutant it passes three times out of three: the mutant has nothing to do with it. The test used a 200 ms answer timeout for a whole handshake and asserted that a dead connection refused in less than that. The process tests now use delays of one second and no assertion on speed (`7efdd07`); eight runs with three busy loops on two cores pass.
+- **Second full run, on `7efdd07`: 208 of 208.**
+- **Third full run, on `cfb63b1`, after the second review: 212 of 212.** This is the commit this part describes.
+
+One mutant is killed by a test binary that dies and not by an assertion: M156 (a list length trusted before the bytes are there) makes the decoder allocate until the process aborts. The runner reports it as such.
+
+Defects without a mutant, and why:
+
+- the time between `bind` and the change of the socket's mode. A connection made in that instant is checked against the list of users like any other (M194); there is nothing else to remove;
+- a coordinator that reuses a transaction name. The counter only grows and no line resets it. The ledger's refusal of a known name has a mutant (M172).
+
+The mutants of this branch:
+
+| Mutation | Injected bug | Result | Caught by |
+| --- | --- | --- | --- |
+| M133 | A checked certificate vouches for another key | caught | `credential_cannot_be_altered` |
+| M134 | The authority's signature does not cover the service's key | caught | `credential_cannot_be_altered` |
+| M135 | An identity file may carry a key that is not the certified one | caught | `a_certificate_without_its_key_proves_nothing` |
+| M136 | A revocation is accepted without the authority's signature | caught | `a_damaged_request_from_a_reader_writes_nothing`, `a_revoked_service_is_cut_off_on_its_next_request`, `revocations_travel_signed` |
+| M137 | Link: a certificate opens a connection without proof of its key | caught | `a_copied_certificate_does_not_open_a_connection`, `a_recorded_handshake_cannot_be_replayed` |
+| M138 | Link: any certificate is accepted at hello | caught | `a_revoked_service_is_cut_off_on_its_next_request`, `a_service_connects_as_itself_only`, `a_signed_revocation_reaches_a_ledger_that_only_knows_the_authoritys_key` and 1 more |
+| M139 | Link: a hello for another deployment is accepted | caught | `a_service_connects_as_itself_only` |
+| M140 | Link: any protocol version is accepted | caught | `a_service_connects_as_itself_only` |
+| M141 | Link: a revoked service keeps its open connection | caught | `a_revoked_service_is_cut_off_on_its_next_request`, `a_signed_revocation_reaches_a_ledger_that_only_knows_the_authoritys_key`, `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead` |
+| M142 | Link: request numbers are not checked | caught | `the_handshake_has_one_order` |
+| M143 | Link: others act on a ledger held by a transaction | caught | `a_killed_orchestrator_leaves_nothing_half_done`, `a_transaction_is_all_or_nothing_and_bounded`, `r5_a_deadline_binds_the_owner_of_a_transaction_too` and 1 more |
+| M144 | Link: a transaction never times out | caught | `r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline`, `r5_a_deadline_binds_the_owner_of_a_transaction_too`, `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` and 1 more |
+| M145 | Link: any service may open a transaction | caught | `a_connection_has_its_own_rights_and_no_other` |
+| M146 | Link: an aborted transaction is not undone | caught | `a_transaction_is_all_or_nothing_and_bounded`, `p36_transactions_in_the_daemon_match_copy_and_restore`, `p36_transactions_match_copy_and_restore` |
+| M147 | Link: a closed connection keeps its uncommitted work | caught | `a_killed_orchestrator_leaves_nothing_half_done`, `a_revoked_service_is_cut_off_on_its_next_request`, `a_transaction_is_all_or_nothing_and_bounded` and 4 more |
+| M148 | Link: no limit on the size of a transaction | caught | `a_transaction_too_large_is_rolled_back`, `r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once` |
+| M149 | Link: no limit on nested transactions | caught | `a_transaction_is_all_or_nothing_and_bounded` |
+| M150 | Link: any service may register account keys | caught | `a_connection_has_its_own_rights_and_no_other` |
+| M151 | Link: a full rollback stops at the innermost transaction | caught | `a_transaction_is_all_or_nothing_and_bounded` |
+| M152 | Link: the proof does not depend on the ledger's nonce (replay) | caught | `a_recorded_handshake_cannot_be_replayed` |
+| M153 | Link: the client accepts a peer that is not a ledger | caught | `a_client_refuses_anything_but_its_deployments_ledger` |
+| M154 | Link: the client does not check the ledger's proof | caught | `a_client_refuses_anything_but_its_deployments_ledger` |
+| M155 | Link: bytes after a message are ignored | caught | `every_message_round_trips_and_nothing_else_decodes` |
+| M156 | Link: a list length is trusted before the bytes are there | caught | `(a test binary died)` |
+| M157 | Link: no limit on the length of a text | caught | `the_decoder_never_trusts_a_length` |
+| M158 | Coordinator: no transaction around a command | caught | `a_coordinator_behind_the_link_matches_the_one_in_process`, `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there` and 8 more |
+| M159 | Coordinator: a refused command is not rolled back at the ledger | caught | `a_coordinator_behind_the_link_matches_the_one_in_process`, `r5_an_answer_lost_after_the_commit_is_asked_about_and_nothing_is_sent_twice`, `p37_a_coordinator_drives_a_ledger_in_another_process` and 1 more |
+| M160 | Coordinator: an applied command is never committed | caught | `a_coordinator_behind_the_link_matches_the_one_in_process`, `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there` and 8 more |
+| M161 | Coordinator: a repeated command leaves its transaction open | caught | `a_coordinator_behind_the_link_matches_the_one_in_process`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome`, `p37_a_coordinator_drives_a_ledger_in_another_process` and 1 more |
+| M162 | Daemon: memory left readable by the same user | caught | `another_process_of_the_same_user_cannot_read_the_ledgers_memory` |
+| M163 | Daemon: socket left with the default permissions | caught | `r5_the_socket_admits_listed_users_only`, `the_socket_and_the_key_file_are_private` |
+| M164 | Daemon: key file readable by others accepted | caught | `r5_ping_answers_for_a_service_and_for_no_one_else`, `the_socket_and_the_key_file_are_private` |
+| M165 | Daemon: a dead connection keeps its transaction | caught | `a_killed_orchestrator_leaves_nothing_half_done`, `r5_a_commit_applied_by_the_daemon_whose_answer_was_lost_is_found_again` |
+| M166 | Daemon: a frame of any length is read | caught | `garbage_on_the_socket_does_not_stop_the_daemon` |
+| M167 | Ledger: an operation runs under another role than the connection's | caught | `a_connection_has_its_own_rights_and_no_other`, `a_damaged_request_from_a_reader_writes_nothing`, `compromise_delivery_cannot_issue_or_move_credits` and 4 more |
+| M168 | Link: the owner of a rolled-back transaction goes on outside it | caught | `r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead`, `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead`, `r5_a_deadline_binds_the_owner_of_a_transaction_too` and 2 more |
+| M169 | Link: a transaction's deadline does not bind its owner | caught | `r5_a_deadline_binds_the_owner_of_a_transaction_too` |
+| M170 | Link: a nested transaction restarts the deadline | caught | `r5_a_deadline_binds_the_owner_of_a_transaction_too`, `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` |
+| M171 | Link: a connection that is gone stays on the list of expired ones | caught | `r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline`, `r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead`, `r5_a_deadline_binds_the_owner_of_a_transaction_too` and 1 more |
+| M172 | Link: a transaction name can be used twice | caught | `r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once`, `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten`, `r6_the_daemon_refuses_a_name_whose_outcome_it_forgot` |
+| M173 | Link: what became of a closed transaction is not recorded | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome`, `r5_an_answer_lost_after_the_commit_is_asked_about_and_nothing_is_sent_twice` and 6 more |
+| M174 | Link: a rollback is recorded as a commit | caught | `a_killed_orchestrator_leaves_nothing_half_done`, `a_transaction_is_all_or_nothing_and_bounded`, `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again` and 6 more |
+| M175 | Link: the outcome log grows without bound | caught | `r5_an_outcome_the_ledger_forgot_is_left_to_a_person`, `r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once`, `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten` and 1 more |
+| M176 | Link: any service may ask what became of a transaction | caught | `a_connection_has_its_own_rights_and_no_other`, `r5_the_outcome_of_a_transaction_can_be_asked_and_a_name_is_used_once` |
+| M177 | Link: the outcome question waits behind an open transaction | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome`, `r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline` and 4 more |
+| M178 | Link: a swept transaction's owner is not told | caught | `r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead`, `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead`, `r5_a_deadline_binds_the_owner_of_a_transaction_too` and 2 more |
+| M179 | Link: a second Begin replaces the open transaction | caught | `a_transaction_is_all_or_nothing_and_bounded`, `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten` |
+| M180 | Client: a connection goes on after an answer was lost | caught | `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead`, `r5_a_connection_that_timed_out_is_not_used_again` |
+| M181 | Client: a commit without answer is reported as not applied | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome` and 5 more |
+| M182 | Client: a commit without answer is reported as done | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome` and 5 more |
+| M183 | Coordinator: goes on after a commit of unknown outcome | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline`, `r5_an_answer_lost_after_the_commit_is_asked_about_and_nothing_is_sent_twice` and 2 more |
+| M184 | Coordinator: a commit of unknown outcome is taken as applied | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome` and 4 more |
+| M185 | Coordinator: a commit of unknown outcome is taken as not applied | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome` and 4 more |
+| M186 | Coordinator: a transaction still open is taken as rolled back | caught | `r5_a_transaction_still_open_keeps_the_coordinator_stopped_until_its_deadline` |
+| M187 | Coordinator: an outcome the ledger forgot is taken as rolled back | caught | `r5_an_outcome_the_ledger_forgot_is_left_to_a_person` |
+| M188 | Coordinator: a committed transaction is resolved without taking its state | caught | `r5_a_lost_answer_inside_a_command_is_not_an_unknown_outcome`, `r5_an_answer_lost_after_the_commit_is_asked_about_and_nothing_is_sent_twice`, `r5_a_commit_applied_by_the_daemon_whose_answer_was_lost_is_found_again` |
+| M189 | Coordinator: a restarted ledger is taken for the one that was there | caught | `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_restarted_daemon_is_another_ledger_and_says_so` |
+| M190 | Coordinator: goes on against a ledger that lost its state | caught | `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there`, `r5_a_restarted_daemon_is_another_ledger_and_says_so` |
+| M191 | Coordinator: stopped for a lost ledger, it takes a new connection all the same | caught | `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there` |
+| M192 | Coordinator: the failed connection is kept open after reconnection | caught | `r5_a_commit_that_never_arrived_is_rolled_back_and_can_be_sent_again`, `r5_a_commit_applied_by_the_daemon_whose_answer_was_lost_is_found_again` |
+| M193 | Coordinator: a connection that does not answer is taken | caught | `r5_a_ledger_that_restarted_is_not_mistaken_for_the_one_that_was_there` |
+| M194 | Daemon: any local user may connect | caught | `r5_the_socket_admits_listed_users_only` |
+| M195 | Daemon: its own user is admitted whatever the list says | caught | `r5_the_daemon_checks_its_own_options`, `r5_the_socket_admits_listed_users_only` |
+| M196 | Daemon: root is admitted whatever the list says | caught | `r5_the_daemon_checks_its_own_options` |
+| M197 | Daemon: a socket opened to a group is opened to everyone | caught | `r5_the_socket_admits_listed_users_only` |
+| M198 | Daemon: no deadline on authentication | caught | `r5_a_connection_that_does_not_authenticate_in_time_is_closed` |
+| M199 | Daemon: the authentication deadline restarts at every byte | caught | `r5_a_connection_that_does_not_authenticate_in_time_is_closed` |
+| M200 | Daemon: an authenticated service is cut off after the authentication delay | caught | `r5_a_connection_that_does_not_authenticate_in_time_is_closed`, `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` |
+| M201 | Daemon: nothing ends an idle transaction | caught | `r5_the_daemon_ends_a_transaction_past_its_deadline_by_itself` |
+| M202 | Daemon: every start is the same incarnation | caught | `r5_a_restarted_daemon_is_another_ledger_and_says_so` |
+| M203 | Daemon: starts without saying what it is not | caught | `r5_a_restarted_daemon_is_another_ledger_and_says_so` |
+| M204 | Daemon: a timeout of zero is accepted | caught | `r5_the_daemon_checks_its_own_options` |
+| M205 | Daemon client: waits for ever for an answer | caught | `r5_a_connection_that_timed_out_is_not_used_again` |
+| M206 | Daemon: an option given twice is silently accepted | caught | `r5_the_daemon_checks_its_own_options` |
+| M207 | Link: a connection whose transaction expired is served again after one refusal | caught | `r6_a_command_that_outlives_the_deadline_is_not_applied_and_its_connection_is_dead`, `r5_a_commit_is_done_not_applied_or_unknown_and_a_failed_connection_is_dead`, `r5_a_deadline_binds_the_owner_of_a_transaction_too` and 2 more |
+| M208 | Link: a name is refused only while its outcome is remembered | caught | `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten`, `r6_the_daemon_refuses_a_name_whose_outcome_it_forgot` |
+| M209 | Link: an earlier instance of a service goes on after a later one began | caught | `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten` |
+| M210 | Link: a transaction is reported open to a service that does not own it | caught | `r6_a_transaction_name_stays_spent_after_its_outcome_is_forgotten` |
+
+### What is not shown
+
+- **Persistence and recovery.** Nothing is written to disk. No test restarts a coordinator, and none recovers a ledger: there is nothing to recover from.
+- **A coordinator that dies with a commit in doubt.** The state that went with the commit is lost with it. The ledger may then hold a commit no coordinator knows of.
+- **Other systems than Linux.** The daemon checks its peers with `SO_PEERCRED` and seals its memory with `prctl`; it does not build elsewhere.
+- **A share of the ledger per service.** An authenticated service can hold all 64 connections, or open one 5 s transaction after another.
+- **A coordinator that reconnects by itself.** After an expired transaction or a failed link, the coordinator needs to be given a new connection. Nothing here does that for it.
+- **Time.** The process tests of deadlines use real delays: deadlines of one second, checks several hundred milliseconds away from them. A machine stalled for longer than that could make one fail. The same rules are tested without any clock in `crates/ledger/tests/link.rs`.
+- **The three-users test needs root** and is skipped by a plain `cargo test`. CI runs it in the job `isolation`.
+- **A network.** The link is for a local socket. Nothing here was tried across machines.
 
 ## Part 2: `hardening/ledger-authority`
 

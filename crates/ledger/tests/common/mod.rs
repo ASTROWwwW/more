@@ -2,6 +2,14 @@
 //! bystander and an account held by the attacker.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod hostile;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use gpu_ledger::link::{
+    HostEnv, HostLimits, LedgerClient, LedgerHost, LedgerSummary, Loopback, Transport,
+};
 use gpu_ledger::*;
 use more_identity::{
     lease_message, mandate_message, ready_message, receipt_message, relay_message, restore_message,
@@ -28,6 +36,17 @@ pub const STATE: u64 = 0xabc;
 pub const SEGS: [u64; 3] = [0xa0, 0xa1, 0xa2];
 /// Recovery segments an honest recipient attests by default: all of them.
 pub const SEGMENTS: u32 = 3;
+/// Incarnation of the ledgers the tests host themselves.
+pub const INCARNATION: u64 = 0x1ed6e5;
+
+/// Name of the `n`-th transaction of the tests' orchestrator.
+pub fn tx(n: u64) -> gpu_ledger::link::TxId {
+    gpu_ledger::link::TxId {
+        node: 1,
+        counter: n,
+    }
+}
+
 /// Seed of the identity authority of the tests' deployment.
 pub const AUTHORITY: [u8; 32] = [3; 32];
 
@@ -58,48 +77,147 @@ pub fn terms(max_budget: Amount) -> JobTerms {
 pub struct World {
     pub auth: IdentityAuthority,
     pub ledger: LedgerService,
+    pub keys: KeyDirectory,
     pub treasury: ServiceCredential,
     pub orch: ServiceCredential,
     pub auditor: ServiceCredential,
     pub clock: ServiceCredential,
+    pub platform: ServiceCredential,
+    pub identity: ServiceCredential,
+    /// The ledger's own identity, for a host or a daemon of this deployment.
+    pub ledger_id: ServiceCredential,
+    /// A second ledger behind the link, sent every operation the first one gets.
+    pub mirror: Option<Mirror>,
+}
+
+/// Host clock and nonces a test controls.
+#[derive(Clone, Default)]
+pub struct TestEnv {
+    pub now_ms: Arc<AtomicU64>,
+    nonces: Arc<AtomicU64>,
+}
+
+impl HostEnv for TestEnv {
+    fn now_ms(&mut self) -> u64 {
+        self.now_ms.load(Ordering::Relaxed)
+    }
+    fn nonce(&mut self) -> [u8; 32] {
+        let n = self.nonces.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut out = [0x5a; 32];
+        out[..8].copy_from_slice(&n.to_le_bytes());
+        out
+    }
+}
+
+/// A connection to the mirrored ledger, whatever carries it.
+pub trait Wire {
+    fn exec(&mut self, op: LedgerOp) -> Res;
+    /// `Begin`, `Commit` or `Abort`.
+    fn tx(&mut self, step: gpu_ledger::link::Request);
+    fn balances(&mut self) -> Vec<(Account, i128)>;
+    fn summary(&mut self) -> LedgerSummary;
+}
+
+impl<T: Transport> Wire for LedgerClient<T> {
+    fn exec(&mut self, op: LedgerOp) -> Res {
+        self.execute(op).expect("link")
+    }
+    fn tx(&mut self, step: gpu_ledger::link::Request) {
+        let answer = self.call(step.clone()).expect("link");
+        assert_eq!(answer, gpu_ledger::link::Response::Done, "{step:?}");
+    }
+    fn balances(&mut self) -> Vec<(Account, i128)> {
+        self.audit_balances().expect("link").expect("auditor")
+    }
+    fn summary(&mut self) -> LedgerSummary {
+        self.audit_summary().expect("link").expect("auditor")
+    }
+}
+
+/// One authenticated connection per service that writes or audits.
+pub struct Mirror {
+    pub orch: Box<dyn Wire>,
+    pub treasury: Box<dyn Wire>,
+    pub clock: Box<dyn Wire>,
+    pub platform: Box<dyn Wire>,
+    pub auditor: Box<dyn Wire>,
+    /// The host itself, when it lives in this process: its whole state can then be compared.
+    pub host: Option<Arc<Mutex<LedgerHost>>>,
+    /// The orchestrator holds a transaction: the auditor would be told to wait.
+    pub in_tx: bool,
+}
+
+/// Who sends an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum By {
+    Orchestrator,
+    Treasury,
+    Clock,
+    Platform,
 }
 
 pub fn world() -> World {
+    let mut w = bare_world();
+    w.setup();
+    w
+}
+
+/// The same world with a second ledger behind an in-process link. Every operation goes to both,
+/// and both must answer and end up the same.
+pub fn mirrored_world() -> World {
+    let mut w = bare_world();
+    let service = LedgerService::new(w.auth.verifier(), w.keys.clone(), LedgerLimits::default());
+    let host = LedgerHost::new(
+        service,
+        w.keys.clone(),
+        w.auth.verifier(),
+        w.ledger_id.clone(),
+        HostLimits::default(),
+        INCARNATION,
+    )
+    .unwrap();
+    let host = Arc::new(Mutex::new(host));
+    let env = TestEnv::default();
+    let verifier = w.auth.verifier();
+    let mut n = 0u8;
+    let mut connect = |me: &ServiceCredential| -> Box<dyn Wire> {
+        n += 1;
+        let link = Loopback::new(host.clone(), Box::new(env.clone()));
+        Box::new(LedgerClient::connect(link, me, &verifier, [n; 32]).unwrap())
+    };
+    w.mirror = Some(Mirror {
+        orch: connect(&w.orch),
+        treasury: connect(&w.treasury),
+        clock: connect(&w.clock),
+        platform: connect(&w.platform),
+        auditor: connect(&w.auditor),
+        host: Some(host),
+        in_tx: false,
+    });
+    w.setup();
+    w
+}
+
+/// Accounts registered, services certified, nothing issued yet.
+pub fn bare_world() -> World {
     let mut auth = IdentityAuthority::new(AUTHORITY);
     let keys = KeyDirectory::new();
     for a in [ALICE, BOB, L1, L2, WIT, MALLORY, ADMIN] {
         keys.register(a, key(a).public()).unwrap();
     }
-    let mut ledger = LedgerService::new(auth.verifier(), keys, LedgerLimits::default());
-    let treasury = auth.issue(ServiceRole::Treasury);
-    let orch = auth.issue(ServiceRole::Orchestrator);
-    let auditor = auth.issue(ServiceRole::Auditor);
-    let clock = auth.issue(ServiceRole::Clock);
-    let platform = auth.issue(ServiceRole::PlatformAdmin);
-    let pool = LedgerOp::RegisterPool {
-        pool: POOL,
-        admin: ADMIN,
-    };
-    ledger.execute(&platform, pool).unwrap();
-    for (k, to) in [
-        ("i1", IssueTo::User(ALICE)),
-        ("i2", IssueTo::User(BOB)),
-        ("i3", IssueTo::Pool(POOL)),
-    ] {
-        let op = LedgerOp::Issue {
-            key: k.into(),
-            to,
-            amount: 1_000,
-        };
-        ledger.execute(&treasury, op).unwrap();
-    }
+    let ledger = LedgerService::new(auth.verifier(), keys.clone(), LedgerLimits::default());
     World {
-        auth,
         ledger,
-        treasury,
-        orch,
-        auditor,
-        clock,
+        keys,
+        treasury: auth.issue(ServiceRole::Treasury),
+        orch: auth.issue(ServiceRole::Orchestrator),
+        auditor: auth.issue(ServiceRole::Auditor),
+        clock: auth.issue(ServiceRole::Clock),
+        platform: auth.issue(ServiceRole::PlatformAdmin),
+        identity: auth.issue(ServiceRole::Identity),
+        ledger_id: auth.issue(ServiceRole::Ledger),
+        auth,
+        mirror: None,
     }
 }
 
@@ -163,9 +281,93 @@ pub fn out(pos: u32) -> OutputRef {
 }
 
 impl World {
+    /// The pool and the starting balances.
+    pub fn setup(&mut self) {
+        let pool = LedgerOp::RegisterPool {
+            pool: POOL,
+            admin: ADMIN,
+        };
+        self.exec(By::Platform, pool).unwrap();
+        for (k, to) in [
+            ("i1", IssueTo::User(ALICE)),
+            ("i2", IssueTo::User(BOB)),
+            ("i3", IssueTo::Pool(POOL)),
+        ] {
+            let op = LedgerOp::Issue {
+                key: k.into(),
+                to,
+                amount: 1_000,
+            };
+            self.exec(By::Treasury, op).unwrap();
+        }
+    }
+
+    /// Sends `op` as `by`. With a mirror, the ledger behind the link gets the same operation on
+    /// that service's own connection, and must give the same answer and hold the same state.
+    pub fn exec(&mut self, by: By, op: LedgerOp) -> Res {
+        let cred = match by {
+            By::Orchestrator => &self.orch,
+            By::Treasury => &self.treasury,
+            By::Clock => &self.clock,
+            By::Platform => &self.platform,
+        };
+        let local = self.ledger.execute(cred, op.clone());
+        let Some(m) = self.mirror.as_mut() else {
+            return local;
+        };
+        let wire = match by {
+            By::Orchestrator => &mut m.orch,
+            By::Treasury => &mut m.treasury,
+            By::Clock => &mut m.clock,
+            By::Platform => &mut m.platform,
+        };
+        let remote = wire.exec(op.clone());
+        assert_eq!(local, remote, "answers differ for {op:?}");
+        self.same_as_mirror(&op);
+        local
+    }
+
+    /// The ledger behind the link holds what the local one holds: its whole state when it is in
+    /// this process, and in any case balances, journal, position and clock as its auditor sees
+    /// them. Inside a transaction the auditor would be told to wait, and is not asked.
+    pub fn same_as_mirror(&mut self, after: &dyn std::fmt::Debug) {
+        let Some(m) = self.mirror.as_mut() else {
+            return;
+        };
+        if let Some(host) = &m.host {
+            let host = host.lock().unwrap();
+            assert!(
+                *host.service() == self.ledger,
+                "states differ after {after:?}"
+            );
+        }
+        if m.in_tx {
+            return;
+        }
+        let view = self.ledger.audit_view(&self.auditor).unwrap();
+        let balances: Vec<(Account, i128)> = view.accounts().map(|(a, b)| (*a, *b)).collect();
+        assert_eq!(
+            balances,
+            m.auditor.balances(),
+            "balances differ after {after:?}"
+        );
+        let s = m.auditor.summary();
+        let head = view.entries().last().map_or(0, |e| e.hash);
+        assert_eq!(
+            (s.entries, s.head, s.seq, s.now),
+            (
+                view.entries().len() as u64,
+                head,
+                self.ledger.seq(),
+                self.ledger.now()
+            ),
+            "journals differ after {after:?}"
+        );
+    }
+
     /// As the orchestrator.
     pub fn run(&mut self, op: LedgerOp) -> Res {
-        self.ledger.execute(&self.orch, op)
+        self.exec(By::Orchestrator, op)
     }
 
     pub fn bal(&self, a: Account) -> i128 {
@@ -284,9 +486,7 @@ impl World {
     /// The clock service moves the ledger's time forward by `dt`.
     pub fn advance(&mut self, dt: u64) {
         let now = self.ledger.now() + dt;
-        self.ledger
-            .execute(&self.clock, LedgerOp::Advance { now })
-            .unwrap();
+        self.exec(By::Clock, LedgerOp::Advance { now }).unwrap();
     }
 
     /// `signer` signs a receipt for `producer`'s outputs `0..upto`.

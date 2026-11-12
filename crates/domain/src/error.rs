@@ -48,6 +48,13 @@ pub enum DomainError {
     Overflow(&'static str),
     /// The ledger refused the operation.
     Ledger(LedgerApiError),
+    /// The ledger runs in another process and the answer to a commit never came. The coordinator
+    /// does not know whether its last command was applied there: it accepts nothing until it
+    /// has asked (`Coordinator::resolve_commit`). It never sends the command again by itself.
+    LedgerOutcomeUnknown,
+    /// The ledger this coordinator was working with restarted, and with it lost its state. The
+    /// coordinator's own state no longer matches any ledger: it stays stopped.
+    LedgerStateLost,
     /// An internal invariant would break: a model bug, never expected.
     Internal(String),
 }
@@ -88,6 +95,8 @@ impl DomainError {
             DomainError::InvalidInput(_) => "INVALID_INPUT",
             DomainError::Overflow(_) => "ARITHMETIC_OVERFLOW",
             DomainError::Ledger(e) => e.code(),
+            DomainError::LedgerOutcomeUnknown => "LEDGER_OUTCOME_UNKNOWN",
+            DomainError::LedgerStateLost => "LEDGER_STATE_LOST",
             DomainError::Internal(_) => "INTERNAL",
         }
     }

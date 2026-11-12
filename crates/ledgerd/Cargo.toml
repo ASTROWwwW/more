@@ -1,0 +1,33 @@
+[package]
+name = "more-ledgerd"
+description = "The More ledger as a process of its own, behind a local socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+more-identity.workspace = true
+gpu-ledger.workspace = true
+getrandom = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "process", "net"] }
+
+[[bin]]
+name = "more-ledgerd"
+path = "src/main.rs"
+
+[[bin]]
+name = "more-ledger-ping"
+path = "src/bin/more-ledger-ping.rs"
+
+[dev-dependencies]
+gpu-ledger = { workspace = true }
+gpu-domain.workspace = true
+gpu-simulation.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

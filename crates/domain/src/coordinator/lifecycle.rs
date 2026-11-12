@@ -17,8 +17,13 @@ impl Coordinator {
         let clock = ctx
             .credential()
             .ok_or(DomainError::Unauthorized("only the clock"))?;
-        self.ledger
-            .execute(clock, LedgerOp::Advance { now: self.now })?;
+        // In its own process the ledger takes its time from the clock service directly.
+        if let Some(r) = self
+            .ledger
+            .forward(clock, LedgerOp::Advance { now: self.now })
+        {
+            r?;
+        }
         Ok(Outcome::Applied)
     }
 
@@ -45,12 +50,16 @@ impl Coordinator {
             to,
             amount,
         };
-        match self.ledger.execute(treasury, op) {
-            Ok(_) => Ok(Outcome::Applied),
-            Err(LedgerApiError::Ledger(LedgerError::DuplicateKey(_))) => {
+        match self.ledger.forward(treasury, op) {
+            Some(Ok(_)) => Ok(Outcome::Applied),
+            Some(Err(LedgerApiError::Ledger(LedgerError::DuplicateKey(_)))) => {
                 Ok(Outcome::AlreadyApplied)
             }
-            Err(e) => Err(e.into()),
+            Some(Err(e)) => Err(e.into()),
+            // The ledger is in its own process: the treasury issues there, with its own key. The
+            // command is only a notice here. It takes its place in the log, so that positions
+            // mean the same in one process or two, and changes nothing else.
+            None => Ok(Outcome::Applied),
         }
     }
 
@@ -147,7 +156,10 @@ impl Coordinator {
                 pool: pool.0,
                 admin: admin.0,
             };
-            self.ledger.execute(platform, op)?;
+            // In its own process the ledger hears it from the platform admin directly.
+            if let Some(r) = self.ledger.forward(platform, op) {
+                r?;
+            }
         }
         Ok(out)
     }
